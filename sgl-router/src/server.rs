@@ -820,16 +820,14 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
 
     // Configure mTLS client identity if provided (certificates already loaded during config creation)
     if let Some(identity_pem) = &config.router_config.client_identity {
-        let identity = reqwest::Identity::from_pem(identity_pem)
-            .expect("Failed to create client identity from loaded certificate");
+        let identity = reqwest::Identity::from_pem(identity_pem)?;
         client_builder = client_builder.identity(identity);
         info!("mTLS client authentication enabled");
     }
 
     // Add CA certificates for verifying worker TLS (certificates already loaded during config creation)
     for ca_cert in &config.router_config.ca_certificates {
-        let cert = reqwest::Certificate::from_pem(ca_cert)
-            .expect("Failed to parse CA certificate from loaded data");
+        let cert = reqwest::Certificate::from_pem(ca_cert)?;
         client_builder = client_builder.add_root_certificate(cert);
     }
     if !config.router_config.ca_certificates.is_empty() {

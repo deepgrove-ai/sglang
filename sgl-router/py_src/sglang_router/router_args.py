@@ -593,7 +593,7 @@ class RouterArgs:
             help="Path to client private key for mTLS authentication with workers",
         )
         parser.add_argument(
-            f"--{prefix}ca-cert-path",
+            f"--{prefix}ca-cert-paths",
             type=str,
             nargs="*",
             default=[],
