@@ -85,6 +85,8 @@ async fn test_non_streaming_mcp_minimal_e2e_with_persistence() {
         reasoning_parser: None,
         tool_call_parser: None,
         tokenizer_cache: sglang_router_rs::config::TokenizerCacheConfig::default(),
+        client_identity: None,
+        ca_certificates: vec![],
     };
 
     // Create router and context
@@ -286,6 +288,8 @@ async fn test_conversations_crud_basic() {
         reasoning_parser: None,
         tool_call_parser: None,
         tokenizer_cache: sglang_router_rs::config::TokenizerCacheConfig::default(),
+        client_identity: None,
+        ca_certificates: vec![],
     };
 
     let ctx = common::create_test_context(router_cfg);
@@ -622,6 +626,8 @@ async fn test_multi_turn_loop_with_mcp() {
         reasoning_parser: None,
         tool_call_parser: None,
         tokenizer_cache: sglang_router_rs::config::TokenizerCacheConfig::default(),
+        client_identity: None,
+        ca_certificates: vec![],
     };
 
     let ctx = common::create_test_context(router_cfg);
@@ -799,6 +805,8 @@ async fn test_max_tool_calls_limit() {
         reasoning_parser: None,
         tool_call_parser: None,
         tokenizer_cache: sglang_router_rs::config::TokenizerCacheConfig::default(),
+        client_identity: None,
+        ca_certificates: vec![],
     };
 
     let ctx = common::create_test_context(router_cfg);
@@ -942,6 +950,8 @@ async fn setup_streaming_mcp_test() -> (
         reasoning_parser: None,
         tool_call_parser: None,
         tokenizer_cache: sglang_router_rs::config::TokenizerCacheConfig::default(),
+        client_identity: None,
+        ca_certificates: vec![],
     };
 
     let ctx = common::create_test_context(router_cfg);
@@ -1384,6 +1394,8 @@ async fn test_conversation_items_create_and_get() {
         reasoning_parser: None,
         tool_call_parser: None,
         tokenizer_cache: sglang_router_rs::config::TokenizerCacheConfig::default(),
+        client_identity: None,
+        ca_certificates: vec![],
     };
 
     let ctx = common::create_test_context(router_cfg);
@@ -1486,6 +1498,8 @@ async fn test_conversation_items_delete() {
         reasoning_parser: None,
         tool_call_parser: None,
         tokenizer_cache: sglang_router_rs::config::TokenizerCacheConfig::default(),
+        client_identity: None,
+        ca_certificates: vec![],
     };
 
     let ctx = common::create_test_context(router_cfg);
@@ -1594,6 +1608,8 @@ async fn test_conversation_items_max_limit() {
         reasoning_parser: None,
         tool_call_parser: None,
         tokenizer_cache: sglang_router_rs::config::TokenizerCacheConfig::default(),
+        client_identity: None,
+        ca_certificates: vec![],
     };
 
     let ctx = common::create_test_context(router_cfg);
@@ -1672,6 +1688,8 @@ async fn test_conversation_items_unsupported_type() {
         reasoning_parser: None,
         tool_call_parser: None,
         tokenizer_cache: sglang_router_rs::config::TokenizerCacheConfig::default(),
+        client_identity: None,
+        ca_certificates: vec![],
     };
 
     let ctx = common::create_test_context(router_cfg);
@@ -1749,6 +1767,8 @@ async fn test_conversation_items_multi_conversation_sharing() {
         reasoning_parser: None,
         tool_call_parser: None,
         tokenizer_cache: sglang_router_rs::config::TokenizerCacheConfig::default(),
+        client_identity: None,
+        ca_certificates: vec![],
     };
 
     let ctx = common::create_test_context(router_cfg);

@@ -207,6 +207,9 @@ struct Router {
     backend: BackendType,
     history_backend: HistoryBackendType,
     oracle_config: Option<PyOracleConfig>,
+    client_cert_path: Option<String>,
+    client_key_path: Option<String>,
+    ca_cert_paths: Vec<String>,
 }
 
 impl Router {
@@ -302,6 +305,42 @@ impl Router {
             None
         };
 
+        // Read and validate mTLS certificates during config creation
+        let client_identity = if let (Some(cert_path), Some(key_path)) =
+            (&self.client_cert_path, &self.client_key_path)
+        {
+            let cert =
+                std::fs::read(cert_path).map_err(|e| config::ConfigError::ValidationFailed {
+                    reason: format!(
+                        "Failed to read client certificate from {}: {}",
+                        cert_path, e
+                    ),
+                })?;
+            let key =
+                std::fs::read(key_path).map_err(|e| config::ConfigError::ValidationFailed {
+                    reason: format!("Failed to read client key from {}: {}", key_path, e),
+                })?;
+            // Combine cert and key into single PEM for reqwest::Identity
+            Some([cert, key].concat())
+        } else if self.client_cert_path.is_some() || self.client_key_path.is_some() {
+            return Err(config::ConfigError::ValidationFailed {
+                reason: "Both --client-cert-path and --client-key-path must be specified together"
+                    .to_string(),
+            });
+        } else {
+            None
+        };
+
+        let ca_certificates: Vec<Vec<u8>> = self
+            .ca_cert_paths
+            .iter()
+            .map(|path| {
+                std::fs::read(path).map_err(|e| config::ConfigError::ValidationFailed {
+                    reason: format!("Failed to read CA certificate from {}: {}", path, e),
+                })
+            })
+            .collect::<Result<Vec<_>, config::ConfigError>>()?;
+
         Ok(config::RouterConfig {
             mode,
             policy,
@@ -360,6 +399,8 @@ impl Router {
                 enable_l1: self.tokenizer_cache_enable_l1,
                 l1_max_memory: self.tokenizer_cache_l1_max_memory,
             },
+            client_identity,
+            ca_certificates,
         })
     }
 }
@@ -434,6 +475,9 @@ impl Router {
         backend = BackendType::Sglang,
         history_backend = HistoryBackendType::Memory,
         oracle_config = None,
+        client_cert_path = None,
+        client_key_path = None,
+        ca_cert_paths = vec![],
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -503,6 +547,9 @@ impl Router {
         backend: BackendType,
         history_backend: HistoryBackendType,
         oracle_config: Option<PyOracleConfig>,
+        client_cert_path: Option<String>,
+        client_key_path: Option<String>,
+        ca_cert_paths: Vec<String>,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
@@ -586,6 +633,9 @@ impl Router {
             backend,
             history_backend,
             oracle_config,
+            client_cert_path,
+            client_key_path,
+            ca_cert_paths,
         })
     }
 

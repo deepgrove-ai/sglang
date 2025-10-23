@@ -599,6 +599,8 @@ impl CliArgs {
                 enable_l1: self.tokenizer_cache_enable_l1,
                 l1_max_memory: self.tokenizer_cache_l1_max_memory,
             },
+            client_identity: None,
+            ca_certificates: vec![],
         })
     }
 

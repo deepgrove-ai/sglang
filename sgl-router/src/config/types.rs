@@ -84,6 +84,14 @@ pub struct RouterConfig {
     /// Tokenizer cache configuration
     #[serde(default)]
     pub tokenizer_cache: TokenizerCacheConfig,
+    /// mTLS client identity (combined certificate + key in PEM format)
+    /// This is loaded from client_cert_path and client_key_path during config creation
+    #[serde(skip)]
+    pub client_identity: Option<Vec<u8>>,
+    /// CA certificates for verifying worker TLS certificates (PEM format)
+    /// Loaded from ca_cert_paths during config creation
+    #[serde(default)]
+    pub ca_certificates: Vec<Vec<u8>>,
 }
 
 /// Tokenizer cache configuration
@@ -507,6 +515,8 @@ impl Default for RouterConfig {
             reasoning_parser: None,
             tool_call_parser: None,
             tokenizer_cache: TokenizerCacheConfig::default(),
+            client_identity: None,
+            ca_certificates: vec![],
         }
     }
 }
@@ -1053,6 +1063,8 @@ mod tests {
             reasoning_parser: None,
             tool_call_parser: None,
             tokenizer_cache: TokenizerCacheConfig::default(),
+            client_identity: None,
+            ca_certificates: vec![],
         };
 
         assert!(config.mode.is_pd_mode());
@@ -1122,6 +1134,8 @@ mod tests {
             reasoning_parser: None,
             tool_call_parser: None,
             tokenizer_cache: TokenizerCacheConfig::default(),
+            client_identity: None,
+            ca_certificates: vec![],
         };
 
         assert!(!config.mode.is_pd_mode());
@@ -1187,6 +1201,8 @@ mod tests {
             reasoning_parser: None,
             tool_call_parser: None,
             tokenizer_cache: TokenizerCacheConfig::default(),
+            client_identity: None,
+            ca_certificates: vec![],
         };
 
         assert!(config.has_service_discovery());

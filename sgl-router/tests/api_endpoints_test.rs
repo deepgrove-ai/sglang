@@ -70,6 +70,8 @@ impl TestContext {
             reasoning_parser: None,
             tool_call_parser: None,
             tokenizer_cache: sglang_router_rs::config::TokenizerCacheConfig::default(),
+            client_identity: None,
+            ca_certificates: vec![],
         };
 
         Self::new_with_config(config, worker_configs).await
@@ -1222,6 +1224,8 @@ mod error_tests {
             reasoning_parser: None,
             tool_call_parser: None,
             tokenizer_cache: sglang_router_rs::config::TokenizerCacheConfig::default(),
+            client_identity: None,
+            ca_certificates: vec![],
         };
 
         let ctx = TestContext::new_with_config(
@@ -1552,6 +1556,8 @@ mod pd_mode_tests {
             reasoning_parser: None,
             tool_call_parser: None,
             tokenizer_cache: sglang_router_rs::config::TokenizerCacheConfig::default(),
+            client_identity: None,
+            ca_certificates: vec![],
         };
 
         // Create app context
@@ -1716,6 +1722,8 @@ mod request_id_tests {
             reasoning_parser: None,
             tool_call_parser: None,
             tokenizer_cache: sglang_router_rs::config::TokenizerCacheConfig::default(),
+            client_identity: None,
+            ca_certificates: vec![],
         };
 
         let ctx = TestContext::new_with_config(

@@ -201,6 +201,8 @@ mod test_pd_routing {
                 reasoning_parser: None,
                 tool_call_parser: None,
                 tokenizer_cache: sglang_router_rs::config::TokenizerCacheConfig::default(),
+                client_identity: None,
+                ca_certificates: vec![],
             };
 
             let app_context = {
