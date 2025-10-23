@@ -67,6 +67,7 @@ impl Default for ResponseTool {
 pub enum ResponseToolType {
     WebSearchPreview,
     CodeInterpreter,
+    Container,
     Mcp,
     Function,
 }
@@ -942,6 +943,8 @@ pub struct ResponseTextDeltaEvent {
     pub item_id: String,
     pub content_index: usize,
     pub delta: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<ChatLogProbs>,
 }
 
 /// SSE event for text completion

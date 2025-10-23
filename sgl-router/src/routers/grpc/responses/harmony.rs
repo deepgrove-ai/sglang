@@ -704,14 +704,22 @@ fn create_harmony_system_message(
         }
     }
 
-    // Append instructions to model_identity if provided
-    if let Some(ref instructions) = request.instructions {
-        let new_identity = if let Some(identity) = &sys_content.model_identity {
-            format!("{}\n{}", identity, instructions)
-        } else {
-            instructions.clone()
-        };
-        sys_content = sys_content.with_model_identity(&new_identity);
+    // Append instructions to model_identity if VLLM_GPT_OSS_HARMONY_SYSTEM_INSTRUCTIONS is true
+    // Otherwise, instructions go to developer message
+    let use_system_instructions = std::env::var("VLLM_GPT_OSS_HARMONY_SYSTEM_INSTRUCTIONS")
+        .ok()
+        .and_then(|v| v.parse::<bool>().ok())
+        .unwrap_or(true); // Default to true (put in system message)
+
+    if use_system_instructions {
+        if let Some(ref instructions) = request.instructions {
+            let new_identity = if let Some(identity) = &sys_content.model_identity {
+                format!("{}\n{}", identity, instructions)
+            } else {
+                instructions.clone()
+            };
+            sys_content = sys_content.with_model_identity(&new_identity);
+        }
     }
 
     // Set conversation start date (current date)
@@ -722,14 +730,60 @@ fn create_harmony_system_message(
     // Add built-in tool descriptions if MCP manager is available
     if let Some(mcp) = mcp_manager {
         if let Some(tools) = &request.tools {
+            // Collect tool types to enable
+            let mut tool_types_to_enable = Vec::new();
+
+            // First, collect tool types from regular tools
             for tool in tools {
                 let tool_type = match tool.r#type {
-                    ResponseToolType::WebSearchPreview => "browser",
-                    ResponseToolType::CodeInterpreter => "python",
-                    ResponseToolType::Mcp => continue, // MCP tools handled separately
-                    ResponseToolType::Function => continue, // Function tools go in developer message
+                    ResponseToolType::WebSearchPreview => Some("browser"),
+                    ResponseToolType::CodeInterpreter => Some("python"),
+                    ResponseToolType::Container => Some("container"),
+                    ResponseToolType::Mcp => None, // Will be handled by allowlist below
+                    ResponseToolType::Function => None, // Function tools go in developer message
                 };
 
+                if let Some(t) = tool_type {
+                    tool_types_to_enable.push(t);
+                }
+            }
+
+            // Check GPT_OSS_SYSTEM_TOOL_MCP_LABELS env var for MCP tool allowlist
+            // Allows MCP tools to enable built-in tools (browser, python, container)
+            // Example: GPT_OSS_SYSTEM_TOOL_MCP_LABELS=web_search_preview,code_interpreter
+            if let Ok(allowlist_str) = std::env::var("GPT_OSS_SYSTEM_TOOL_MCP_LABELS") {
+                let allowlist: Vec<&str> = allowlist_str.split(',').map(|s| s.trim()).collect();
+
+                // For each MCP tool, check if server_label is in allowlist
+                for tool in tools {
+                    if matches!(tool.r#type, ResponseToolType::Mcp) {
+                        if let Some(ref label) = tool.server_label {
+                            if allowlist.contains(&label.as_str()) {
+                                // Map server_label to built-in tool type
+                                let builtin_tool = match label.as_str() {
+                                    "web_search_preview" => Some("browser"),
+                                    "code_interpreter" => Some("python"),
+                                    "container" => Some("container"),
+                                    _ => None,
+                                };
+
+                                if let Some(t) = builtin_tool {
+                                    if !tool_types_to_enable.contains(&t) {
+                                        tool_types_to_enable.push(t);
+                                        debug!(
+                                            "MCP tool with label '{}' enabled built-in tool '{}'",
+                                            label, t
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Now enable all collected tool types
+            for tool_type in tool_types_to_enable {
                 if let Some(config) = get_builtin_tool_config(mcp, tool_type) {
                     sys_content = sys_content.with_tools(config);
                     debug!("Added {} tool configuration to system message", tool_type);
@@ -800,6 +854,13 @@ fn get_builtin_tool_config(
                 None
             }
         }
+        "container" => {
+            // Container tool support: openai-harmony doesn't have a built-in container config yet
+            // For now, we skip it - this would need to be added to openai-harmony library
+            // TODO: Add container tool configuration when openai-harmony adds support
+            debug!("Container tool requested but not yet supported in openai-harmony");
+            None
+        }
         _ => None,
     }
 }
@@ -812,6 +873,12 @@ fn get_builtin_tool_config(
 fn create_harmony_developer_message(
     request: &ResponsesRequest,
 ) -> Result<Option<HarmonyMessage>, String> {
+    // Check if instructions should go to developer message
+    let use_system_instructions = std::env::var("VLLM_GPT_OSS_HARMONY_SYSTEM_INSTRUCTIONS")
+        .ok()
+        .and_then(|v| v.parse::<bool>().ok())
+        .unwrap_or(true); // Default to true (put in system message)
+
     // Extract function tools from request
     let function_tools: Vec<&ResponseTool> = request
         .tools
@@ -824,18 +891,23 @@ fn create_harmony_developer_message(
         })
         .unwrap_or_default();
 
-    // Only create developer message if there are function tools
-    if function_tools.is_empty() {
+    // Create developer message if:
+    // 1. There are function tools, OR
+    // 2. Instructions should go to developer message (not system)
+    let need_dev_message =
+        !function_tools.is_empty() || (!use_system_instructions && request.instructions.is_some());
+
+    if !need_dev_message {
         return Ok(None);
     }
 
     let mut dev_content = DeveloperContent::new();
 
-    // Add instructions if provided
-    // Note: In vLLM, instructions go to system message if VLLM_GPT_OSS_HARMONY_SYSTEM_INSTRUCTIONS is set
-    // For now, we always add instructions to developer message to match standard behavior
-    if let Some(ref instructions) = request.instructions {
-        dev_content = dev_content.with_instructions(instructions);
+    // Add instructions to developer message if not in system message
+    if !use_system_instructions {
+        if let Some(ref instructions) = request.instructions {
+            dev_content = dev_content.with_instructions(instructions);
+        }
     }
 
     // Convert function tools to ToolDescription
@@ -1578,12 +1650,26 @@ async fn process_harmony_stream(
                                         tx.send(Ok(Bytes::from(format!("data: {}\n\n", event))))
                                             .map_err(|_| "Channel closed".to_string())?;
                                     } else {
-                                        let event = json!({
+                                        // Extract logprobs from json_data if available and top_logprobs requested
+                                        let logprobs_opt =
+                                            if original_request.top_logprobs.unwrap_or(0) > 0 {
+                                                json_data.get("logprobs").cloned()
+                                            } else {
+                                                None
+                                            };
+
+                                        let mut event = json!({
                                             "type": "response.output_text.delta",
                                             "item_id": &current_item_id,
                                             "content_index": current_content_index,
                                             "delta": delta
                                         });
+
+                                        // Add logprobs if available
+                                        if let Some(logprobs) = logprobs_opt {
+                                            event["logprobs"] = logprobs;
+                                        }
+
                                         tx.send(Ok(Bytes::from(format!("data: {}\n\n", event))))
                                             .map_err(|_| "Channel closed".to_string())?;
                                     }
