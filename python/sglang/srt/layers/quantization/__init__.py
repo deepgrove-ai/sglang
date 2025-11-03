@@ -54,6 +54,7 @@ from sglang.srt.layers.quantization.moe_wna16 import MoeWNA16Config
 from sglang.srt.layers.quantization.mxfp4 import Mxfp4Config
 from sglang.srt.layers.quantization.petit import PetitNvFp4Config
 from sglang.srt.layers.quantization.qoq import QoQConfig
+from sglang.srt.layers.quantization.ternary import TernaryConfig
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config
 from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8Config
 from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8Config
@@ -83,6 +84,7 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "w4afp8": W4AFp8Config,
     "petit_nvfp4": PetitNvFp4Config,
     "fbgemm_fp8": FBGEMMFp8Config,
+    "ternary": TernaryConfig,  # Ternary quantization with FP8 storage
 }
 
 

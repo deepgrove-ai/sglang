@@ -94,6 +94,7 @@ from sglang.srt.model_loader.weight_utils import (
     safetensors_weights_iterator,
     set_runai_streamer_env,
 )
+# Ternary quantization now handled via native QuantizationConfig
 from sglang.srt.utils import (
     get_bool_env_var,
     get_device_capability,
@@ -183,6 +184,9 @@ def _get_quantization_config(
 ) -> Optional[QuantizationConfig]:
     """Get the quantization config."""
     if model_config.quantization is not None:
+        # Special case: ternary uses runtime hook, not QuantizationConfig
+        if model_config.quantization == "ternary":
+            return None
         quant_config = get_quant_config(
             model_config, load_config, packed_modules_mapping
         )
@@ -594,6 +598,11 @@ class DefaultModelLoader(BaseModelLoader):
                 model, self._get_all_weights(model_config, model), target_device
             )
 
+        # Apply ternary quantization (runtime hook approach)
+        if model_config.quantization == "ternary":
+            from sglang.srt.model_loader.ternary_hook import apply_ternary_quantization
+            model = apply_ternary_quantization(model, threshold_scale=0.7, verbose=True)
+
         return model.eval()
 
     @staticmethod
@@ -725,6 +734,11 @@ class DummyModelLoader(BaseModelLoader):
             # NOTE(woosuk): For accurate performance evaluation, we assign
             # random values to the weights.
             initialize_dummy_weights(model)
+
+            # Apply ternary quantization (runtime hook approach)
+            if model_config.quantization == "ternary":
+                from sglang.srt.model_loader.ternary_hook import apply_ternary_quantization
+                model = apply_ternary_quantization(model, threshold_scale=0.7, verbose=True)
 
             post_load_weights(model, model_config)
 
@@ -1382,6 +1396,7 @@ class BitsAndBytesModelLoader(BaseModelLoader):
                 )
 
                 self._load_weights(model_config, model)
+
 
         return model.eval()
 

@@ -93,6 +93,7 @@ QUANTIZATION_CHOICES = [
     "w4afp8",
     "mxfp4",
     "compressed-tensors",  # for Ktransformers
+    "ternary",  # Ternary quantization with FP8 storage (Option B)
 ]
 
 ATTENTION_BACKEND_CHOICES = [

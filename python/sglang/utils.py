@@ -357,9 +357,9 @@ def download_and_cache_file(url: str, filename: Optional[str] = None):
 
 
 def is_in_ci():
-    from sglang.test.test_utils import is_in_ci
-
-    return is_in_ci()
+    # Check if we're in CI environment
+    import os
+    return os.getenv('CI') == 'true' or os.getenv('GITHUB_ACTIONS') == 'true'
 
 
 def print_highlight(html_content: str):
