@@ -40,44 +40,59 @@ def apply_ternary_quantization(
 
     import os
     th = float(os.environ.get("TERNARY_THRESHOLD_SCALE", str(threshold_scale)))
-    max_out = int(os.environ.get("TERNARY_MAX_OUTPUT_FEATURES", "100000"))
     
-    # Read I2_S mode from environment variable
-    use_i2s = os.environ.get("TERNARY_USE_I2S", "0") == "1"
+    # Default to i2s storage mode (can override with TERNARY_STORAGE_MODE env var if needed)
+    storage_mode = os.environ.get("TERNARY_STORAGE_MODE", "i2s")
     
-    # Read FP8 block size from environment (optional)
-    fp8_block_k = int(os.environ.get("TERNARY_FP8_BLOCK_K", "128"))
-    fp8_block_n = int(os.environ.get("TERNARY_FP8_BLOCK_N", "128"))
-    fp8_block_size = (fp8_block_n, fp8_block_k)
     
     cfg = TernaryConfig(
         threshold_scale=th,
-        max_output_features=max_out,
-        fp8_block_size=fp8_block_size,
-        use_i2s=use_i2s
+        storage_mode=storage_mode
     )
     
-    if verbose or use_i2s:
+    if verbose or storage_mode == "fp16":
         logger.info(
-            f"TernaryConfig: threshold_scale={th}, max_output_features={max_out}, "
-            f"fp8_block_size={fp8_block_size}, use_i2s={use_i2s}"
+            f"TernaryConfig: threshold_scale={th}, "
+            f"storage_mode={storage_mode}"
         )
 
     applied, quantized = 0, 0
     first_ternary_method = None  # Keep reference to first instance for final summary
     
-    for m in model.modules():
+    # IMPORTANT:
+    # - If the model was constructed with quant_config=TernaryConfig (the usual
+    #   `--quantization ternary` path), then LinearBase already attached a
+    #   TernaryLinearMethod and `load_weights_and_postprocess` has *already*
+    #   run `process_weights_after_loading` once. In that case we MUST NOT
+    #   quantize again, or we would be quantizing already-quantized weights.
+    # - If the model was built without quant_config, this hook will attach
+    #   TernaryLinearMethod and perform quantization exactly once.
+    for prefix, m in model.named_modules():
         if isinstance(m, LinearBase):
-            qm = getattr(m, "quant_method", None)
-            # Always recreate quant_method to ensure correct config (especially for I2_S mode)
-            # This ensures environment variables are properly applied
-            m.quant_method = TernaryLinearMethod(cfg)
-            if first_ternary_method is None:
-                first_ternary_method = m.quant_method
+            existing_qm = getattr(m, "quant_method", None)
+
+            if _is_ternary_linear_method(existing_qm):
+                # Already using ternary; just track stats and reuse
+                if first_ternary_method is None:
+                    first_ternary_method = existing_qm
+                applied += 1
+                # Do NOT call process_weights_after_loading again.
+                continue
+
+            # Model was not built with a ternary quant_config; decide if this
+            # layer should be quantized according to TernaryConfig rules.
+            qm = cfg.get_quant_method(m, prefix=prefix)
+            if qm is None:
+                continue
+
+            m.quant_method = qm
+            if first_ternary_method is None and _is_ternary_linear_method(qm):
+                first_ternary_method = qm
             applied += 1
-            # Proactively quantize weights now to avoid first-request latency
+
+            # First-time quantization for this layer
             try:
-                m.quant_method.process_weights_after_loading(m)
+                qm.process_weights_after_loading(m)
                 quantized += 1
             except Exception as e:  # best-effort; fallback will be used if needed
                 logger.debug(f"Ternary quantization skipped for {m.__class__.__name__}: {e}")
@@ -110,9 +125,6 @@ def apply_ternary_quantization(
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
     
-    # Log final memory summary after all layers are processed
-    if first_ternary_method is not None:
-        first_ternary_method.log_final_memory_summary()
     
     return model
 
