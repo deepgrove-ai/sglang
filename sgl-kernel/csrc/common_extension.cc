@@ -155,6 +155,13 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("awq_dequantize(Tensor qweight, Tensor scales, Tensor qzeros) -> Tensor");
   m.impl("awq_dequantize", torch::kCUDA, &awq_dequantize);
 
+  /*
+   * From csrc/quantization/i2s_cutlass_kernel
+   */
+  m.def(
+      "i2s_cutlass_matmul(Tensor! out, Tensor x, Tensor weight_packed, Tensor alpha, Tensor bias, int K) -> ()");
+  m.impl("i2s_cutlass_matmul", torch::kCUDA, &i2s_cutlass_matmul);
+
   m.def(
       "int8_scaled_mm(Tensor mat_a, Tensor mat_b, Tensor scales_a, Tensor scales_b, ScalarType out_dtype, Tensor? "
       "bias) -> Tensor");

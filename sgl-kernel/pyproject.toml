@@ -33,6 +33,7 @@ exclude = [
 [tool.scikit-build]
 cmake.build-type = "Release"
 minimum-version = "build-system.requires"
+cmake.args = ["-DCMAKE_POLICY_VERSION_MINIMUM=3.5"]
 
 wheel.py-api = "cp310"
 wheel.license-files = []

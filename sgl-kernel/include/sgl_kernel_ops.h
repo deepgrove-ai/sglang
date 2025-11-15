@@ -242,6 +242,17 @@ torch::Tensor fp8_scaled_mm(
     const torch::Tensor& scales_b,
     const torch::Dtype& out_dtype,
     const c10::optional<torch::Tensor>& bias);
+/*
+ * From csrc/quantization/i2s_cutlass_kernel
+ */
+void i2s_cutlass_matmul(
+    torch::Tensor const& out,
+    torch::Tensor const& x,
+    torch::Tensor const& weight_packed,
+    torch::Tensor const& alpha,
+    torch::Tensor const& bias,
+    int64_t K);
+
 torch::Tensor fp8_blockwise_scaled_mm(
     const torch::Tensor& mat_a,
     const torch::Tensor& mat_b,

@@ -8,6 +8,11 @@ include(FetchContent)
 # CMake
 cmake_policy(SET CMP0169 OLD)
 cmake_policy(SET CMP0177 NEW)
+# Workaround for dlpack compatibility with CMake 4.x
+if(POLICY CMP0144)
+    cmake_policy(SET CMP0144 NEW)
+endif()
+set(CMAKE_POLICY_DEFAULT_CMP0144 NEW)
 set(CMAKE_COLOR_DIAGNOSTICS ON)
 set(CMAKE_VERBOSE_MAKEFILE ON CACHE BOOL "ON")
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
@@ -289,6 +294,7 @@ set(SOURCES
     "csrc/common_extension.cc"
 
     "csrc/quantization/gguf/gguf_kernel.cu"
+    "csrc/quantization/i2s_cutlass_kernel.cu"
 
     "csrc/gemm/awq_kernel.cu"
     "csrc/gemm/bmm_fp8.cu"
