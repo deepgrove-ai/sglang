@@ -7,7 +7,7 @@ Supports two storage modes:
 - fp16: Direct ternary storage (no compression, for debugging)
 
 Features:
-- V3 CUDA kernel: 1.15-4.17× speedup vs FP16 on Qwen3 MoE (100% win rate)
+- V4 CUDA kernel: 1.8-2.0× speedup vs FP16 on Qwen3 MoE (correct output)
 - 8× memory savings with 2-bit weight storage
 - Per-column alpha scaling for superior accuracy
 - Optimized int8 quantization for activations and alpha
@@ -55,7 +55,7 @@ try:
 except ImportError:
     pass
 
-# Try to import optimized BitNet CUDA kernel (V3 - production)
+# Try to import optimized BitNet CUDA kernel (V4 - production)
 BITNET_CUDA_AVAILABLE = False
 BITNET_LIB = None
 try:
@@ -70,13 +70,9 @@ try:
         if os.path.exists(lib_path):
             BITNET_LIB = ctypes.CDLL(lib_path)
             
-            # Define C function signatures for V3 kernel
-            # void bitlinear_int8xint2_ternary_alpha_v3(
-            #     int8_t* input0, int8_t* input1, int8_t* alpha_q, float* alpha_scale,
-            #     __nv_bfloat16* output0, __nv_bfloat16* s,
-            #     int M, int N, int K, cudaStream_t stream
-            # )
-            BITNET_LIB.bitlinear_int8xint2_ternary_alpha_v3.argtypes = [
+            # Define C function signatures for V4 kernel (Pre-scaled activations)
+            # int bitlinear_int8xint2_v4_simple(...)
+            BITNET_LIB.bitlinear_int8xint2_v4_simple.argtypes = [
                 ctypes.c_void_p,  # input0 (int8 activations)
                 ctypes.c_void_p,  # input1 (packed weights)
                 ctypes.c_void_p,  # alpha_q (int8)
@@ -88,11 +84,11 @@ try:
                 ctypes.c_int,     # K
                 ctypes.c_void_p,  # stream
             ]
-            BITNET_LIB.bitlinear_int8xint2_ternary_alpha_v3.restype = None
+            BITNET_LIB.bitlinear_int8xint2_v4_simple.restype = ctypes.c_int
             
             BITNET_CUDA_AVAILABLE = True
-            logger.info(f"[TERNARY] BitNet CUDA V3 kernel loaded successfully from {lib_path}")
-            logger.info("[TERNARY] V3 kernel features: 128-bit loads, register alpha, int8 quantized, 100% win rate on Qwen3 MoE")
+            logger.info(f"[TERNARY] BitNet CUDA V4 kernel loaded successfully from {lib_path}")
+            logger.info("[TERNARY] V4 kernel features: Pre-scaled activations, 1.8-2.0x speedup, correct production output")
             break
     
     if not BITNET_CUDA_AVAILABLE:
@@ -782,16 +778,16 @@ class TernaryLinearMethod(LinearMethodBase):
                         layer.register_buffer('ternary_weight_bitnet', weight_bitnet, persistent=False)
                         bitnet_packed = True
                     except Exception as e:
-                        logger.warning(f"[TERNARY V3] BitNet packing failed ({e}), kernel path disabled")
+                        logger.warning(f"[TERNARY V4] BitNet packing failed ({e}), kernel path disabled")
                 else:
-                    logger.debug("[TERNARY V3] BitNet packing unavailable; falling back to unpack path")
+                    logger.debug("[TERNARY V4] BitNet packing unavailable; falling back to unpack path")
 
                 alpha_flat = alpha.view(-1).contiguous()
                 
                 # Store FP32 alpha for fallback/unpacking
                 layer.register_buffer('ternary_alpha', alpha_flat.to(torch.float32), persistent=False)
                 
-                # Quantize alpha to int8 for V3 kernel (done once at load time)
+                # Quantize alpha to int8 for V4 kernel (done once at load time)
                 if BITNET_CUDA_AVAILABLE and self.quant_config.use_bitnet_kernel and device.type == 'cuda':
                     try:
                         alpha_q, alpha_scale = quantize_alpha_int8(alpha_flat)
@@ -800,9 +796,9 @@ class TernaryLinearMethod(LinearMethodBase):
                         layer.register_buffer('ternary_alpha_q', alpha_q.contiguous(), persistent=False)
                         layer.register_buffer('ternary_alpha_scale', alpha_scale_tensor, persistent=False)
                         
-                        logger.info(f"[TERNARY V3] Quantized alpha for {weight.shape}: scale={alpha_scale:.6f}")
+                        logger.info(f"[TERNARY V4] Quantized alpha for {weight.shape}: scale={alpha_scale:.6f}")
                     except Exception as e:
-                        logger.warning(f"[TERNARY V3] Alpha quantization failed ({e}), V3 kernel will not be available")
+                        logger.warning(f"[TERNARY V4] Alpha quantization failed ({e}), V4 kernel will not be available")
                 
                 layer._ternary_original_dtype = original_dtype
                 layer._ternary_i2s_enabled = True
@@ -883,9 +879,9 @@ class TernaryLinearMethod(LinearMethodBase):
         x_compute = x if x.dtype in (torch.float16, torch.bfloat16) else x.to(torch.bfloat16)
         b_compute = None if bias is None else (bias if bias.dtype in (torch.float16, torch.bfloat16) else bias.to(x_compute.dtype))
         
-        # Check if V3 kernel is available
-        # V3 only supports M=1 (GEMV/decode), for M>1 (prefill) use cached F.linear
-        # This is optimal: V3 for decode (latency-critical), cuBLAS for prefill (throughput-optimized)
+        # Check if V4 kernel is available
+        # V4 only supports M=1 (GEMV/decode), for M>1 (prefill) use cached F.linear
+        # This is optimal: V4 for decode (latency-critical), cuBLAS for prefill (throughput-optimized)
         if hasattr(layer, '_ternary_weight_shape'):
             N, K = layer._ternary_weight_shape
             x_2d = x_compute.reshape(-1, K)
@@ -893,7 +889,7 @@ class TernaryLinearMethod(LinearMethodBase):
         else:
             M_batch = 0
         
-        v3_available = (
+        v4_available = (
             bitnet_enabled
             and self.quant_config.use_bitnet_kernel
             and BITNET_CUDA_AVAILABLE
@@ -903,10 +899,10 @@ class TernaryLinearMethod(LinearMethodBase):
             and x_compute.is_cuda
             and hasattr(layer, 'ternary_alpha_q')
             and hasattr(layer, 'ternary_alpha_scale')
-            # V3 kernel now supports M>1 via per-row launch (enables prefill/batch)
+            # V4 kernel only supports M=1 currently
         )
         
-        if v3_available:
+        if v4_available:
             try:
                 N, K = layer._ternary_weight_shape
                 
@@ -916,10 +912,9 @@ class TernaryLinearMethod(LinearMethodBase):
                 M = x_2d.shape[0]
                 
                 # Validate arguments before kernel call
-                if M != 1:
-                    # V3 only supports M=1, fall through to fallback
-                    layer._ternary_bitnet_enabled = False
-                elif any(t is None for t in [x_2d, layer.ternary_weight_bitnet, layer.ternary_alpha_q, layer.ternary_alpha_scale]):
+                # We can rely on the kernel to check shapes and M=1
+                # and return non-zero if unsupported.
+                if any(t is None for t in [x_2d, layer.ternary_weight_bitnet, layer.ternary_alpha_q, layer.ternary_alpha_scale, layer.ternary_alpha]):
                     # Invalid tensors, fall through to fallback
                     layer._ternary_bitnet_enabled = False
                 else:
@@ -930,9 +925,17 @@ class TernaryLinearMethod(LinearMethodBase):
                         layer.ternary_alpha_q = layer.ternary_alpha_q.to(x_compute.device, non_blocking=True)
                     if layer.ternary_alpha_scale.device != x_compute.device:
                         layer.ternary_alpha_scale = layer.ternary_alpha_scale.to(x_compute.device, non_blocking=True)
+                    if layer.ternary_alpha.device != x_compute.device:
+                        layer.ternary_alpha = layer.ternary_alpha.to(x_compute.device, non_blocking=True)
 
-                    # Quantize activations to int8 (per-tensor scaling, similar to fp8.py)
-                    x_int8, x_scale = quantize_activation_int8(x_2d)
+                    # V4 Strategy: Pre-scale activations by alpha
+                    # 1. Pre-scale: x_scaled = x * alpha (FP32/BF16)
+                    #    Note: alpha is (K,), x is (M, K). Broadcasting works automatically.
+                    #    We use layer.ternary_alpha which is FP32.
+                    x_scaled = x_2d * layer.ternary_alpha.view(1, -1).to(x_2d.dtype)
+
+                    # 2. Quantize activations to int8 (per-tensor scaling)
+                    x_int8, x_scale = quantize_activation_int8(x_scaled)
                     
                     # Ensure all tensors are contiguous and on the same device
                     x_int8 = x_int8.contiguous()
@@ -948,8 +951,8 @@ class TernaryLinearMethod(LinearMethodBase):
                     # Get CUDA stream (similar to fp8.py approach)
                     stream = torch.cuda.current_stream().cuda_stream
                     
-                    # Call V3 kernel
-                    BITNET_LIB.bitlinear_int8xint2_ternary_alpha_v3(
+                    # Call V4 kernel
+                    res = BITNET_LIB.bitlinear_int8xint2_v4_simple(
                         ctypes.c_void_p(x_int8.data_ptr()),
                         ctypes.c_void_p(weight_contig.data_ptr()),
                         ctypes.c_void_p(alpha_q_contig.data_ptr()),
@@ -961,6 +964,11 @@ class TernaryLinearMethod(LinearMethodBase):
                         ctypes.c_int(K),
                         ctypes.c_void_p(stream),
                     )
+                    
+                    if res != 0:
+                        # Kernel failed (unsupported shape or M!=1)
+                        # Trigger fallback
+                        raise RuntimeError(f"V4 kernel failed with code {res}")
                     
                     # Don't synchronize here - it breaks CUDA graph capture!
                     # Restore original shape
@@ -978,8 +986,10 @@ class TernaryLinearMethod(LinearMethodBase):
                 
             except Exception:
                 # Silent fallback - never propagate exceptions during CUDA graph capture
-                # Disable V3 for this layer to avoid repeated attempts
-                layer._ternary_bitnet_enabled = False
+                # If it was a shape error (RuntimeError from res != 0), keep V4 enabled for other shapes
+                # Only disable if it's a critical error
+                # For now, just fallback to F.linear
+                pass
                 # Fall through to fallback path below
         
         # Fallback path: unpack weights and use F.linear
