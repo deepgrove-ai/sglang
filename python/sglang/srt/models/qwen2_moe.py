@@ -561,11 +561,31 @@ class Qwen2MoeModel(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
+        # Macroscale profiling
+        try:
+            from sglang.srt.layers.quantization.ternary import _macro_profiler
+            mode_str = forward_batch.forward_mode.name if hasattr(forward_batch.forward_mode, 'name') else "UNKNOWN"
+        except (ImportError, AttributeError):
+            mode_str = "UNKNOWN"
+        
         if self.pp_group.is_first_rank:
+            try:
+                from sglang.srt.layers.quantization.ternary import _macro_profiler
+                _macro_profiler.start(f"embedding({mode_str})")
+            except (ImportError, AttributeError):
+                pass
+            
             if input_embeds is None:
                 hidden_states = self.embed_tokens(input_ids)
             else:
                 hidden_states = input_embeds
+            
+            try:
+                from sglang.srt.layers.quantization.ternary import _macro_profiler
+                _macro_profiler.end(f"embedding({mode_str})")
+            except (ImportError, AttributeError):
+                pass
+            
             residual = None
         else:
             assert pp_proxy_tensors is not None
@@ -610,10 +630,22 @@ class Qwen2MoeModel(nn.Module):
             )
         else:
             if hidden_states.shape[0] != 0:
+                try:
+                    from sglang.srt.layers.quantization.ternary import _macro_profiler
+                    _macro_profiler.start(f"layer_norm({mode_str})")
+                except (ImportError, AttributeError):
+                    pass
+                
                 if residual is None:
                     hidden_states = self.norm(hidden_states)
                 else:
                     hidden_states, _ = self.norm(hidden_states, residual)
+                
+                try:
+                    from sglang.srt.layers.quantization.ternary import _macro_profiler
+                    _macro_profiler.end(f"layer_norm({mode_str})")
+                except (ImportError, AttributeError):
+                    pass
 
         if len(aux_hidden_states) == 0:
             return hidden_states

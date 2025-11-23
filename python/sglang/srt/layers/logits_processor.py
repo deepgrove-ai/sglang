@@ -573,6 +573,14 @@ class LogitsProcessor(nn.Module):
         last position (e.g., extend without input logprobs). The caller should
         guarantee the given hidden_states follow this constraint.
         """
+        # Macroscale profiling
+        try:
+            from sglang.srt.layers.quantization.ternary import _macro_profiler
+            mode_str = logits_metadata.forward_mode.name if hasattr(logits_metadata.forward_mode, 'name') else "UNKNOWN"
+            _macro_profiler.start(f"lm_head({mode_str})")
+        except (ImportError, AttributeError):
+            pass
+        
         if self.do_tensor_parallel_all_gather_dp_attn:
             logits_metadata.compute_dp_attention_metadata()
             hidden_states, local_hidden_states = (
@@ -609,6 +617,13 @@ class LogitsProcessor(nn.Module):
                 logits = lm_head.quant_method.apply(
                     lm_head, hidden_states, embedding_bias
                 )
+        
+        try:
+            from sglang.srt.layers.quantization.ternary import _macro_profiler
+            mode_str = logits_metadata.forward_mode.name if hasattr(logits_metadata.forward_mode, 'name') else "UNKNOWN"
+            _macro_profiler.end(f"lm_head({mode_str})")
+        except (ImportError, AttributeError):
+            pass
 
         if self.logit_scale is not None:
             logits.mul_(self.logit_scale)

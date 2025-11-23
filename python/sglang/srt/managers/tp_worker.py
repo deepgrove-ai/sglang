@@ -344,6 +344,14 @@ class TpModelWorker(BaseTpWorker):
         is_verify: bool = False,
         skip_attn_backend_init=False,
     ) -> GenerationBatchResult:
+        # Macroscale profiling
+        try:
+            from sglang.srt.layers.quantization.ternary import _macro_profiler
+            batch_type = "decode" if (model_worker_batch and not model_worker_batch.is_prefill_only) else "prefill"
+            _macro_profiler.start(f"tp_worker.forward_batch_generation({batch_type})")
+        except (ImportError, AttributeError):
+            pass
+        
         # FIXME(lsyin): maybe remove skip_attn_backend_init in forward_batch_generation,
         #               which requires preparing replay to always be in this function
 
@@ -414,6 +422,13 @@ class TpModelWorker(BaseTpWorker):
                     logits_output, forward_batch
                 )
 
+            try:
+                from sglang.srt.layers.quantization.ternary import _macro_profiler
+                batch_type = "decode" if (model_worker_batch and not model_worker_batch.is_prefill_only) else "prefill"
+                _macro_profiler.end(f"tp_worker.forward_batch_generation({batch_type})")
+            except (ImportError, AttributeError):
+                pass
+            
             return batch_result
         else:
             pp_proxy_tensors, can_run_cuda_graph = self.model_runner.forward(
@@ -421,6 +436,14 @@ class TpModelWorker(BaseTpWorker):
                 pp_proxy_tensors=pp_proxy_tensors,
                 skip_attn_backend_init=skip_attn_backend_init,
             )
+            
+            try:
+                from sglang.srt.layers.quantization.ternary import _macro_profiler
+                batch_type = "decode" if (forward_batch and forward_batch.forward_mode.is_decode()) else "prefill"
+                _macro_profiler.end(f"tp_worker.forward_batch_generation({batch_type})")
+            except (ImportError, AttributeError):
+                pass
+            
             return GenerationBatchResult(
                 pp_hidden_states_proxy_tensors=pp_proxy_tensors,
                 can_run_cuda_graph=can_run_cuda_graph,

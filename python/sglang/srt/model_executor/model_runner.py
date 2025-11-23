@@ -2200,6 +2200,14 @@ class ModelRunner:
         reinit_attn_backend: bool = False,
         split_forward_count: int = 1,
     ) -> Tuple[Union[LogitsProcessorOutput, PPProxyTensors], bool]:
+        # Macroscale profiling
+        try:
+            from sglang.srt.layers.quantization.ternary import _macro_profiler
+            mode_str = forward_batch.forward_mode.name if hasattr(forward_batch.forward_mode, 'name') else str(forward_batch.forward_mode)
+            _macro_profiler.start(f"model_runner.forward({mode_str})")
+        except (ImportError, AttributeError):
+            pass
+        
         self.forward_pass_id += 1
 
         with get_global_expert_distribution_recorder().with_forward_pass(
@@ -2216,6 +2224,13 @@ class ModelRunner:
 
         if self.eplb_manager is not None:
             self.eplb_manager.on_forward_pass_end()
+
+        try:
+            from sglang.srt.layers.quantization.ternary import _macro_profiler
+            mode_str = forward_batch.forward_mode.name if hasattr(forward_batch.forward_mode, 'name') else str(forward_batch.forward_mode)
+            _macro_profiler.end(f"model_runner.forward({mode_str})")
+        except (ImportError, AttributeError):
+            pass
 
         return output
 
@@ -2305,12 +2320,25 @@ class ModelRunner:
         Returns:
             A list of next_token_ids
         """
+        # Macroscale profiling
+        try:
+            from sglang.srt.layers.quantization.ternary import _macro_profiler
+            _macro_profiler.start("model_runner.sample")
+        except (ImportError, AttributeError):
+            pass
+        
         # For duplex models with multiple output streams.
         if isinstance(logits_output, tuple):
-            return torch.stack(
+            result = torch.stack(
                 [self.sample(values, forward_batch) for values in logits_output],
                 axis=-1,
             )
+            try:
+                from sglang.srt.layers.quantization.ternary import _macro_profiler
+                _macro_profiler.end("model_runner.sample")
+            except (ImportError, AttributeError):
+                pass
+            return result
 
         self._preprocess_logits(logits_output, forward_batch.sampling_info)
         # Sample the next tokens
@@ -2327,6 +2355,13 @@ class ModelRunner:
                 else forward_batch.seq_lens - 1
             ),
         )
+        
+        try:
+            from sglang.srt.layers.quantization.ternary import _macro_profiler
+            _macro_profiler.end("model_runner.sample")
+        except (ImportError, AttributeError):
+            pass
+        
         return next_token_ids
 
     def compute_logprobs_only(

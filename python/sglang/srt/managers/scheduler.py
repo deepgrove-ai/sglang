@@ -1884,6 +1884,14 @@ class Scheduler(
         self, batch: ScheduleBatch
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         """Run a batch."""
+        # Macroscale profiling
+        try:
+            from sglang.srt.layers.quantization.ternary import _macro_profiler
+            batch_type = "decode" if batch.forward_mode.is_decode() else "prefill" if batch.forward_mode.is_extend() else "other"
+            _macro_profiler.start(f"scheduler.run_batch({batch_type})")
+        except (ImportError, AttributeError):
+            pass
+        
         self.forward_ct += 1
 
         # Whether to run the profiler
@@ -1983,11 +1991,26 @@ class Scheduler(
             batch_result.extend_logprob_start_len_per_req = (
                 extend_logprob_start_len_per_req
             )
+            
+            try:
+                from sglang.srt.layers.quantization.ternary import _macro_profiler
+                batch_type = "decode" if batch.forward_mode.is_decode() else "prefill" if batch.forward_mode.is_extend() else "other"
+                _macro_profiler.end(f"scheduler.run_batch({batch_type})")
+            except (ImportError, AttributeError):
+                pass
+            
             return batch_result
         else:  # embedding or reward model
             model_worker_batch = batch.get_model_worker_batch()
             embeddings = self.tp_worker.forward_batch_embedding(model_worker_batch)
             ret = EmbeddingBatchResult(embeddings=embeddings)
+            
+            try:
+                from sglang.srt.layers.quantization.ternary import _macro_profiler
+                _macro_profiler.end(f"scheduler.run_batch(embedding)")
+            except (ImportError, AttributeError):
+                pass
+            
         return ret
 
     def launch_batch_sample_if_needed(

@@ -102,6 +102,8 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             use_grouped_topk=False,
         )
 
+        # Use raw FP16 for MoE experts (not ternary quantization)
+        # This improves decode performance by avoiding fast path overhead
         self.experts = get_moe_impl_class(quant_config)(
             num_experts=config.num_experts
             + get_global_server_args().ep_num_redundant_experts,
@@ -109,7 +111,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             layer_id=layer_id,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
-            quant_config=quant_config,
+            quant_config=None,  # Use FP16 instead of ternary quantization for MoE experts
             prefix=add_prefix("experts", prefix),
         )
 
@@ -540,17 +542,35 @@ class Qwen3MoeDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Macroscale profiling - aggregate across all layers
+        try:
+            from sglang.srt.layers.quantization.ternary import _macro_profiler
+            mode_str = forward_batch.forward_mode.name if hasattr(forward_batch.forward_mode, 'name') else "UNKNOWN"
+        except (ImportError, AttributeError):
+            mode_str = "UNKNOWN"
 
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states, residual, forward_batch
         )
 
         if hidden_states.shape[0] != 0:
+            try:
+                from sglang.srt.layers.quantization.ternary import _macro_profiler
+                _macro_profiler.start(f"attention_all_layers({mode_str})")
+            except (ImportError, AttributeError):
+                pass
+            
             hidden_states = self.self_attn(
                 positions=positions,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
             )
+            
+            try:
+                from sglang.srt.layers.quantization.ternary import _macro_profiler
+                _macro_profiler.end(f"attention_all_layers({mode_str})")
+            except (ImportError, AttributeError):
+                pass
 
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
@@ -567,9 +587,21 @@ class Qwen3MoeDecoderLayer(nn.Module):
             forward_batch
         )
 
+        try:
+            from sglang.srt.layers.quantization.ternary import _macro_profiler
+            _macro_profiler.start(f"mlp_all_layers({mode_str})")
+        except (ImportError, AttributeError):
+            pass
+        
         hidden_states = self.mlp(
             hidden_states, forward_batch, should_allreduce_fusion, use_reduce_scatter
         )
+        
+        try:
+            from sglang.srt.layers.quantization.ternary import _macro_profiler
+            _macro_profiler.end(f"mlp_all_layers({mode_str})")
+        except (ImportError, AttributeError):
+            pass
 
         if should_allreduce_fusion:
             hidden_states._sglang_needs_allreduce_fusion = True
