@@ -17,11 +17,12 @@ source "$SCRIPT_DIR/activate_env.sh"
 QUANT_MODE="${1:-i2s}"  # Default to i2s if not specified
 
 # Validate mode
-if [[ ! "$QUANT_MODE" =~ ^(fp16|i2s|i2s-kvfp8|i2s-fp8)$ ]]; then
+if [[ ! "$QUANT_MODE" =~ ^(fp16|i2s|i2s-tuned|i2s-kvfp8|i2s-fp8)$ ]]; then
     echo "Error: Invalid quantization mode '$QUANT_MODE'"
-    echo "Usage: $0 [fp16|i2s|i2s-kvfp8|i2s-fp8]"
+    echo "Usage: $0 [fp16|i2s|i2s-tuned|i2s-kvfp8|i2s-fp8]"
     echo "  fp16:      Pure FP16/BF16 (no quantization, baseline)"
     echo "  i2s:       Ternary + I2_S (8x memory reduction, FP16 inference)"
+    echo "  i2s-tuned: Ternary + I2_S + Optimized FlashInfer (RECOMMENDED)"
     echo "  i2s-kvfp8: Ternary + I2_S + FP8 KV Cache (Lower memory, faster attention)"
     echo "  i2s-fp8:   Ternary + I2_S + FP8 tensor cores (fastest inference)"
     exit 1
@@ -37,9 +38,9 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # INFO: Shows quantized layers and important events (default)
 export SGLANG_TERNARY_LOG_LEVEL="${SGLANG_TERNARY_LOG_LEVEL:-INFO}"
 
-# Enable ternary profiling (set to 0 to disable)
+# Enable ternary profiling (set to 1 to enable for debugging)
 # When enabled, tracks timing for ternary operations and saves to JSON file
-export TERNARY_ENABLE_PROFILING="${TERNARY_ENABLE_PROFILING:-1}"
+export TERNARY_ENABLE_PROFILING="${TERNARY_ENABLE_PROFILING:-0}"
 export TERNARY_PROFILE_OUTPUT="${TERNARY_PROFILE_OUTPUT:-/tmp/ternary_profile.json}"
 
 # Mode-specific configuration
@@ -56,6 +57,17 @@ case "$QUANT_MODE" in
         # Enable FlashInfer by default as it is generally faster for decode on H100
         QUANT_FLAG="--quantization ternary --attention-backend flashinfer"
         QUANT_DESC="Ternary + I2_S (8x memory reduction, FP16 inference)"
+        ;;
+    
+    i2s-tuned)
+        # Ternary + I2S + Tuned FlashInfer (RECOMMENDED for H100)
+        # Optimizes attention computation with tensor cores and larger workspace
+        export SGLANG_FLASHINFER_USE_TENSOR_CORE=true
+        export SGLANG_FLASHINFER_WORKSPACE_SIZE=$((1024*1024*1024))  # 1GB
+        export SGLANG_FLASHINFER_DECODE_SPLIT_TILE_SIZE=4096
+        QUANT_FLAG="--quantization ternary --attention-backend flashinfer"
+        QUANT_DESC="Ternary + I2_S + Tuned FlashInfer (RECOMMENDED for H100)"
+        echo "Note: FlashInfer optimizations enabled (Tensor Cores, 1GB workspace, 4K tiles)"
         ;;
     
     i2s-kvfp8)

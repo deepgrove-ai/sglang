@@ -46,7 +46,7 @@ class _MacroscaleProfiler:
     """Macroscale profiler for tracking function-level timing in decode batches."""
     
     def __init__(self):
-        self.enabled = False # os.environ.get("TERNARY_ENABLE_PROFILING", "0") == "1"
+        self.enabled = False  # Disabled for production
         self.macro_stats = defaultdict(lambda: {
             'count': 0,
             'total_time_ms': 0.0,
@@ -235,7 +235,7 @@ class _TernaryProfiler:
     """Simple inline profiler for ternary operations."""
     
     def __init__(self):
-        self.enabled = False # os.environ.get("TERNARY_ENABLE_PROFILING", "0") == "1"
+        self.enabled = False  # Disabled for production
         self.stats = defaultdict(lambda: {
             'count': 0,
             'total_time_ms': 0.0,
@@ -329,9 +329,48 @@ class _TernaryProfiler:
         print(f"{'Operation':<60} {'Count':<8} {'Total (ms)':<12} {'Avg (ms)':<12} {'%':<8}", file=sys.stderr)
         print("-" * 100, file=sys.stderr)
         
+        # Group operations by category
+        quantize_ops = []
+        v4_ops = []
+        fallback_ops = []
+        skip_ops = []
+        
         for op_name, stats in summary['operations'].items():
-            print(f"{op_name:<60} {stats['count']:<8} {stats['total_ms']:<12.2f} "
-                  f"{stats['avg_ms']:<12.3f} {stats['percentage']:<8.1f}", file=sys.stderr)
+            if 'quantize' in op_name:
+                quantize_ops.append((op_name, stats))
+            elif 'v4_kernel' in op_name:
+                v4_ops.append((op_name, stats))
+            elif 'prefill_skip' in op_name:
+                skip_ops.append((op_name, stats))
+            elif 'fallback' in op_name:
+                fallback_ops.append((op_name, stats))
+        
+        # Print quantization operations
+        if quantize_ops:
+            print("\n[QUANTIZATION]", file=sys.stderr)
+            for op_name, stats in sorted(quantize_ops, key=lambda x: -x[1]['total_ms'])[:20]:
+                print(f"{op_name:<60} {stats['count']:<8} {stats['total_ms']:<12.2f} "
+                      f"{stats['avg_ms']:<12.3f} {stats['percentage']:<8.1f}", file=sys.stderr)
+        
+        # Print V4 kernel operations
+        if v4_ops:
+            print("\n[V4 KERNEL EXECUTION]", file=sys.stderr)
+            for op_name, stats in sorted(v4_ops, key=lambda x: -x[1]['total_ms'])[:20]:
+                print(f"{op_name:<60} {stats['count']:<8} {stats['total_ms']:<12.2f} "
+                      f"{stats['avg_ms']:<12.3f} {stats['percentage']:<8.1f}", file=sys.stderr)
+        
+        # Print skip operations
+        if skip_ops:
+            print("\n[PREFILL SKIP (M > threshold)]", file=sys.stderr)
+            skip_count = sum(s['count'] for _, s in skip_ops)
+            print(f"Total skipped operations: {skip_count}", file=sys.stderr)
+        
+        # Print fallback operations
+        if fallback_ops:
+            print("\n[FALLBACK (FP16 Path)]", file=sys.stderr)
+            for op_name, stats in sorted(fallback_ops, key=lambda x: -x[1]['total_ms'])[:20]:
+                print(f"{op_name:<60} {stats['count']:<8} {stats['total_ms']:<12.2f} "
+                      f"{stats['avg_ms']:<12.3f} {stats['percentage']:<8.1f}", file=sys.stderr)
         
         # Analysis
         print("\n" + "="*80, file=sys.stderr)
@@ -350,8 +389,22 @@ class _TernaryProfiler:
             print(f"Fallback Operations: {fallback_time:.2f} ms ({fallback_time/total_ops_time*100:.1f}%)", file=sys.stderr)
             print(f"Quantization Overhead: {quant_time:.2f} ms ({quant_time/total_ops_time*100:.1f}%)", file=sys.stderr)
             
+            # Breakdown quantization by M value
+            m1_quant = sum(s['total_ms'] for name, s in summary['operations'].items() if 'quantize_activation_M1_' in name)
+            m_small_quant = sum(s['total_ms'] for name, s in summary['operations'].items() 
+                               if 'quantize_activation' in name and any(f'_M{m}_' in name for m in [2,4,6,8,12,16,24,32,40,48,56,64]))
+            
+            print(f"  ├─ M=1 (decode): {m1_quant:.2f} ms ({m1_quant/total_ops_time*100:.1f}%)", file=sys.stderr)
+            print(f"  └─ M=2-64 (small batch): {m_small_quant:.2f} ms ({m_small_quant/total_ops_time*100:.1f}%)", file=sys.stderr)
+            
             if v4_time + fallback_time > 0:
                 print(f"\nV4 Kernel Efficiency: {v4_time/(v4_time+fallback_time)*100:.1f}% of quantized ops use V4", file=sys.stderr)
+            
+            # Performance estimate
+            if m1_quant > 0:
+                m1_count = sum(s['count'] for name, s in summary['operations'].items() if 'quantize_activation_M1_' in name)
+                if m1_count > 0:
+                    print(f"\nM=1 Quantization: {m1_quant/m1_count:.3f} ms per call (avg)", file=sys.stderr)
         
         print(f"\n[PROFILER] Profile saved to: {self.output_file}", file=sys.stderr)
         
@@ -1452,6 +1505,8 @@ class TernaryLinearMethod(LinearMethodBase):
             if M > PREFILL_SKIP_THRESHOLD:
                 # Large batch (prefill): Skip V4 kernel, use FP16 directly
                 # cuBLAS is highly optimized for large M, and we avoid quantization overhead
+                if _ternary_profiler.enabled:
+                    _ternary_profiler.record(f"prefill_skip_M{M}_N{N}_K{K}", 0.0)
                 pass  # Fall through to FP16 fallback path below
             else:
                 # Check if shape is supported for V4 kernel to avoid fallback overhead
