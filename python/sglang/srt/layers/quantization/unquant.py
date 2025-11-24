@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import os
+import sys
+import time
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
@@ -7,6 +10,77 @@ import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
 from sglang.srt.custom_op import CustomOp
+
+# FastProfiler for unquantized layers (FP16 baseline)
+class _FastApplyProfiler:
+    """Extremely lightweight profiler using CUDA events with deferred synchronization."""
+    def __init__(self):
+        self.enabled = os.environ.get("TERNARY_FAST_PROFILE", "0") == "1"
+        self.events = []
+        self.max_events = 50000  # Store up to 50k events
+        
+        if self.enabled:
+            # Use a different logger or print directly to avoid circular imports or setup issues
+            print("[FastProfiler-FP16] Enabled for apply()", file=sys.stderr)
+            import atexit
+            atexit.register(self.report)
+            
+    def start(self):
+        if not self.enabled:
+            return None
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        return (start, end)
+        
+    def stop(self, ctx):
+        if not self.enabled or ctx is None:
+            return
+        start, end = ctx
+        end.record()
+        if len(self.events) < self.max_events:
+            self.events.append((start, end))
+            
+    def report(self):
+        if not self.events:
+            return
+            
+        print(f"[FastProfiler-FP16] Synchronizing {len(self.events)} events...", file=sys.stderr)
+        try:
+            torch.cuda.synchronize()
+        except Exception as e:
+            print(f"[FastProfiler-FP16] Warning: Sync failed ({e}), attempting to read events anyway", file=sys.stderr)
+        
+        times = []
+        for s, e in self.events:
+            try:
+                if s.query() and e.query():
+                    times.append(s.elapsed_time(e))
+            except Exception:
+                pass
+            
+        if not times:
+            print(f"[FastProfiler-FP16] No valid timed events found (out of {len(self.events)})", file=sys.stderr)
+            return
+            
+        avg = sum(times) / len(times)
+        times.sort()
+        p50 = times[len(times)//2]
+        p95 = times[int(len(times)*0.95)]
+        p99 = times[int(len(times)*0.99)]
+        
+        print("\n" + "="*60, file=sys.stderr)
+        print(f"FastProfiler Stats (FP16 apply method)", file=sys.stderr)
+        print("="*60, file=sys.stderr)
+        print(f"Total Calls: {len(times)}", file=sys.stderr)
+        print(f"Avg Time:    {avg:.4f} ms", file=sys.stderr)
+        print(f"P50 Time:    {p50:.4f} ms", file=sys.stderr)
+        print(f"P95 Time:    {p95:.4f} ms", file=sys.stderr)
+        print(f"P99 Time:    {p99:.4f} ms", file=sys.stderr)
+        print("="*60 + "\n", file=sys.stderr)
+
+_fast_apply_profiler = _FastApplyProfiler()
+
 from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
@@ -115,6 +189,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        prof_ctx = _fast_apply_profiler.start()
 
         if use_intel_amx_backend(layer):
             x_shapes = x.shape
@@ -125,9 +200,13 @@ class UnquantizedLinearMethod(LinearMethodBase):
             )
             if len(x_shapes) == 3:
                 output = output.view(x_shapes[0], x_shapes[1], -1)
+            
+            _fast_apply_profiler.stop(prof_ctx)
             return output
 
-        return F.linear(x, layer.weight, bias)
+        out = F.linear(x, layer.weight, bias)
+        _fast_apply_profiler.stop(prof_ctx)
+        return out
 
 
 class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):

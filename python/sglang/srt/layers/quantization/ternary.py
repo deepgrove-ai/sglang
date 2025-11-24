@@ -7,7 +7,6 @@ Supports two storage modes:
 - fp16: Direct ternary storage (no compression, for debugging)
 
 Features:
-- V4 CUDA kernel: 1.8-2.0× speedup vs FP16 on Qwen3 MoE (correct output)
 - 8× memory savings with 2-bit weight storage
 - Per-column alpha scaling for superior accuracy
 - Optimized int8 quantization for activations and alpha
@@ -38,6 +37,14 @@ from sglang.srt.utils import set_weight_attrs
 
 logger = logging.getLogger(__name__)
 
+TERNARY_USE_CUDA_ACT_QUANT = os.environ.get("TERNARY_USE_CUDA_ACT_QUANT", "0") == "1"
+DEFAULT_PREFILL_SKIP_M = int(os.environ.get("TERNARY_PREFILL_SKIP_M", "64"))
+SUPPORTED_V4_NK_SHAPES = {
+    (5120, 2048),
+    (2048, 4096),
+    (2048, 2048),
+}
+
 # ============================================================================
 # Macroscale Profiler (function-level timing for decode batch breakdown)
 # ============================================================================
@@ -46,7 +53,8 @@ class _MacroscaleProfiler:
     """Macroscale profiler for tracking function-level timing in decode batches."""
     
     def __init__(self):
-        self.enabled = False  # Disabled for production
+        # Gate via env var so profiling can be toggled at runtime
+        self.enabled = os.environ.get("TERNARY_MACRO_PROFILE", "0") == "1"
         self.macro_stats = defaultdict(lambda: {
             'count': 0,
             'total_time_ms': 0.0,
@@ -235,7 +243,8 @@ class _TernaryProfiler:
     """Simple inline profiler for ternary operations."""
     
     def __init__(self):
-        self.enabled = False  # Disabled for production
+        # Enable when TERNARY_ENABLE_PROFILING=1
+        self.enabled = os.environ.get("TERNARY_ENABLE_PROFILING", "0") == "1"
         self.stats = defaultdict(lambda: {
             'count': 0,
             'total_time_ms': 0.0,
@@ -420,6 +429,75 @@ if _ternary_profiler.enabled:
     import atexit
     atexit.register(_ternary_profiler.print_summary)
 
+class _FastApplyProfiler:
+    """Extremely lightweight profiler using CUDA events with deferred synchronization."""
+    def __init__(self):
+        self.enabled = os.environ.get("TERNARY_FAST_PROFILE", "0") == "1"
+        self.events = []
+        self.max_events = 50000  # Store up to 50k events
+        
+        if self.enabled:
+            logger.info("[FastProfiler] Enabled for apply()")
+            import atexit
+            atexit.register(self.report)
+            
+    def start(self):
+        if not self.enabled:
+            return None
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        return (start, end)
+        
+    def stop(self, ctx):
+        if not self.enabled or ctx is None:
+            return
+        start, end = ctx
+        end.record()
+        if len(self.events) < self.max_events:
+            self.events.append((start, end))
+            
+    def report(self):
+        if not self.events:
+            return
+            
+        print(f"[FastProfiler] Synchronizing {len(self.events)} events...", file=sys.stderr)
+        try:
+            torch.cuda.synchronize()
+        except Exception as e:
+            print(f"[FastProfiler] Warning: Sync failed ({e}), attempting to read events anyway", file=sys.stderr)
+        
+        times = []
+        for s, e in self.events:
+            try:
+                # Check if event is recorded before querying
+                if s.query() and e.query():
+                    times.append(s.elapsed_time(e))
+            except Exception:
+                pass
+            
+        if not times:
+            print(f"[FastProfiler] No valid timed events found (out of {len(self.events)})", file=sys.stderr)
+            return
+            
+        avg = sum(times) / len(times)
+        times.sort()
+        p50 = times[len(times)//2]
+        p95 = times[int(len(times)*0.95)]
+        p99 = times[int(len(times)*0.99)]
+        
+        print("\n" + "="*60, file=sys.stderr)
+        print(f"FastProfiler Stats (apply method)", file=sys.stderr)
+        print("="*60, file=sys.stderr)
+        print(f"Total Calls: {len(times)}", file=sys.stderr)
+        print(f"Avg Time:    {avg:.4f} ms", file=sys.stderr)
+        print(f"P50 Time:    {p50:.4f} ms", file=sys.stderr)
+        print(f"P95 Time:    {p95:.4f} ms", file=sys.stderr)
+        print(f"P99 Time:    {p99:.4f} ms", file=sys.stderr)
+        print("="*60 + "\n", file=sys.stderr)
+
+_fast_apply_profiler = _FastApplyProfiler()
+
 BITNET_PACK_AVAILABLE = False
 convert_weight_int8_to_int2 = None
 try:
@@ -443,6 +521,9 @@ except ImportError:
 # Try to import optimized BitNet CUDA kernel (V4 - production)
 BITNET_CUDA_AVAILABLE = False
 BITNET_LIB = None
+BITNET_CUDA_ACT_QUANT_AVAILABLE = False
+_BITNET_ACT_FAST_FN = None
+_bitnet_act_fast_error_logged = False
 try:
     # Try to load the shared library directly
     lib_paths = [
@@ -474,6 +555,22 @@ try:
             BITNET_CUDA_AVAILABLE = True
             logger.info(f"[TERNARY] BitNet CUDA V4 kernel loaded successfully from {lib_path}")
             logger.info("[TERNARY] V4 kernel features: Pre-scaled activations, 1.8-2.0x speedup, correct production output")
+
+            if hasattr(BITNET_LIB, 'ternary_quantize_activation_fast'):
+                BITNET_LIB.ternary_quantize_activation_fast.argtypes = [
+                    ctypes.c_void_p,  # activations (bf16)
+                    ctypes.c_void_p,  # alpha (fp32)
+                    ctypes.c_void_p,  # output int8
+                    ctypes.c_void_p,  # per-row scale (bf16)
+                    ctypes.c_int,     # M
+                    ctypes.c_int,     # K
+                    ctypes.c_void_p,  # cuda stream
+                ]
+                BITNET_LIB.ternary_quantize_activation_fast.restype = ctypes.c_int
+                _BITNET_ACT_FAST_FN = BITNET_LIB.ternary_quantize_activation_fast
+                BITNET_CUDA_ACT_QUANT_AVAILABLE = True
+                if TERNARY_USE_CUDA_ACT_QUANT:
+                    logger.info("[TERNARY] CUDA fast activation quantizer enabled (ternary_quantize_activation_fast)")
             break
     
     if not BITNET_CUDA_AVAILABLE:
@@ -794,7 +891,66 @@ def get_memory_snapshot(device: Optional[torch.device] = None) -> Dict[str, int]
         'max_allocated': torch.cuda.max_memory_allocated(device),
     }
 
+@torch.inference_mode()
+def _quantize_activation_fast_cuda(
+    x: torch.Tensor,
+    alpha: torch.Tensor,
+    out_int8: Optional[torch.Tensor] = None,
+    out_scale: Optional[torch.Tensor] = None,
+) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    global _bitnet_act_fast_error_logged
 
+    if not (TERNARY_USE_CUDA_ACT_QUANT and BITNET_CUDA_ACT_QUANT_AVAILABLE and _BITNET_ACT_FAST_FN is not None):
+        return None
+
+    if not (x.is_cuda and alpha.is_cuda):
+        return None
+
+    if x.dtype != torch.bfloat16 or alpha.dtype != torch.float32:
+        return None
+
+    if x.dim() != 2:
+        return None
+
+    x_c = x.contiguous()
+    alpha_c = alpha.contiguous()
+    M, K = x_c.shape
+
+    if out_int8 is None or out_int8.shape != x_c.shape or out_int8.dtype != torch.int8 or not out_int8.is_contiguous():
+        x_int8 = torch.empty_like(x_c, dtype=torch.int8)
+    else:
+        x_int8 = out_int8
+
+    if (
+        out_scale is None
+        or out_scale.shape[0] != M
+        or out_scale.dtype != torch.bfloat16
+        or out_scale.device != x.device
+        or not out_scale.is_contiguous()
+    ):
+        scale = torch.empty(M, device=x.device, dtype=torch.bfloat16)
+    else:
+        scale = out_scale
+
+    err = _BITNET_ACT_FAST_FN(
+        ctypes.c_void_p(x_c.data_ptr()),
+        ctypes.c_void_p(alpha_c.data_ptr()),
+        ctypes.c_void_p(x_int8.data_ptr()),
+        ctypes.c_void_p(scale.data_ptr()),
+        ctypes.c_int(M),
+        ctypes.c_int(K),
+        ctypes.c_void_p(torch.cuda.current_stream().cuda_stream),
+    )
+    if err != 0:
+        if not _bitnet_act_fast_error_logged:
+            logger.warning(f"[TERNARY] CUDA fast activation quantizer failed (code {err}), disabling")
+            _bitnet_act_fast_error_logged = True
+        return None
+
+    return x_int8, scale
+
+
+@torch.inference_mode()
 def quantize_activation_prescale_fused(
     x: torch.Tensor, 
     alpha: torch.Tensor,
@@ -803,17 +959,8 @@ def quantize_activation_prescale_fused(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Fused operation: Pre-scale activations by alpha and quantize to int8.
     
-    Uses Triton kernel when available for 5x speedup, falls back to PyTorch.
-    
-    Args:
-        x: Input activation tensor (M, K), BF16
-        alpha: Per-column alpha scaling factors (K,), FP32
-        out_int8: Optional output buffer for int8 tensor (M, K)
-        out_scale: Optional output buffer for scale (M,), BF16
-    
-    Returns:
-        x_int8: Quantized int8 tensor (M, K)
-        scale: Scale factor per row (M,), BF16
+    Uses Triton kernel when available for 5x speedup, falls back to CUDA helper
+    and finally to PyTorch.
     """
     M, K = x.shape
     
@@ -862,7 +1009,11 @@ def quantize_activation_prescale_fused(
             
             return x_int8, scale
         except Exception as e:
-            logger.debug(f"[TERNARY] Triton fused quantization failed ({e}), using PyTorch fallback")
+            logger.debug(f"[TERNARY] Triton fused quantization failed ({e}), trying CUDA fallback")
+
+    fast_result = _quantize_activation_fast_cuda(x, alpha, out_int8=out_int8, out_scale=out_scale)
+    if fast_result is not None:
+        return fast_result
     
     # PyTorch fallback
     # 1. Pre-scale
@@ -1195,6 +1346,64 @@ def replace_parameter(layer: nn.Module, name: str, new_param: torch.Tensor) -> N
             layer._parameters[name] = new_param_obj
 
 
+def _device_cache_key(device: torch.device) -> Tuple[str, int]:
+    """Return a stable key for caching tensors per device."""
+    if not isinstance(device, torch.device):
+        device = torch.device(device)
+    if device.type == "cuda":
+        return (device.type, device.index if device.index is not None else torch.cuda.current_device())
+    return (device.type, -1)
+
+
+def _get_cached_tensor(
+    layer: nn.Module,
+    cache_attr: str,
+    key: Tuple[Any, ...],
+    shape: Tuple[int, ...],
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    """Fetch or allocate a tensor cache entry attached to the layer."""
+    cache = getattr(layer, cache_attr, None)
+    if cache is None:
+        cache = {}
+        setattr(layer, cache_attr, cache)
+    tensor = cache.get(key)
+    if (
+        tensor is None
+        or tensor.shape != shape
+        or tensor.dtype != dtype
+        or tensor.device != device
+    ):
+        tensor = torch.empty(shape, device=device, dtype=dtype)
+        cache[key] = tensor
+    return tensor
+
+
+def _get_fp16_fallback_weight(
+    layer: nn.Module,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    base = getattr(layer, "_ternary_weight_fp16", None)
+    if base is None:
+        return None
+    cache = getattr(layer, "_ternary_weight_fp16_cache", None)
+    if cache is None:
+        cache = {}
+        setattr(layer, "_ternary_weight_fp16_cache", cache)
+    key = (dtype, _device_cache_key(device))
+    tensor = cache.get(key)
+    if tensor is None:
+        tensor = base
+        if tensor.dtype != dtype:
+            tensor = tensor.to(dtype)
+        if tensor.device != device:
+            tensor = tensor.to(device, non_blocking=True)
+        cache[key] = tensor
+    return tensor
+
+
 @dataclass
 class TernaryConfig(QuantizationConfig):
     """Config class for ternary quantization.
@@ -1357,6 +1566,7 @@ class TernaryLinearMethod(LinearMethodBase):
                         if device.type == 'cuda':
                             weight_bitnet = weight_bitnet.to(device, non_blocking=True)
                         layer.register_buffer('ternary_weight_bitnet', weight_bitnet, persistent=False)
+                        layer._ternary_weight_bitnet_ptr = weight_bitnet.data_ptr()
                         bitnet_packed = True
                     except Exception as e:
                         logger.warning(f"[TERNARY V4] BitNet packing failed ({e}), kernel path disabled")
@@ -1377,7 +1587,27 @@ class TernaryLinearMethod(LinearMethodBase):
                         layer.register_buffer('ternary_alpha_q', alpha_q.contiguous(), persistent=False)
                         layer.register_buffer('ternary_alpha_scale', alpha_scale_tensor, persistent=False)
                         
+                        # Cache pointers as direct attributes (eliminates getattr overhead)
+                        layer._ternary_weight_bitnet_ptr = layer.ternary_weight_bitnet.data_ptr()
+                        layer._ternary_alpha_q_ptr = layer.ternary_alpha_q.data_ptr()
+                        layer._ternary_alpha_scale_ptr = layer.ternary_alpha_scale.data_ptr()
+                        
+                        # Pre-allocate buffers for common decode batch sizes (M=1 is most common)
+                        # This eliminates cache lookup overhead entirely
+                        common_batch_sizes = [1, 2, 4, 8, 16, 32]
+                        for M_prealloc in common_batch_sizes:
+                            if M_prealloc <= DEFAULT_PREFILL_SKIP_M:
+                                # Pre-allocate activation quantization buffers
+                                setattr(layer, f'_ternary_act_int8_M{M_prealloc}', 
+                                       torch.empty(M_prealloc, K, device=device, dtype=torch.int8))
+                                setattr(layer, f'_ternary_act_scale_M{M_prealloc}',
+                                       torch.empty(M_prealloc, device=device, dtype=torch.bfloat16))
+                                # Pre-allocate output buffer
+                                setattr(layer, f'_ternary_output_M{M_prealloc}',
+                                       torch.empty(M_prealloc, N, device=device, dtype=torch.bfloat16))
+                        
                         logger.info(f"[TERNARY V4] Quantized alpha for {weight.shape}: scale={alpha_scale:.6f}")
+                        logger.info(f"[TERNARY V4] Pre-allocated buffers for batch sizes: {common_batch_sizes}")
                     except Exception as e:
                         logger.warning(f"[TERNARY V4] Alpha quantization failed ({e}), V4 kernel will not be available")
                 
@@ -1386,6 +1616,8 @@ class TernaryLinearMethod(LinearMethodBase):
                 layer._ternary_fp16_enabled = False
                 layer._ternary_bitnet_enabled = bitnet_packed
                 layer._ternary_weight_shape = (N, K)
+                layer._ternary_K = K
+                layer._ternary_N = N
                 
                 del weight_fp32, absW, mask, mask_f, weight_ternary, weight_ternary_sign
                 del weight
@@ -1446,43 +1678,37 @@ class TernaryLinearMethod(LinearMethodBase):
                 import traceback
                 logger.debug(f"Quantization error traceback: {traceback.format_exc()}")
 
+    @torch.inference_mode()
     def apply(
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        # Early setup - compute once
         weight = layer.weight
-        i2s_enabled = getattr(layer, '_ternary_i2s_enabled', False)
-        fp16_enabled = getattr(layer, '_ternary_fp16_enabled', False)
-        bitnet_enabled = getattr(layer, '_ternary_bitnet_enabled', False)
-        
         x_compute = x if x.dtype in (torch.float16, torch.bfloat16) else x.to(torch.bfloat16)
+        x_shape = x_compute.shape
         b_compute = None if bias is None else (bias if bias.dtype in (torch.float16, torch.bfloat16) else bias.to(x_compute.dtype))
         
-        # Check if V4 kernel is available
-        # V4 only supports M=1 (GEMV/decode), for M>1 (prefill) use cached F.linear
-        # This is optimal: V4 for decode (latency-critical), cuBLAS for prefill (throughput-optimized)
-        # 
-        # PERFORMANCE NOTE: Why only ~10% overall speedup despite 2x kernel speedup?
-        # - V4 kernel only works for M=1 (decode phase)
-        # - Prefill (M>1) falls back to unpack+F.linear path (no speedup)
-        # - Prefill typically dominates total time (70-90% of inference time)
-        # - Only decode phase (~20-30% of time) gets 2x speedup
-        # - Overall speedup = decode_fraction * 2x = ~0.25 * 2x = ~1.25x = ~20% max
-        # - Additional factors reduce this further:
-        #   * Many layers skipped (gate/router, embed, lm_head, MoE experts)
-        #   * Activation quantization overhead for M>1 (wasted work)
-        #   * Memory bandwidth bottlenecks in prefill
-        # - To achieve higher speedup, need M>1 support in V4 kernel (like V3 had)
-        if hasattr(layer, '_ternary_weight_shape'):
-            N, K = layer._ternary_weight_shape
-            x_2d = x_compute.reshape(-1, K)
-            M_batch = x_2d.shape[0]
-        else:
-            M_batch = 0
+        # Get layer attributes once
+        weight_shape = getattr(layer, "_ternary_weight_shape", None)
+        if weight_shape is None:
+            # Early exit if not quantized
+            return F.linear(x_compute, weight, b_compute)
         
-        # V4 kernel path: Supports M=1 (decode) and M>1 (batched)
+        N, K = weight_shape
+        x_2d = x_compute.reshape(-1, K)
+        M = x_2d.shape[0]
+        
+        # Cache profiling state to avoid repeated checks
+        prof_enabled = _ternary_profiler.enabled
+        
+        # Fast profiler context (always start, stop in both paths)
+        prof_ctx = _fast_apply_profiler.start()
+        
+        # V4 kernel path: Try optimized kernel first
+        bitnet_enabled = getattr(layer, '_ternary_bitnet_enabled', False)
         if (
             bitnet_enabled
             and self.quant_config.use_bitnet_kernel
@@ -1490,149 +1716,147 @@ class TernaryLinearMethod(LinearMethodBase):
             and BITNET_LIB is not None
             and weight.dtype == torch.uint8
             and x_compute.is_cuda
-            # Remove M_batch == 1 restriction to enable batched V4 kernel
-            # and M_batch == 1  
+            and M <= DEFAULT_PREFILL_SKIP_M
+            and (N, K) in SUPPORTED_V4_NK_SHAPES
         ):
-            N, K = layer._ternary_weight_shape
-            x_shape = x_compute.shape
-            x_2d = x_compute.reshape(-1, K)
-            M = x_2d.shape[0]
-
-            # Performance optimization: Skip quantization for large M (prefill)
-            # For M > 32, quantization overhead dominates, use FP16 fallback directly
-            # This trades memory bandwidth for reduced latency on prefill-heavy workloads
-            PREFILL_SKIP_THRESHOLD = int(os.environ.get("TERNARY_PREFILL_SKIP_M", "64"))
-            if M > PREFILL_SKIP_THRESHOLD:
-                # Large batch (prefill): Skip V4 kernel, use FP16 directly
-                # cuBLAS is highly optimized for large M, and we avoid quantization overhead
-                if _ternary_profiler.enabled:
-                    _ternary_profiler.record(f"prefill_skip_M{M}_N{N}_K{K}", 0.0)
-                pass  # Fall through to FP16 fallback path below
+            # OPTIMIZATION: Use pre-allocated buffers if available (eliminates cache lookup)
+            # For common batch sizes (M=1,2,4,8,16,32), buffers are pre-allocated at init
+            buf_attr_int8 = f'_ternary_act_int8_M{M}'
+            buf_attr_scale = f'_ternary_act_scale_M{M}'
+            buf_attr_output = f'_ternary_output_M{M}'
+            
+            if hasattr(layer, buf_attr_int8):
+                # Use pre-allocated buffers (zero overhead)
+                out_int8 = getattr(layer, buf_attr_int8)
+                out_scale = getattr(layer, buf_attr_scale)
+                output = getattr(layer, buf_attr_output)
+                # Ensure buffers match expected shape (should always match, but safety check)
+                if out_int8.shape[0] < M:
+                    # Fallback to dynamic allocation for unexpected shapes
+                    out_int8 = torch.empty(M, K, device=x_compute.device, dtype=torch.int8)
+                    out_scale = torch.empty(M, device=x_compute.device, dtype=torch.bfloat16)
+                    output = torch.empty(M, N, device=x_compute.device, dtype=torch.bfloat16)
             else:
-                # Check if shape is supported for V4 kernel to avoid fallback overhead
-                # Supported shapes match bitlinear_int8xint2_v4_simple in .cu file
-                is_supported_shape = False
-                if M == 1:
-                     # M=1 supports 2048x2048, 5120x2048, 2048x4096
-                     if (N == 5120 and K == 2048) or \
-                        (N == 2048 and K == 4096) or \
-                        (N == 2048 and K == 2048):
-                        is_supported_shape = True
-                else:
-                     # M>1 supports same key shapes via batch kernel
-                     if (N == 5120 and K == 2048) or \
-                        (N == 2048 and K == 4096) or \
-                        (N == 2048 and K == 2048):
-                        is_supported_shape = True
+                # Fallback to cache for uncommon batch sizes
+                dev_key = _device_cache_key(x_compute.device)
+                act_key = (M, K, dev_key)
+                scale_key = (M, dev_key)
+                out_key = (M, N, dev_key)
                 
-                if is_supported_shape:
-                    # Quantize activations (fused pre-scale + quantization)
-                    # For M=1 decode, kernel only needs act_scale[0] (scalar), but quantize function returns (M,) tensor
-                    
-                    # Optimization: Use dedicated cache for M=1 (decode) to avoid thrashing with M>1 (prefill)
-                    if M == 1:
-                        if not hasattr(layer, '_ternary_decode_act_int8'):
-                            layer._ternary_decode_act_int8 = torch.empty(1, K, device=x_compute.device, dtype=torch.int8)
-                            layer._ternary_decode_act_scale = torch.empty(1, device=x_compute.device, dtype=torch.bfloat16)
-                        
-                        out_int8 = layer._ternary_decode_act_int8
-                        out_scale = layer._ternary_decode_act_scale
-                    else:
-                        # For M>1, just allocate (prefill is throughput bound, not latency bound)
-                        out_int8 = None
-                        out_scale = None
-
-                    if _ternary_profiler.enabled:
-                        _ternary_profiler._safe_sync()
-                        quant_start = time.time()
-                    
+                out_int8 = _get_cached_tensor(
+                    layer, "_ternary_act_int8_cache", act_key,
+                    (M, K), torch.int8, x_compute.device
+                )
+                out_scale = _get_cached_tensor(
+                    layer, "_ternary_act_scale_cache", scale_key,
+                    (M,), torch.bfloat16, x_compute.device
+                )
+                output = _get_cached_tensor(
+                    layer, "_ternary_v4_output_cache", out_key,
+                    (M, N), torch.bfloat16, x_compute.device
+                )
+            
+            # Profiling for quantization
+            if prof_enabled:
+                _ternary_profiler._safe_sync()
+                quant_start = time.time()
+            
+            # OPTIMIZATION: Fast path for M=1 (decode) - use CUDA fast quantizer if available
+            if M == 1 and BITNET_CUDA_ACT_QUANT_AVAILABLE and TERNARY_USE_CUDA_ACT_QUANT:
+                # CUDA fast quantizer is optimized for M=1 decode path
+                fast_result = _quantize_activation_fast_cuda(
+                    x_2d, layer.ternary_alpha,
+                    out_int8=out_int8, out_scale=out_scale
+                )
+                if fast_result is not None:
+                    x_int8, x_scale = fast_result
+                else:
+                    # Fallback to Triton/PyTorch
                     x_int8, x_scale = quantize_activation_prescale_fused(
                         x_2d, layer.ternary_alpha,
-                        out_int8=out_int8,
-                        out_scale=out_scale
+                        out_int8=out_int8, out_scale=out_scale
                     )
-                    
-                    if _ternary_profiler.enabled:
-                        _ternary_profiler._safe_sync()
-                        quant_duration = (time.time() - quant_start) * 1000
-                        _ternary_profiler.record(f"quantize_activation_M{M}_K{K}", quant_duration)
-                    
-                    # Preallocate output tensor
-                    if not hasattr(layer, '_ternary_v4_output_cache'):
-                        layer._ternary_v4_output_cache = torch.empty(M, N, device=x_compute.device, dtype=torch.bfloat16)
-                    elif layer._ternary_v4_output_cache.shape != (M, N) or layer._ternary_v4_output_cache.device != x_compute.device:
-                        layer._ternary_v4_output_cache = torch.empty(M, N, device=x_compute.device, dtype=torch.bfloat16)
-                    
-                    output = layer._ternary_v4_output_cache
-                    
-                    if _ternary_profiler.enabled:
-                        _ternary_profiler._safe_sync()
-                        kernel_start = time.time()
-                    
-                    ret_code = BITNET_LIB.bitlinear_int8xint2_v4_simple(
-                        ctypes.c_void_p(x_int8.data_ptr()),
-                        ctypes.c_void_p(layer.ternary_weight_bitnet.data_ptr()),
-                        ctypes.c_void_p(layer.ternary_alpha_q.data_ptr()),
-                        ctypes.c_void_p(layer.ternary_alpha_scale.data_ptr()),
-                        ctypes.c_void_p(output.data_ptr()),
-                        ctypes.c_void_p(x_scale.data_ptr()),
-                        ctypes.c_int(M),
-                        ctypes.c_int(N),
-                        ctypes.c_int(K),
-                        ctypes.c_void_p(torch.cuda.current_stream().cuda_stream),
-                    )
-                    
-                    if ret_code == 0:
-                        if _ternary_profiler.enabled:
-                            _ternary_profiler._safe_sync()
-                            kernel_duration = (time.time() - kernel_start) * 1000
-                            _ternary_profiler.record(f"ternary_apply_v4_kernel_M{M}_N{N}_K{K}", kernel_duration)
-                        
-                        # Post-process output (create view/reshape, don't modify cached tensor)
-                        output = output.view(*x_shape[:-1], N)
-                        if b_compute is not None:
-                            output = output + b_compute
-                        if output.dtype != x.dtype:
-                            output = output.to(x.dtype)
-                        
-                        return output
-                    else:
-                        # Kernel failed (unsupported shape despite check?), fall back
-                        pass
+            else:
+                # General path (M>1 or CUDA quantizer not available)
+                x_int8, x_scale = quantize_activation_prescale_fused(
+                    x_2d, layer.ternary_alpha,
+                    out_int8=out_int8, out_scale=out_scale
+                )
+            
+            if prof_enabled:
+                _ternary_profiler._safe_sync()
+                quant_duration = (time.time() - quant_start) * 1000
+                _ternary_profiler.record(f"quantize_activation_M{M}_K{K}", quant_duration)
+            
+            # OPTIMIZATION: Use cached pointers (set at init, zero overhead)
+            weight_ptr = layer._ternary_weight_bitnet_ptr
+            alpha_q_ptr = layer._ternary_alpha_q_ptr
+            alpha_scale_ptr = layer._ternary_alpha_scale_ptr
+            
+            # Profiling for kernel
+            if prof_enabled:
+                _ternary_profiler._safe_sync()
+                kernel_start = time.time()
+            
+            # Call V4 kernel
+            ret_code = BITNET_LIB.bitlinear_int8xint2_v4_simple(
+                ctypes.c_void_p(x_int8.data_ptr()),
+                ctypes.c_void_p(weight_ptr),
+                ctypes.c_void_p(alpha_q_ptr),
+                ctypes.c_void_p(alpha_scale_ptr),
+                ctypes.c_void_p(output.data_ptr()),
+                ctypes.c_void_p(x_scale.data_ptr()),
+                ctypes.c_int(M),
+                ctypes.c_int(N),
+                ctypes.c_int(K),
+                ctypes.c_void_p(torch.cuda.current_stream().cuda_stream),
+            )
+            
+            if ret_code == 0:
+                if prof_enabled:
+                    _ternary_profiler._safe_sync()
+                    kernel_duration = (time.time() - kernel_start) * 1000
+                    _ternary_profiler.record(f"ternary_apply_v4_kernel_M{M}_N{N}_K{K}", kernel_duration)
+                
+                # Post-process output
+                output = output.view(*x_shape[:-1], N)
+                if b_compute is not None:
+                    output = output + b_compute
+                if output.dtype != x.dtype:
+                    output = output.to(x.dtype)
+                
+                _fast_apply_profiler.stop(prof_ctx)
+                return output
         
-        # Fallback path: Use raw FP16 weights directly (fastest fallback)
-        if _ternary_profiler.enabled:
+        # Fallback path: Use FP16 weights
+        if prof_enabled:
             _ternary_profiler._safe_sync()
             fallback_start = time.time()
-            if hasattr(layer, '_ternary_weight_shape'):
-                N, K = layer._ternary_weight_shape
-                x_2d = x_compute.reshape(-1, K)
-                M = x_2d.shape[0]
-                shape_info = f"M{M}_N{N}_K{K}"
-            else:
-                shape_info = "unknown"
+            shape_info = f"M{M}_N{N}_K{K}"
         
-        # Use cached FP16 weights (stored during quantization)
-        # This is faster than unpacking I2S weights
-        if not hasattr(layer, '_ternary_weight_fp16'):
-            # Fallback: reconstruct if not cached (shouldn't happen)
+        # Get or create FP16 weight cache
+        weight_fp16 = _get_fp16_fallback_weight(layer, x_compute.dtype, x_compute.device)
+        if weight_fp16 is None:
+            i2s_enabled = getattr(layer, '_ternary_i2s_enabled', False)
             if i2s_enabled and weight.dtype == torch.uint8:
-                N, K = layer._ternary_weight_shape
                 weight_fp16 = unpack_i2s_weights(weight, K, layer.ternary_alpha, x_compute.dtype)
-                layer.register_buffer('_ternary_weight_fp16', weight_fp16, persistent=False)
             else:
-                layer.register_buffer('_ternary_weight_fp16', weight.to(x_compute.dtype), persistent=False)
+                weight_fp16 = weight.to(x_compute.dtype)
+            layer.register_buffer("_ternary_weight_fp16", weight_fp16, persistent=False)
+            setattr(layer, "_ternary_weight_fp16_cache", {})
+            weight_fp16 = _get_fp16_fallback_weight(layer, x_compute.dtype, x_compute.device)
         
-        path = "fp16_fallback"
-        out = F.linear(x_compute, layer._ternary_weight_fp16, b_compute)
+        # Compute linear layer
+        out = F.linear(x_compute, weight_fp16, b_compute)
         if out.dtype != x.dtype:
             out = out.to(x.dtype)
         
-        if _ternary_profiler.enabled:
+        if prof_enabled:
             _ternary_profiler._safe_sync()
             fallback_duration = (time.time() - fallback_start) * 1000
-            _ternary_profiler.record(f"ternary_apply_{path}_{shape_info}", fallback_duration)
+            _ternary_profiler.record(f"ternary_apply_fp16_fallback_{shape_info}", fallback_duration)
         
+        _fast_apply_profiler.stop(prof_ctx)
         return out
 
 
