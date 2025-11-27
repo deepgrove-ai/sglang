@@ -38,7 +38,7 @@ from sglang.srt.utils import set_weight_attrs
 logger = logging.getLogger(__name__)
 
 TERNARY_USE_CUDA_ACT_QUANT = os.environ.get("TERNARY_USE_CUDA_ACT_QUANT", "0") == "1"
-DEFAULT_PREFILL_SKIP_M = int(os.environ.get("TERNARY_PREFILL_SKIP_M", "64"))
+DEFAULT_PREFILL_SKIP_M = int(os.environ.get("TERNARY_PREFILL_SKIP_M", "8"))
 SUPPORTED_V4_NK_SHAPES = {
     (5120, 2048),
     (2048, 4096),
@@ -1761,9 +1761,8 @@ class TernaryLinearMethod(LinearMethodBase):
                 _ternary_profiler._safe_sync()
                 quant_start = time.time()
             
-            # OPTIMIZATION: Fast path for M=1 (decode) - use CUDA fast quantizer if available
-            if M == 1 and BITNET_CUDA_ACT_QUANT_AVAILABLE and TERNARY_USE_CUDA_ACT_QUANT:
-                # CUDA fast quantizer is optimized for M=1 decode path
+            # OPTIMIZATION: Use CUDA fast quantizer when available (10-14x faster than Triton)
+            if BITNET_CUDA_ACT_QUANT_AVAILABLE:
                 fast_result = _quantize_activation_fast_cuda(
                     x_2d, layer.ternary_alpha,
                     out_int8=out_int8, out_scale=out_scale
@@ -1771,13 +1770,13 @@ class TernaryLinearMethod(LinearMethodBase):
                 if fast_result is not None:
                     x_int8, x_scale = fast_result
                 else:
-                    # Fallback to Triton/PyTorch
+                    # Fallback to Triton/PyTorch if CUDA fails
                     x_int8, x_scale = quantize_activation_prescale_fused(
                         x_2d, layer.ternary_alpha,
                         out_int8=out_int8, out_scale=out_scale
                     )
             else:
-                # General path (M>1 or CUDA quantizer not available)
+                # Triton path (slower but always available)
                 x_int8, x_scale = quantize_activation_prescale_fused(
                     x_2d, layer.ternary_alpha,
                     out_int8=out_int8, out_scale=out_scale
