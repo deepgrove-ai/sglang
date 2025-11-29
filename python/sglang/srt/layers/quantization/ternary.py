@@ -498,6 +498,776 @@ class _FastApplyProfiler:
 
 _fast_apply_profiler = _FastApplyProfiler()
 
+# ============================================================================
+# DETAILED PROFILER (TERNARY_DETAILED_PROFILE=1)
+# 
+# IMPORTANT: Ternary kernels only beat FP16 when CUDA graphs are enabled.
+# This profiler works WITH CUDA graphs by:
+# 1. Profiling during CUDA graph CAPTURE phase (warmup)
+# 2. Timing graph REPLAY at batch level
+# 3. Using torch.profiler for kernel-level breakdown
+#
+# For production profiling with CUDA graphs, use:
+#   TERNARY_DETAILED_PROFILE=1 + torch.profiler or Nsight
+# ============================================================================
+
+import threading
+from contextlib import contextmanager
+
+class _DetailedProfiler:
+    """
+    Profiler for ternary operations that works WITH CUDA graphs.
+    
+    Profiling Strategy:
+    1. CAPTURE PHASE: Profile operations during CUDA graph capture (warmup)
+       - This gives us the operation breakdown for what's inside the graph
+    2. REPLAY PHASE: Time entire graph replays at batch level
+       - This gives us realistic production timing
+    3. TORCH PROFILER: For kernel-level analysis inside graphs
+       - Use: python -m torch.profiler or Nsight Compute
+    
+    Environment Variables:
+        TERNARY_DETAILED_PROFILE=1      Enable this profiler
+        TERNARY_PROFILE_CAPTURE_ONLY=1  Only profile during graph capture (default: 0)
+        TERNARY_TORCH_PROFILE=1         Enable torch.profiler integration
+        TERNARY_PROFILE_WARMUP=N        Profile first N batches before graphs (default: 10)
+    
+    Usage:
+        # Profile warmup + graph replays:
+        TERNARY_DETAILED_PROFILE=1 ./run_server_ternary.sh
+        
+        # Use torch.profiler for kernel breakdown:
+        TERNARY_TORCH_PROFILE=1 ./run_server_ternary.sh
+    """
+    
+    def __init__(self):
+        self.enabled = os.environ.get("TERNARY_DETAILED_PROFILE", "0") == "1"
+        self.output_file = os.environ.get("TERNARY_DETAILED_PROFILE_OUTPUT", "/tmp/ternary_detailed_profile.json")
+        self.sample_rate = int(os.environ.get("TERNARY_PROFILE_SAMPLE_RATE", "1"))
+        
+        # Profile settings
+        self.capture_only = os.environ.get("TERNARY_PROFILE_CAPTURE_ONLY", "0") == "1"
+        self.warmup_batches = int(os.environ.get("TERNARY_PROFILE_WARMUP", "10"))
+        self.torch_profile_enabled = os.environ.get("TERNARY_TORCH_PROFILE", "0") == "1"
+        
+        # Thread-local storage for current phase context
+        self._local = threading.local()
+        
+        # Track if we're in CUDA graph capture mode
+        self._in_cuda_capture = False
+        self._cuda_graphs_active = False  # Set after warmup
+        
+        # Statistics storage - hierarchical structure
+        self.stats = defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: {
+            'count': 0,
+            'total_us': 0.0,
+            'min_us': float('inf'),
+            'max_us': 0.0,
+            'cuda_events': [],
+        }))))
+        
+        # Separate stats for capture vs replay
+        self.capture_stats = defaultdict(lambda: defaultdict(lambda: {
+            'count': 0,
+            'total_us': 0.0,
+        }))
+        self.replay_stats = defaultdict(lambda: {
+            'count': 0,
+            'total_us': 0.0,
+            'min_us': float('inf'),
+            'max_us': 0.0,
+        })
+        
+        # Phase stats
+        self.phase_stats = defaultdict(lambda: {
+            'count': 0,
+            'total_us': 0.0,
+            'operations': defaultdict(lambda: {'count': 0, 'total_us': 0.0}),
+        })
+        
+        # Call counters
+        self._call_counter = 0
+        self._operations_recorded = 0
+        self._batch_counter = 0
+        
+        # Layer tracking
+        self._current_layer_name = "unknown"
+        self._current_layer_idx = -1
+        
+        # Batch info tracking
+        self.batch_stats = defaultdict(lambda: {
+            'M_values': [],
+            'N_values': [],
+            'K_values': [],
+        })
+        
+        # Track shapes hitting fallback vs V4 kernel (for optimization guidance)
+        self.v4_kernel_shapes = defaultdict(int)  # (N, K) -> count
+        self.fallback_shapes = defaultdict(int)   # (N, K) -> count
+        self.fallback_reasons = defaultdict(int)  # (N, K, reason) -> count
+        
+        # CUDA events pool
+        self._event_pool = []
+        self._event_pool_size = 1000
+        
+        # Torch profiler - enable by default for detailed profiling to see kernels
+        self.torch_profile_enabled = os.environ.get("TERNARY_TORCH_PROFILE", "1") == "1"
+        self._torch_profiler = None
+        
+        if self.enabled:
+            logger.info(f"[DETAILED PROFILER] ████████████████████████████████████████████████")
+            logger.info(f"[DETAILED PROFILER] ENABLED (CUDA graph compatible)")
+            logger.info(f"[DETAILED PROFILER] Output: {self.output_file}")
+            logger.info(f"[DETAILED PROFILER] Strategy: Profile warmup + capture phase, time replays")
+            logger.info(f"[DETAILED PROFILER] Warmup batches to profile: {self.warmup_batches}")
+            if self.torch_profile_enabled:
+                logger.info(f"[DETAILED PROFILER] torch.profiler integration: ENABLED (Auto)")
+            logger.info(f"[DETAILED PROFILER] ████████████████████████████████████████████████")
+            print(f"\n{'='*70}", file=sys.stderr)
+            print(f"[DETAILED PROFILER] ENABLED - Works with CUDA graphs", file=sys.stderr)
+            print(f"[DETAILED PROFILER] Profiling warmup/capture + timing replays", file=sys.stderr)
+            print(f"{'='*70}\n", file=sys.stderr)
+            import atexit
+            atexit.register(self.print_detailed_summary)
+            
+            # Initialize torch profiler if requested
+            if self.torch_profile_enabled:
+                self._init_torch_profiler()
+    
+    def _init_torch_profiler(self):
+        """Initialize torch.profiler for kernel-level analysis."""
+        try:
+            from torch.profiler import profile, ProfilerActivity, tensorboard_trace_handler
+            trace_dir = os.environ.get("TERNARY_TORCH_PROFILE_DIR", "/tmp/ternary_torch_profile")
+            os.makedirs(trace_dir, exist_ok=True)
+            logger.info(f"[DETAILED PROFILER] torch.profiler traces will be saved to: {trace_dir}")
+            logger.info(f"[DETAILED PROFILER] View with: tensorboard --logdir={trace_dir}")
+            self._torch_trace_dir = trace_dir
+        except ImportError:
+            logger.warning("[DETAILED PROFILER] torch.profiler not available")
+            self.torch_profile_enabled = False
+    
+    def start_torch_profile(self):
+        """Start torch profiler for a profiling window."""
+        if not self.torch_profile_enabled or self._torch_profiler is not None:
+            return
+        try:
+            from torch.profiler import profile, ProfilerActivity, tensorboard_trace_handler
+            self._torch_profiler = profile(
+                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                on_trace_ready=tensorboard_trace_handler(self._torch_trace_dir),
+                record_shapes=True,
+                profile_memory=True,
+                with_stack=True,
+            )
+            self._torch_profiler.__enter__()
+            logger.info("[DETAILED PROFILER] torch.profiler started")
+        except Exception as e:
+            logger.warning(f"[DETAILED PROFILER] Failed to start torch.profiler: {e}")
+    
+    def stop_torch_profile(self):
+        """Stop torch profiler and print summary."""
+        if self._torch_profiler is not None:
+            try:
+                self._torch_profiler.__exit__(None, None, None)
+                
+                print("\n" + "█"*78, file=sys.stderr)
+                print("█ GPU KERNEL BREAKDOWN (from torch.profiler)                                 █", file=sys.stderr)
+                print("█"*78, file=sys.stderr)
+                print(self._torch_profiler.key_averages().table(sort_by="cuda_time_total", row_limit=20), file=sys.stderr)
+                print("█"*78 + "\n", file=sys.stderr)
+                
+                logger.info(f"[DETAILED PROFILER] torch.profiler stopped, traces in {self._torch_trace_dir}")
+            except Exception as e:
+                logger.warning(f"[DETAILED PROFILER] Failed to stop torch.profiler: {e}")
+            self._torch_profiler = None
+    
+    def set_cuda_graph_state(self, capturing: bool = False, active: bool = False):
+        """Update CUDA graph state for profiling decisions."""
+        self._in_cuda_capture = capturing
+        self._cuda_graphs_active = active
+        if capturing:
+            logger.debug("[DETAILED PROFILER] CUDA graph capture started - profiling operations")
+        elif active and not self._cuda_graphs_active:
+            logger.info("[DETAILED PROFILER] CUDA graphs now active - switching to replay timing")
+    
+    def _get_cuda_events(self):
+        """Get a pair of CUDA events from pool or create new."""
+        if self._event_pool:
+            return self._event_pool.pop()
+        return (
+            torch.cuda.Event(enable_timing=True),
+            torch.cuda.Event(enable_timing=True)
+        )
+    
+    def _return_cuda_events(self, events):
+        """Return events to pool for reuse."""
+        if len(self._event_pool) < self._event_pool_size:
+            self._event_pool.append(events)
+    
+    @property
+    def current_phase(self):
+        """Get the current phase (decode/prefill/unknown)."""
+        return getattr(self._local, 'phase', 'unknown')
+    
+    @contextmanager
+    def phase_context(self, phase: str, batch_size: int = 0):
+        """Set the current phase context (decode/prefill/mixed)."""
+        if not self.enabled:
+            yield
+            return
+        
+        old_phase = getattr(self._local, 'phase', 'unknown')
+        self._local.phase = phase
+        self.phase_stats[phase]['count'] += 1
+        
+        # Batch tracking
+        self.on_batch_start(phase)
+        
+        # Record start time for phase/batch timing
+        start_event, end_event = self._get_cuda_events()
+        start_event.record()
+        
+        try:
+            yield
+        finally:
+            end_event.record()
+            self._local.phase = old_phase
+            
+            # Store events for deferred timing calculation
+            self.phase_stats[phase].setdefault('_pending_events', []).append((start_event, end_event))
+            
+            # Track replay stats if CUDA graphs are active OR if we're decoding
+            # Even without explicit graph signal, decode batches are useful to track
+            if (self._cuda_graphs_active or phase == 'decode') and phase == 'decode':
+                self.replay_stats[phase]['count'] += 1
+                self.replay_stats[phase].setdefault('_pending_events', []).append((start_event, end_event))
+            
+            self.on_batch_end(phase)
+    
+    def set_layer_context(self, layer_name: str, layer_idx: int = -1):
+        """Set the current layer being profiled."""
+        self._current_layer_name = layer_name
+        self._current_layer_idx = layer_idx
+    
+    def should_profile(self) -> bool:
+        """
+        Check if we should profile this call.
+        
+        Profiling strategy:
+        1. Always profile during CUDA graph capture (operations run once)
+        2. Profile first N warmup batches before graphs are active
+        3. After graphs active, only do lightweight batch-level timing
+        """
+        if not self.enabled:
+            return False
+        
+        self._call_counter += 1
+        
+        # Always profile during CUDA graph capture
+        if self._in_cuda_capture:
+            if self._call_counter <= 5:
+                logger.info(f"[DETAILED PROFILER] Profiling during graph capture, call #{self._call_counter}")
+            return True
+        
+        # Profile warmup batches before CUDA graphs kick in
+        # FIX: If we have seen many batches but _cuda_graphs_active is still False,
+        # it might mean we missed the signal or graphs aren't being used.
+        # Stop detailed op profiling after warmup limit to avoid overhead.
+        if not self._cuda_graphs_active:
+            if self._batch_counter < self.warmup_batches:
+                should = (self._call_counter % self.sample_rate) == 0
+                if should and self._call_counter <= 5:
+                    logger.info(f"[DETAILED PROFILER] Warmup profiling call #{self._call_counter}, batch {self._batch_counter}")
+                return should
+            else:
+                # exceeded warmup but graphs not active yet? stop profiling ops
+                return False
+        
+        # After CUDA graphs active, don't profile individual operations
+        if self.capture_only:
+            return False
+        
+        # Light sampling for non-graphed paths (prefill, edge cases)
+        return (self._call_counter % (self.sample_rate * 100)) == 0
+    
+    def on_batch_start(self, phase: str):
+        """Called at start of each batch for batch-level tracking."""
+        self._batch_counter += 1
+        
+        # Auto-detect if we missed the graph activation signal
+        # If we see many decode batches, assume graphs are active if not told otherwise
+        if phase == 'decode' and self._batch_counter > self.warmup_batches + 5 and not self._cuda_graphs_active:
+             # Heuristic: if we are decoding and past warmup, likely using graphs
+             # But we only set this if we are sure we are not in eager mode
+             pass
+
+        # Start torch profiler after a few warmup batches
+        if self.torch_profile_enabled and self._batch_counter == 2: # Start earlier
+            self.start_torch_profile()
+    
+    def on_batch_end(self, phase: str):
+        """Called at end of each batch."""
+        # Stop torch profiler after collecting enough data
+        if self.torch_profile_enabled and self._batch_counter == 50:
+            self.stop_torch_profile()
+    
+    @contextmanager
+    def operation_timer(self, operation: str, sub_operation: str = "total", M: int = 0, N: int = 0, K: int = 0):
+        """Time an operation with sub-operation granularity."""
+        if not self.enabled:
+            yield
+            return
+        
+        phase = self.current_phase
+        layer_type = self._infer_layer_type(N, K)
+        
+        # Track that we're recording
+        self._operations_recorded += 1
+        
+        # Record shape info
+        if M > 0:
+            self.batch_stats[phase]['M_values'].append(M)
+            self.batch_stats[phase]['N_values'].append(N)
+            self.batch_stats[phase]['K_values'].append(K)
+        
+        # Use CUDA events for precise timing
+        start_event, end_event = self._get_cuda_events()
+        start_event.record()
+        
+        try:
+            yield
+        finally:
+            end_event.record()
+            
+            # Store for deferred timing
+            stats = self.stats[phase][layer_type][operation][sub_operation]
+            stats['count'] += 1
+            stats['cuda_events'].append((start_event, end_event, M, N, K))
+            
+            # Also track in phase stats
+            self.phase_stats[phase]['operations'][f"{operation}.{sub_operation}"]['count'] += 1
+    
+    def _infer_layer_type(self, N: int, K: int) -> str:
+        """Infer layer type from dimensions."""
+        # Common patterns for Llama-style models:
+        # QKV proj: K=hidden, N=head_dim * (num_heads + 2*num_kv_heads)
+        # O proj: K=head_dim * num_heads, N=hidden
+        # Gate/Up proj: K=hidden, N=intermediate*2 (merged)
+        # Down proj: K=intermediate, N=hidden
+        
+        if N == 0 or K == 0:
+            return "unknown"
+        
+        ratio = N / K if K > 0 else 0
+        
+        # Heuristics based on typical ratios
+        if 2.5 < ratio < 4.5:  # gate_up is usually 2x-4x expansion
+            return "mlp.gate_up"
+        elif 0.2 < ratio < 0.5:  # down_proj is reduction
+            return "mlp.down"
+        elif 0.8 < ratio < 1.2:  # attention projections are usually ~1:1
+            if N > K:
+                return "attn.qkv"
+            else:
+                return "attn.o"
+        elif ratio > 10:  # LM head / embedding
+            return "lm_head"
+        else:
+            return f"linear_{N}x{K}"
+    
+    def record_sync(self, operation: str, duration_us: float):
+        """Record a synchronous timing (already measured)."""
+        if not self.enabled:
+            return
+        
+        phase = self.current_phase
+        stats = self.stats[phase]["sync"][operation]["measured"]
+        stats['count'] += 1
+        stats['total_us'] += duration_us
+        stats['min_us'] = min(stats['min_us'], duration_us)
+        stats['max_us'] = max(stats['max_us'], duration_us)
+    
+    def _process_pending_events(self):
+        """Process all pending CUDA events to calculate timings."""
+        try:
+            torch.cuda.synchronize()
+        except Exception as e:
+            logger.warning(f"[DETAILED PROFILER] CUDA sync failed: {e}")
+            return
+        
+        # Process phase events
+        for phase, phase_data in self.phase_stats.items():
+            pending = phase_data.pop('_pending_events', [])
+            for start_event, end_event in pending:
+                try:
+                    if start_event.query() and end_event.query():
+                        elapsed_ms = start_event.elapsed_time(end_event)
+                        phase_data['total_us'] += elapsed_ms * 1000
+                        self._return_cuda_events((start_event, end_event))
+                except Exception:
+                    pass
+        
+        # Process CUDA graph replay events
+        for phase, replay_data in self.replay_stats.items():
+            pending = replay_data.pop('_pending_events', [])
+            for start_event, end_event in pending:
+                try:
+                    if start_event.query() and end_event.query():
+                        elapsed_ms = start_event.elapsed_time(end_event)
+                        elapsed_us = elapsed_ms * 1000
+                        replay_data['total_us'] += elapsed_us
+                        replay_data['min_us'] = min(replay_data.get('min_us', float('inf')), elapsed_us)
+                        replay_data['max_us'] = max(replay_data.get('max_us', 0), elapsed_us)
+                        self._return_cuda_events((start_event, end_event))
+                except Exception:
+                    pass
+        
+        # Process operation events
+        for phase in self.stats:
+            for layer_type in self.stats[phase]:
+                for operation in self.stats[phase][layer_type]:
+                    for sub_op in self.stats[phase][layer_type][operation]:
+                        stats = self.stats[phase][layer_type][operation][sub_op]
+                        pending = stats.get('cuda_events', [])
+                        for event_tuple in pending:
+                            start_event, end_event = event_tuple[0], event_tuple[1]
+                            try:
+                                if start_event.query() and end_event.query():
+                                    elapsed_ms = start_event.elapsed_time(end_event)
+                                    elapsed_us = elapsed_ms * 1000
+                                    stats['total_us'] += elapsed_us
+                                    stats['min_us'] = min(stats['min_us'], elapsed_us)
+                                    stats['max_us'] = max(stats['max_us'], elapsed_us)
+                                    self._return_cuda_events((start_event, end_event))
+                            except Exception:
+                                pass
+                        stats['cuda_events'] = []  # Clear processed events
+    
+    def get_detailed_summary(self) -> dict:
+        """Generate detailed summary with hierarchical breakdown."""
+        self._process_pending_events()
+        
+        summary = {
+            'total_profiled_calls': self._call_counter,
+            'total_batches': self._batch_counter,
+            'sample_rate': self.sample_rate,
+            'cuda_graphs_active': self._cuda_graphs_active,
+            'phases': {},
+            'cuda_graph_replay': {},
+            'layer_breakdown': {},
+            'operation_breakdown': {},
+            'batch_statistics': {},
+        }
+        
+        # CUDA graph replay timing (this is the production-realistic timing!)
+        for phase, replay_data in self.replay_stats.items():
+            if replay_data['count'] > 0:
+                avg_us = replay_data['total_us'] / replay_data['count']
+                summary['cuda_graph_replay'][phase] = {
+                    'count': replay_data['count'],
+                    'total_ms': replay_data['total_us'] / 1000,
+                    'avg_ms': avg_us / 1000,
+                    'avg_us': avg_us,
+                    'min_us': replay_data.get('min_us', 0) if replay_data.get('min_us', float('inf')) != float('inf') else 0,
+                    'max_us': replay_data.get('max_us', 0),
+                }
+        
+        # Phase breakdown (includes warmup batches)
+        total_time_us = sum(p['total_us'] for p in self.phase_stats.values())
+        for phase, phase_data in self.phase_stats.items():
+            phase_time = phase_data['total_us']
+            summary['phases'][phase] = {
+                'count': phase_data['count'],
+                'total_ms': phase_time / 1000,
+                'percentage': (phase_time / total_time_us * 100) if total_time_us > 0 else 0,
+                'avg_ms_per_batch': (phase_time / 1000 / phase_data['count']) if phase_data['count'] > 0 else 0,
+            }
+        
+        # Detailed operation breakdown by phase
+        for phase in self.stats:
+            summary['layer_breakdown'][phase] = {}
+            for layer_type in self.stats[phase]:
+                layer_total_us = 0
+                layer_ops = {}
+                
+                for operation in self.stats[phase][layer_type]:
+                    op_total_us = 0
+                    op_details = {}
+                    
+                    for sub_op, stats in self.stats[phase][layer_type][operation].items():
+                        if stats['count'] > 0:
+                            avg_us = stats['total_us'] / stats['count']
+                            op_details[sub_op] = {
+                                'count': stats['count'],
+                                'total_us': stats['total_us'],
+                                'avg_us': avg_us,
+                                'min_us': stats['min_us'] if stats['min_us'] != float('inf') else 0,
+                                'max_us': stats['max_us'],
+                            }
+                            op_total_us += stats['total_us']
+                    
+                    if op_details:
+                        layer_ops[operation] = {
+                            'total_us': op_total_us,
+                            'sub_operations': op_details,
+                        }
+                        layer_total_us += op_total_us
+                
+                if layer_ops:
+                    summary['layer_breakdown'][phase][layer_type] = {
+                        'total_us': layer_total_us,
+                        'total_ms': layer_total_us / 1000,
+                        'operations': layer_ops,
+                    }
+        
+        # Batch statistics
+        for phase, batch_data in self.batch_stats.items():
+            M_vals = batch_data['M_values']
+            if M_vals:
+                summary['batch_statistics'][phase] = {
+                    'M_distribution': {
+                        'min': min(M_vals),
+                        'max': max(M_vals),
+                        'avg': sum(M_vals) / len(M_vals),
+                        'count_M1': sum(1 for m in M_vals if m == 1),
+                        'count_M2_8': sum(1 for m in M_vals if 2 <= m <= 8),
+                        'count_M9_plus': sum(1 for m in M_vals if m > 8),
+                    },
+                    'total_samples': len(M_vals),
+                }
+        
+        # Aggregate operation breakdown across all layers
+        op_totals = defaultdict(lambda: {'count': 0, 'total_us': 0})
+        for phase in self.stats:
+            for layer_type in self.stats[phase]:
+                for operation in self.stats[phase][layer_type]:
+                    for sub_op, stats in self.stats[phase][layer_type][operation].items():
+                        key = f"{operation}.{sub_op}"
+                        op_totals[key]['count'] += stats['count']
+                        op_totals[key]['total_us'] += stats['total_us']
+        
+        summary['operation_breakdown'] = {
+            k: {
+                'count': v['count'],
+                'total_ms': v['total_us'] / 1000,
+                'percentage': (v['total_us'] / total_time_us * 100) if total_time_us > 0 else 0,
+            }
+            for k, v in sorted(op_totals.items(), key=lambda x: -x[1]['total_us'])
+        }
+        
+        return summary
+    
+    def print_detailed_summary(self):
+        """Print comprehensive summary to stderr."""
+        if not self.enabled:
+            return
+        
+        # Stop torch profiler if still running
+        self.stop_torch_profile()
+        
+        # Debug info first
+        print("\n" + "="*100, file=sys.stderr)
+        print("█████ DETAILED TERNARY PROFILING REPORT █████", file=sys.stderr)
+        print("="*100, file=sys.stderr)
+        
+        print(f"\n[PROFILER INFO]", file=sys.stderr)
+        print(f"  - Total batches processed: {self._batch_counter}", file=sys.stderr)
+        print(f"  - Warmup batches profiled: {min(self._batch_counter, self.warmup_batches)}", file=sys.stderr)
+        print(f"  - CUDA graphs active: {self._cuda_graphs_active}", file=sys.stderr)
+        print(f"  - Total apply() calls: {self._call_counter}", file=sys.stderr)
+        print(f"  - Operations recorded (warmup/capture): {self._operations_recorded}", file=sys.stderr)
+        sys.stderr.flush()
+        
+        if self.torch_profile_enabled:
+            print(f"  - torch.profiler traces: {getattr(self, '_torch_trace_dir', 'N/A')}", file=sys.stderr)
+        
+        # Process pending events before generating summary
+        print(f"  - Processing CUDA events...", file=sys.stderr)
+        sys.stderr.flush()
+        
+        try:
+            summary = self.get_detailed_summary()
+        except Exception as e:
+            print(f"  - ERROR processing events: {e}", file=sys.stderr)
+            summary = {'phases': {}, 'cuda_graph_replay': {}, 'operation_breakdown': {}, 'layer_breakdown': {}}
+        
+        # SAVE JSON FIRST before printing
+        try:
+            # Convert tuple keys to strings for JSON
+            summary['v4_kernel_shapes'] = {str(k): v for k, v in self.v4_kernel_shapes.items()}
+            summary['fallback_shapes'] = {str(k): v for k, v in self.fallback_shapes.items()}
+            
+            with open(self.output_file, 'w') as f:
+                json.dump(summary, f, indent=2, default=str)
+            print(f"  - JSON saved to: {self.output_file}", file=sys.stderr)
+        except Exception as e:
+            print(f"  - ERROR saving JSON: {e}", file=sys.stderr)
+        sys.stderr.flush()
+        
+        # Don't print empty reports from non-worker processes
+        if self._call_counter == 0 and self._batch_counter == 0:
+            return
+
+        print(f"  - Phases recorded: {list(summary.get('phases', {}).keys())}", file=sys.stderr)
+        print(f"  - Operation types: {len(summary.get('operation_breakdown', {}))}", file=sys.stderr)
+        sys.stderr.flush()
+        
+        # CUDA Graph Replay Timing (MOST IMPORTANT - production realistic)
+        if summary.get('cuda_graph_replay'):
+            print("\n" + "█"*78, file=sys.stderr)
+            print("█ CUDA GRAPH REPLAY TIMING (Production Performance)                          █", file=sys.stderr)
+            print("█"*78, file=sys.stderr)
+            for phase, data in summary['cuda_graph_replay'].items():
+                print(f"\n  {phase.upper()} Graph Replay:", file=sys.stderr)
+                print(f"    Replays:     {data['count']:>10}", file=sys.stderr)
+                print(f"    Avg Time:    {data['avg_us']:>10.1f} µs  ({data['avg_ms']:.3f} ms)", file=sys.stderr)
+                print(f"    Min Time:    {data['min_us']:>10.1f} µs", file=sys.stderr)
+                print(f"    Max Time:    {data['max_us']:>10.1f} µs", file=sys.stderr)
+                print(f"    Total:       {data['total_ms']:>10.2f} ms", file=sys.stderr)
+                
+                # Calculate throughput estimate
+                if data['avg_us'] > 0:
+                    tokens_per_sec = 1_000_000 / data['avg_us']
+                    print(f"    Throughput:  {tokens_per_sec:>10.0f} tokens/sec (estimated)", file=sys.stderr)
+            print("█"*78, file=sys.stderr)
+            sys.stderr.flush()
+        else:
+            print("\n[NOTE] No CUDA graph replay data collected yet.", file=sys.stderr)
+            print("       Run some inference requests and the graph replays will be timed.", file=sys.stderr)
+            sys.stderr.flush()
+        
+        # Phase Summary (warmup batches)
+        print("\n┌─ WARMUP/CAPTURE PHASE TIMING ────────────────────────────────────────────────┐", file=sys.stderr)
+        print(f"│ {'Phase':<15} {'Count':>10} {'Total (ms)':>15} {'Avg/Batch (ms)':>18} {'%':>10} │", file=sys.stderr)
+        print("├" + "─"*78 + "┤", file=sys.stderr)
+        for phase, data in sorted(summary['phases'].items(), key=lambda x: -x[1].get('percentage', 0)):
+            print(f"│ {phase:<15} {data['count']:>10} {data['total_ms']:>15.2f} "
+                  f"{data['avg_ms_per_batch']:>18.3f} {data['percentage']:>9.1f}% │", file=sys.stderr)
+        print("└" + "─"*78 + "┘", file=sys.stderr)
+        
+        # Decode-specific breakdown (most important for optimization)
+        if 'decode' in summary['layer_breakdown']:
+            print("\n┌─ DECODE PHASE DETAILED BREAKDOWN ─────────────────────────────────────────────┐", file=sys.stderr)
+            decode_data = summary['layer_breakdown']['decode']
+            total_decode_us = sum(layer['total_us'] for layer in decode_data.values())
+            
+            print(f"│ {'Layer Type':<20} {'Total (ms)':>12} {'%':>8} │ {'Operation':<20} {'Avg (µs)':>12} │", file=sys.stderr)
+            print("├" + "─"*78 + "┤", file=sys.stderr)
+            
+            for layer_type, layer_data in sorted(decode_data.items(), key=lambda x: -x[1]['total_us']):
+                layer_pct = (layer_data['total_us'] / total_decode_us * 100) if total_decode_us > 0 else 0
+                print(f"│ {layer_type:<20} {layer_data['total_ms']:>12.2f} {layer_pct:>7.1f}% │", file=sys.stderr)
+                
+                for op_name, op_data in sorted(layer_data['operations'].items(), key=lambda x: -x[1]['total_us']):
+                    for sub_op, sub_data in sorted(op_data['sub_operations'].items(), key=lambda x: -x[1]['total_us']):
+                        avg_us = sub_data['avg_us']
+                        print(f"│ {'  └─':<20} {'':<12} {'':<8} │ {op_name}.{sub_op:<14} {avg_us:>12.1f} │", file=sys.stderr)
+            
+            print("└" + "─"*78 + "┘", file=sys.stderr)
+        
+        # Top operations overall
+        print("\n┌─ TOP OPERATIONS BY TIME (All Phases) ────────────────────────────────────────┐", file=sys.stderr)
+        print(f"│ {'Operation':<45} {'Count':>10} {'Total (ms)':>12} {'%':>8} │", file=sys.stderr)
+        print("├" + "─"*78 + "┤", file=sys.stderr)
+        for op_name, data in list(summary['operation_breakdown'].items())[:15]:
+            print(f"│ {op_name:<45} {data['count']:>10} {data['total_ms']:>12.2f} {data['percentage']:>7.1f}% │", file=sys.stderr)
+        print("└" + "─"*78 + "┘", file=sys.stderr)
+        
+        # Batch size distribution (decode focus)
+        if 'decode' in summary.get('batch_statistics', {}):
+            decode_batch = summary['batch_statistics']['decode']
+            print("\n┌─ DECODE BATCH SIZE DISTRIBUTION ─────────────────────────────────────────────┐", file=sys.stderr)
+            dist = decode_batch['M_distribution']
+            total = decode_batch['total_samples']
+            print(f"│ M=1 (single token):  {dist['count_M1']:>8} ({dist['count_M1']/total*100:>5.1f}%)", file=sys.stderr)
+            print(f"│ M=2-8 (small batch): {dist['count_M2_8']:>8} ({dist['count_M2_8']/total*100:>5.1f}%)", file=sys.stderr)
+            print(f"│ M>8 (large batch):   {dist['count_M9_plus']:>8} ({dist['count_M9_plus']/total*100:>5.1f}%)", file=sys.stderr)
+            print("└" + "─"*78 + "┘", file=sys.stderr)
+        
+        # Shape breakdown: V4 kernel vs fallback
+        if self.v4_kernel_shapes or self.fallback_shapes:
+            print("\n┌─ KERNEL SHAPE ANALYSIS ──────────────────────────────────────────────────────┐", file=sys.stderr)
+            total_v4 = sum(self.v4_kernel_shapes.values())
+            total_fallback = sum(self.fallback_shapes.values())
+            total_all = total_v4 + total_fallback
+            
+            if total_all > 0:
+                print(f"│ V4 Kernel:  {total_v4:>8} calls ({total_v4/total_all*100:>5.1f}%)", file=sys.stderr)
+                print(f"│ Fallback:   {total_fallback:>8} calls ({total_fallback/total_all*100:>5.1f}%)", file=sys.stderr)
+            
+            if self.v4_kernel_shapes:
+                print(f"│", file=sys.stderr)
+                print(f"│ Shapes using V4 kernel:", file=sys.stderr)
+                for (n, k), count in sorted(self.v4_kernel_shapes.items(), key=lambda x: -x[1])[:5]:
+                    print(f"│   (N={n}, K={k}): {count} calls", file=sys.stderr)
+            
+            if self.fallback_shapes:
+                print(f"│", file=sys.stderr)
+                print(f"│ ⚠️  Shapes falling back to FP16 (need kernel support):", file=sys.stderr)
+                for (n, k), count in sorted(self.fallback_shapes.items(), key=lambda x: -x[1])[:10]:
+                    # Determine primary reason for fallback
+                    shape_reason = "Unknown"
+                    if self.fallback_reasons:
+                        reasons = [r for r in self.fallback_reasons.keys() if f"{n}x{k}" in r]
+                        if reasons:
+                            # Find most common reason for this shape
+                            top_reason = max(reasons, key=lambda r: self.fallback_reasons[r])
+                            if "unsupported_shape" in top_reason:
+                                shape_reason = "Shape not in kernel allowlist"
+                            elif "large_batch" in top_reason:
+                                shape_reason = "Batch size too large (M > 8)"
+                            elif "not_bitnet" in top_reason:
+                                shape_reason = "Weights not packed"
+                    
+                    print(f"│   (N={n}, K={k}): {count} calls → {shape_reason}", file=sys.stderr)
+            
+            print("└" + "─"*78 + "┘", file=sys.stderr)
+        
+        # Optimization recommendations
+        print("\n┌─ OPTIMIZATION RECOMMENDATIONS ───────────────────────────────────────────────┐", file=sys.stderr)
+        
+        # Analyze bottlenecks
+        if summary['operation_breakdown']:
+            top_op = list(summary['operation_breakdown'].items())[0]
+            print(f"│ 🎯 Primary bottleneck: {top_op[0]} ({top_op[1]['percentage']:.1f}% of time)", file=sys.stderr)
+            
+            # Check kernel vs quantization ratio
+            kernel_time = sum(v['total_ms'] for k, v in summary['operation_breakdown'].items() if 'kernel' in k)
+            quant_time = sum(v['total_ms'] for k, v in summary['operation_breakdown'].items() if 'quant' in k)
+            
+            if quant_time > kernel_time * 0.5 and kernel_time > 0:
+                print(f"│ ⚠️  Quantization overhead ({quant_time:.1f}ms) is >{int(quant_time/kernel_time*100)}% of kernel time", file=sys.stderr)
+                print(f"│    → Consider: CUDA activation quantizer, fused operations", file=sys.stderr)
+            
+            # Check fallback usage
+            fallback_time = sum(v['total_ms'] for k, v in summary['operation_breakdown'].items() if 'fallback' in k)
+            if fallback_time > 0:
+                print(f"│ ⚠️  Fallback path used: {fallback_time:.1f}ms", file=sys.stderr)
+                if self.fallback_shapes:
+                    top_fallback = sorted(self.fallback_shapes.items(), key=lambda x: -x[1])[:3]
+                    shapes_str = ", ".join([f"({n},{k})" for (n,k), _ in top_fallback])
+                    print(f"│    → Add V4 kernel support for: {shapes_str}", file=sys.stderr)
+        
+        print("└" + "─"*78 + "┘", file=sys.stderr)
+        
+        print(f"\n[DETAILED PROFILER] Report complete. JSON: {self.output_file}", file=sys.stderr)
+        sys.stderr.flush()
+
+
+# Global detailed profiler instance
+_detailed_profiler = _DetailedProfiler()
+
+# Export for use in model_runner
+def set_profiling_phase(phase: str, batch_size: int = 0):
+    """Set the current profiling phase context."""
+    return _detailed_profiler.phase_context(phase, batch_size)
+
+def get_profiling_phase() -> str:
+    """Get the current profiling phase."""
+    return _detailed_profiler.current_phase
+
+
 BITNET_PACK_AVAILABLE = False
 convert_weight_int8_to_int2 = None
 try:
@@ -1689,13 +2459,29 @@ class TernaryLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """
+        Apply ternary linear transformation with detailed profiling.
+        
+        Profiling levels:
+        - TERNARY_ENABLE_PROFILING=1: Basic operation timing
+        - TERNARY_DETAILED_PROFILE=1: Microsecond-level sub-operation breakdown
+        """
+        # Check if detailed profiling should run this call
+        detailed_prof = _detailed_profiler.should_profile()
+        
         # Early setup - compute once
-        # OPTIMIZATION: Use BF16 throughout for ternary models (kernel outputs BF16)
-        # This avoids dtype conversion overhead (~10us per layer)
         weight = layer.weight
-        x_compute = x if x.dtype == torch.bfloat16 else x.to(torch.bfloat16)
+        
+        # DETAILED PROFILING: dtype conversion
+        if detailed_prof:
+            with _detailed_profiler.operation_timer("apply", "dtype_conversion"):
+                x_compute = x if x.dtype == torch.bfloat16 else x.to(torch.bfloat16)
+                b_compute = None if bias is None else (bias if bias.dtype == torch.bfloat16 else bias.to(torch.bfloat16))
+        else:
+            x_compute = x if x.dtype == torch.bfloat16 else x.to(torch.bfloat16)
+            b_compute = None if bias is None else (bias if bias.dtype == torch.bfloat16 else bias.to(torch.bfloat16))
+        
         x_shape = x_compute.shape
-        b_compute = None if bias is None else (bias if bias.dtype == torch.bfloat16 else bias.to(torch.bfloat16))
         
         # Get layer attributes once
         weight_shape = getattr(layer, "_ternary_weight_shape", None)
@@ -1704,8 +2490,15 @@ class TernaryLinearMethod(LinearMethodBase):
             return F.linear(x_compute, weight, b_compute)
         
         N, K = weight_shape
-        x_2d = x_compute.reshape(-1, K)
-        M = x_2d.shape[0]
+        
+        # DETAILED PROFILING: reshape operation
+        if detailed_prof:
+            with _detailed_profiler.operation_timer("apply", "shape_reshape", N=N, K=K):
+                x_2d = x_compute.reshape(-1, K)
+                M = x_2d.shape[0]
+        else:
+            x_2d = x_compute.reshape(-1, K)
+            M = x_2d.shape[0]
         
         # Cache profiling state to avoid repeated checks
         prof_enabled = _ternary_profiler.enabled
@@ -1714,113 +2507,139 @@ class TernaryLinearMethod(LinearMethodBase):
         prof_ctx = _fast_apply_profiler.start()
         
         # OPTIMIZATION: Cache stream handle to avoid 7us overhead per call
-        # Getting stream twice (quantizer + kernel) wastes 14us per layer
         cuda_stream = torch.cuda.current_stream().cuda_stream
         
         # V4 kernel path: Try optimized kernel first
         bitnet_enabled = getattr(layer, '_ternary_bitnet_enabled', False)
-        if (
+        
+        # Check conditions individually for profiling
+        is_shape_supported = (N, K) in SUPPORTED_V4_NK_SHAPES
+        is_batch_supported = M <= DEFAULT_PREFILL_SKIP_M
+        
+        use_v4_kernel = (
             bitnet_enabled
             and self.quant_config.use_bitnet_kernel
             and BITNET_CUDA_AVAILABLE
             and BITNET_LIB is not None
             and weight.dtype == torch.uint8
             and x_compute.is_cuda
-            and M <= DEFAULT_PREFILL_SKIP_M
-            and (N, K) in SUPPORTED_V4_NK_SHAPES
-        ):
-            # OPTIMIZATION: Use pre-allocated buffers if available (eliminates cache lookup)
-            # For common batch sizes (M=1,2,4,8,16,32), buffers are pre-allocated at init
-            buf_attr_int8 = f'_ternary_act_int8_M{M}'
-            buf_attr_scale = f'_ternary_act_scale_M{M}'
-            buf_attr_output = f'_ternary_output_M{M}'
-            
-            if hasattr(layer, buf_attr_int8):
-                # Use pre-allocated buffers (zero overhead)
-                out_int8 = getattr(layer, buf_attr_int8)
-                out_scale = getattr(layer, buf_attr_scale)
-                output = getattr(layer, buf_attr_output)
-                # Ensure buffers match expected shape (should always match, but safety check)
-                if out_int8.shape[0] < M:
-                    # Fallback to dynamic allocation for unexpected shapes
-                    out_int8 = torch.empty(M, K, device=x_compute.device, dtype=torch.int8)
-                    out_scale = torch.empty(M, device=x_compute.device, dtype=torch.bfloat16)
-                    output = torch.empty(M, N, device=x_compute.device, dtype=torch.bfloat16)
+            and is_batch_supported
+            and is_shape_supported
+        )
+        
+        # Track kernel vs fallback shapes for profiling
+        if _detailed_profiler.enabled:
+            if use_v4_kernel:
+                _detailed_profiler.v4_kernel_shapes[(N, K)] += 1
             else:
-                # Fallback to cache for uncommon batch sizes
-                dev_key = _device_cache_key(x_compute.device)
-                act_key = (M, K, dev_key)
-                scale_key = (M, dev_key)
-                out_key = (M, N, dev_key)
+                _detailed_profiler.fallback_shapes[(N, K)] += 1
+                # Track specific reasons for fallback
+                if not is_shape_supported:
+                    _detailed_profiler.fallback_reasons[f"{N}x{K}_unsupported_shape"] += 1
+                elif not is_batch_supported:
+                    _detailed_profiler.fallback_reasons[f"{N}x{K}_large_batch_M{M}"] += 1
+                elif not bitnet_enabled:
+                    _detailed_profiler.fallback_reasons[f"{N}x{K}_not_bitnet_packed"] += 1
+        
+        if use_v4_kernel:
+            # DETAILED PROFILING: buffer allocation/lookup
+            if detailed_prof:
+                with _detailed_profiler.operation_timer("v4_kernel", "buffer_alloc", M=M, N=N, K=K):
+                    out_int8, out_scale, output = self._get_v4_buffers(layer, M, N, K, x_compute.device)
+            else:
+                # OPTIMIZATION: Use pre-allocated buffers if available
+                buf_attr_int8 = f'_ternary_act_int8_M{M}'
+                buf_attr_scale = f'_ternary_act_scale_M{M}'
+                buf_attr_output = f'_ternary_output_M{M}'
                 
-                out_int8 = _get_cached_tensor(
-                    layer, "_ternary_act_int8_cache", act_key,
-                    (M, K), torch.int8, x_compute.device
-                )
-                out_scale = _get_cached_tensor(
-                    layer, "_ternary_act_scale_cache", scale_key,
-                    (M,), torch.bfloat16, x_compute.device
-                )
-                output = _get_cached_tensor(
-                    layer, "_ternary_v4_output_cache", out_key,
-                    (M, N), torch.bfloat16, x_compute.device
-                )
+                if hasattr(layer, buf_attr_int8):
+                    out_int8 = getattr(layer, buf_attr_int8)
+                    out_scale = getattr(layer, buf_attr_scale)
+                    output = getattr(layer, buf_attr_output)
+                    if out_int8.shape[0] < M:
+                        out_int8 = torch.empty(M, K, device=x_compute.device, dtype=torch.int8)
+                        out_scale = torch.empty(M, device=x_compute.device, dtype=torch.bfloat16)
+                        output = torch.empty(M, N, device=x_compute.device, dtype=torch.bfloat16)
+                else:
+                    dev_key = _device_cache_key(x_compute.device)
+                    out_int8 = _get_cached_tensor(layer, "_ternary_act_int8_cache", (M, K, dev_key), (M, K), torch.int8, x_compute.device)
+                    out_scale = _get_cached_tensor(layer, "_ternary_act_scale_cache", (M, dev_key), (M,), torch.bfloat16, x_compute.device)
+                    output = _get_cached_tensor(layer, "_ternary_v4_output_cache", (M, N, dev_key), (M, N), torch.bfloat16, x_compute.device)
             
             # Profiling for quantization
             if prof_enabled:
                 _ternary_profiler._safe_sync()
                 quant_start = time.time()
             
-            # OPTIMIZATION: Use CUDA fast quantizer when available (10-14x faster than Triton)
-            if BITNET_CUDA_ACT_QUANT_AVAILABLE:
-                fast_result = _quantize_activation_fast_cuda(
-                    x_2d, layer.ternary_alpha,
-                    out_int8=out_int8, out_scale=out_scale,
-                    cuda_stream=cuda_stream  # Reuse cached stream
-                )
-                if fast_result is not None:
-                    x_int8, x_scale = fast_result
+            # DETAILED PROFILING: activation quantization (the expensive part!)
+            if detailed_prof:
+                with _detailed_profiler.operation_timer("v4_kernel", "activation_quant", M=M, N=N, K=K):
+                    x_int8, x_scale = self._quantize_activations(
+                        x_2d, layer.ternary_alpha, out_int8, out_scale, cuda_stream
+                    )
+            else:
+                # OPTIMIZATION: Use CUDA fast quantizer when available
+                if BITNET_CUDA_ACT_QUANT_AVAILABLE:
+                    fast_result = _quantize_activation_fast_cuda(
+                        x_2d, layer.ternary_alpha,
+                        out_int8=out_int8, out_scale=out_scale,
+                        cuda_stream=cuda_stream
+                    )
+                    if fast_result is not None:
+                        x_int8, x_scale = fast_result
+                    else:
+                        x_int8, x_scale = quantize_activation_prescale_fused(
+                            x_2d, layer.ternary_alpha,
+                            out_int8=out_int8, out_scale=out_scale
+                        )
                 else:
-                    # Fallback to Triton/PyTorch if CUDA fails
                     x_int8, x_scale = quantize_activation_prescale_fused(
                         x_2d, layer.ternary_alpha,
                         out_int8=out_int8, out_scale=out_scale
                     )
-            else:
-                # Triton path (slower but always available)
-                x_int8, x_scale = quantize_activation_prescale_fused(
-                    x_2d, layer.ternary_alpha,
-                    out_int8=out_int8, out_scale=out_scale
-                )
             
             if prof_enabled:
                 _ternary_profiler._safe_sync()
                 quant_duration = (time.time() - quant_start) * 1000
                 _ternary_profiler.record(f"quantize_activation_M{M}_K{K}", quant_duration)
             
-            # OPTIMIZATION: Use cached pointers (set at init, zero overhead)
+            # OPTIMIZATION: Use cached pointers
             weight_ptr = layer._ternary_weight_bitnet_ptr
             alpha_q_ptr = layer._ternary_alpha_q_ptr
             alpha_scale_ptr = layer._ternary_alpha_scale_ptr
             
-            # Profiling for kernel
             if prof_enabled:
                 _ternary_profiler._safe_sync()
                 kernel_start = time.time()
             
-            # Call V4 kernel (using cached stream)
-            ret_code = BITNET_LIB.bitlinear_int8xint2_v4_simple(
-                ctypes.c_void_p(x_int8.data_ptr()),
-                ctypes.c_void_p(weight_ptr),
-                ctypes.c_void_p(alpha_q_ptr),
-                ctypes.c_void_p(alpha_scale_ptr),
-                ctypes.c_void_p(output.data_ptr()),
-                ctypes.c_void_p(x_scale.data_ptr()),
-                ctypes.c_int(M),
-                ctypes.c_int(N),
-                ctypes.c_int(K),
-                ctypes.c_void_p(cuda_stream),  # Reuse cached stream (saves 7us)
-            )
+            # DETAILED PROFILING: kernel launch and execution
+            if detailed_prof:
+                with _detailed_profiler.operation_timer("v4_kernel", "kernel_exec", M=M, N=N, K=K):
+                    ret_code = BITNET_LIB.bitlinear_int8xint2_v4_simple(
+                        ctypes.c_void_p(x_int8.data_ptr()),
+                        ctypes.c_void_p(weight_ptr),
+                        ctypes.c_void_p(alpha_q_ptr),
+                        ctypes.c_void_p(alpha_scale_ptr),
+                        ctypes.c_void_p(output.data_ptr()),
+                        ctypes.c_void_p(x_scale.data_ptr()),
+                        ctypes.c_int(M),
+                        ctypes.c_int(N),
+                        ctypes.c_int(K),
+                        ctypes.c_void_p(cuda_stream),
+                    )
+            else:
+                ret_code = BITNET_LIB.bitlinear_int8xint2_v4_simple(
+                    ctypes.c_void_p(x_int8.data_ptr()),
+                    ctypes.c_void_p(weight_ptr),
+                    ctypes.c_void_p(alpha_q_ptr),
+                    ctypes.c_void_p(alpha_scale_ptr),
+                    ctypes.c_void_p(output.data_ptr()),
+                    ctypes.c_void_p(x_scale.data_ptr()),
+                    ctypes.c_int(M),
+                    ctypes.c_int(N),
+                    ctypes.c_int(K),
+                    ctypes.c_void_p(cuda_stream),
+                )
             
             if ret_code == 0:
                 if prof_enabled:
@@ -1828,12 +2647,28 @@ class TernaryLinearMethod(LinearMethodBase):
                     kernel_duration = (time.time() - kernel_start) * 1000
                     _ternary_profiler.record(f"ternary_apply_v4_kernel_M{M}_N{N}_K{K}", kernel_duration)
                 
-                # Post-process output
-                output = output.view(*x_shape[:-1], N)
+                # DETAILED PROFILING: output reshape
+                if detailed_prof:
+                    with _detailed_profiler.operation_timer("v4_kernel", "output_reshape", M=M, N=N, K=K):
+                        output = output.view(*x_shape[:-1], N)
+                else:
+                    output = output.view(*x_shape[:-1], N)
+                
+                # DETAILED PROFILING: bias addition
                 if b_compute is not None:
-                    output = output + b_compute
+                    if detailed_prof:
+                        with _detailed_profiler.operation_timer("v4_kernel", "bias_add", M=M, N=N, K=K):
+                            output = output + b_compute
+                    else:
+                        output = output + b_compute
+                
+                # DETAILED PROFILING: final dtype conversion
                 if output.dtype != x.dtype:
-                    output = output.to(x.dtype)
+                    if detailed_prof:
+                        with _detailed_profiler.operation_timer("v4_kernel", "output_dtype", M=M, N=N, K=K):
+                            output = output.to(x.dtype)
+                    else:
+                        output = output.to(x.dtype)
                 
                 _fast_apply_profiler.stop(prof_ctx)
                 return output
@@ -1844,22 +2679,36 @@ class TernaryLinearMethod(LinearMethodBase):
             fallback_start = time.time()
             shape_info = f"M{M}_N{N}_K{K}"
         
-        # Get or create FP16 weight cache
-        weight_fp16 = _get_fp16_fallback_weight(layer, x_compute.dtype, x_compute.device)
-        if weight_fp16 is None:
-            i2s_enabled = getattr(layer, '_ternary_i2s_enabled', False)
-            if i2s_enabled and weight.dtype == torch.uint8:
-                weight_fp16 = unpack_i2s_weights(weight, K, layer.ternary_alpha, x_compute.dtype)
-            else:
-                weight_fp16 = weight.to(x_compute.dtype)
-            layer.register_buffer("_ternary_weight_fp16", weight_fp16, persistent=False)
-            setattr(layer, "_ternary_weight_fp16_cache", {})
+        # DETAILED PROFILING: fallback weight preparation
+        if detailed_prof:
+            with _detailed_profiler.operation_timer("fallback", "weight_prep", M=M, N=N, K=K):
+                weight_fp16 = self._get_fallback_weight(layer, weight, K, x_compute.dtype, x_compute.device)
+        else:
             weight_fp16 = _get_fp16_fallback_weight(layer, x_compute.dtype, x_compute.device)
+            if weight_fp16 is None:
+                i2s_enabled = getattr(layer, '_ternary_i2s_enabled', False)
+                if i2s_enabled and weight.dtype == torch.uint8:
+                    weight_fp16 = unpack_i2s_weights(weight, K, layer.ternary_alpha, x_compute.dtype)
+                else:
+                    weight_fp16 = weight.to(x_compute.dtype)
+                layer.register_buffer("_ternary_weight_fp16", weight_fp16, persistent=False)
+                setattr(layer, "_ternary_weight_fp16_cache", {})
+                weight_fp16 = _get_fp16_fallback_weight(layer, x_compute.dtype, x_compute.device)
         
-        # Compute linear layer
-        out = F.linear(x_compute, weight_fp16, b_compute)
+        # DETAILED PROFILING: F.linear execution
+        if detailed_prof:
+            with _detailed_profiler.operation_timer("fallback", "linear_exec", M=M, N=N, K=K):
+                out = F.linear(x_compute, weight_fp16, b_compute)
+        else:
+            out = F.linear(x_compute, weight_fp16, b_compute)
+        
+        # DETAILED PROFILING: output dtype conversion
         if out.dtype != x.dtype:
-            out = out.to(x.dtype)
+            if detailed_prof:
+                with _detailed_profiler.operation_timer("fallback", "output_dtype", M=M, N=N, K=K):
+                    out = out.to(x.dtype)
+            else:
+                out = out.to(x.dtype)
         
         if prof_enabled:
             _ternary_profiler._safe_sync()
@@ -1868,6 +2717,66 @@ class TernaryLinearMethod(LinearMethodBase):
         
         _fast_apply_profiler.stop(prof_ctx)
         return out
+    
+    def _get_v4_buffers(self, layer, M, N, K, device):
+        """Get or allocate buffers for V4 kernel path."""
+        buf_attr_int8 = f'_ternary_act_int8_M{M}'
+        buf_attr_scale = f'_ternary_act_scale_M{M}'
+        buf_attr_output = f'_ternary_output_M{M}'
+        
+        if hasattr(layer, buf_attr_int8):
+            out_int8 = getattr(layer, buf_attr_int8)
+            out_scale = getattr(layer, buf_attr_scale)
+            output = getattr(layer, buf_attr_output)
+            if out_int8.shape[0] < M:
+                out_int8 = torch.empty(M, K, device=device, dtype=torch.int8)
+                out_scale = torch.empty(M, device=device, dtype=torch.bfloat16)
+                output = torch.empty(M, N, device=device, dtype=torch.bfloat16)
+        else:
+            dev_key = _device_cache_key(device)
+            out_int8 = _get_cached_tensor(layer, "_ternary_act_int8_cache", (M, K, dev_key), (M, K), torch.int8, device)
+            out_scale = _get_cached_tensor(layer, "_ternary_act_scale_cache", (M, dev_key), (M,), torch.bfloat16, device)
+            output = _get_cached_tensor(layer, "_ternary_v4_output_cache", (M, N, dev_key), (M, N), torch.bfloat16, device)
+        
+        return out_int8, out_scale, output
+    
+    def _quantize_activations(self, x_2d, alpha, out_int8, out_scale, cuda_stream):
+        """Quantize activations using best available method."""
+        if BITNET_CUDA_ACT_QUANT_AVAILABLE:
+            fast_result = _quantize_activation_fast_cuda(
+                x_2d, alpha,
+                out_int8=out_int8, out_scale=out_scale,
+                cuda_stream=cuda_stream
+            )
+            if fast_result is not None:
+                return fast_result
+        return quantize_activation_prescale_fused(
+            x_2d, alpha,
+            out_int8=out_int8, out_scale=out_scale
+        )
+    
+    def _get_fallback_weight(self, layer, weight, K, dtype, device):
+        """Get or create FP16 fallback weight."""
+        weight_fp16 = _get_fp16_fallback_weight(layer, dtype, device)
+        if weight_fp16 is None:
+            i2s_enabled = getattr(layer, '_ternary_i2s_enabled', False)
+            if i2s_enabled and weight.dtype == torch.uint8:
+                weight_fp16 = unpack_i2s_weights(weight, K, layer.ternary_alpha, dtype)
+            else:
+                weight_fp16 = weight.to(dtype)
+            layer.register_buffer("_ternary_weight_fp16", weight_fp16, persistent=False)
+            setattr(layer, "_ternary_weight_fp16_cache", {})
+            weight_fp16 = _get_fp16_fallback_weight(layer, dtype, device)
+        return weight_fp16
 
 
-__all__ = ["TernaryConfig", "TernaryLinearMethod"]
+__all__ = [
+    "TernaryConfig", 
+    "TernaryLinearMethod",
+    # Profiling exports
+    "_detailed_profiler",
+    "_macro_profiler", 
+    "_ternary_profiler",
+    "set_profiling_phase",
+    "get_profiling_phase",
+]

@@ -518,8 +518,23 @@ class CudaGraphRunner:
             logger.info(log_message)
 
     def _capture_graph(self, graph, pool, stream, run_once_fn):
+        # Notify profiler that we're capturing (operations will run once)
+        try:
+            from sglang.srt.layers.quantization.ternary import _detailed_profiler
+            _detailed_profiler.set_cuda_graph_state(capturing=True, active=False)
+        except (ImportError, AttributeError):
+            pass
+        
         with self.device_module.graph(graph, pool=pool, stream=stream):
             out = run_once_fn()
+        
+        # Notify profiler that capture is done
+        try:
+            from sglang.srt.layers.quantization.ternary import _detailed_profiler
+            _detailed_profiler.set_cuda_graph_state(capturing=False, active=True)
+        except (ImportError, AttributeError):
+            pass
+        
         return out
 
     def _create_device_graph(self):
@@ -822,8 +837,24 @@ class CudaGraphRunner:
             self.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
             self.positions[: self.raw_num_token].copy_(forward_batch.positions)
 
-        # Replay
-        self.graphs[self.bs].replay()
+        # Profile graph replay timing
+        try:
+            from sglang.srt.layers.quantization.ternary import _detailed_profiler
+            if _detailed_profiler.enabled:
+                start_event = torch.cuda.Event(enable_timing=True)
+                end_event = torch.cuda.Event(enable_timing=True)
+                start_event.record()
+                self.graphs[self.bs].replay()
+                end_event.record()
+                _detailed_profiler.replay_stats['decode'].setdefault('_pending_events', []).append(
+                    (start_event, end_event)
+                )
+                _detailed_profiler.replay_stats['decode']['count'] += 1
+            else:
+                self.graphs[self.bs].replay()
+        except (ImportError, AttributeError):
+            # Replay without profiling
+            self.graphs[self.bs].replay()
 
         output = self.output_buffers[self.bs]
         if isinstance(output, LogitsProcessorOutput):

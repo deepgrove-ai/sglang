@@ -2208,22 +2208,49 @@ class ModelRunner:
         except (ImportError, AttributeError):
             pass
         
+        # Detailed profiling: set phase context (decode/prefill/mixed)
+        phase_context = None
+        try:
+            from sglang.srt.layers.quantization.ternary import _detailed_profiler
+            if _detailed_profiler.enabled:
+                if forward_batch.forward_mode.is_decode():
+                    phase_name = "decode"
+                elif forward_batch.forward_mode.is_extend():
+                    phase_name = "prefill"
+                elif forward_batch.forward_mode.is_mixed():
+                    phase_name = "mixed"
+                else:
+                    phase_name = "other"
+                batch_size = forward_batch.batch_size if hasattr(forward_batch, 'batch_size') else 0
+                phase_context = _detailed_profiler.phase_context(phase_name, batch_size)
+                phase_context.__enter__()
+        except (ImportError, AttributeError):
+            pass
+        
         self.forward_pass_id += 1
 
-        with get_global_expert_distribution_recorder().with_forward_pass(
-            self.forward_pass_id,
-            forward_batch,
-        ):
-            output = self._forward_raw(
+        try:
+            with get_global_expert_distribution_recorder().with_forward_pass(
+                self.forward_pass_id,
                 forward_batch,
-                skip_attn_backend_init,
-                pp_proxy_tensors,
-                reinit_attn_backend,
-                split_forward_count,
-            )
+            ):
+                output = self._forward_raw(
+                    forward_batch,
+                    skip_attn_backend_init,
+                    pp_proxy_tensors,
+                    reinit_attn_backend,
+                    split_forward_count,
+                )
 
-        if self.eplb_manager is not None:
-            self.eplb_manager.on_forward_pass_end()
+            if self.eplb_manager is not None:
+                self.eplb_manager.on_forward_pass_end()
+        finally:
+            # Exit phase context
+            if phase_context is not None:
+                try:
+                    phase_context.__exit__(None, None, None)
+                except Exception:
+                    pass
 
         try:
             from sglang.srt.layers.quantization.ternary import _macro_profiler
