@@ -102,8 +102,8 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             use_grouped_topk=False,
         )
 
-        # Use raw FP16 for MoE experts (not ternary quantization)
-        # This improves decode performance by avoiding fast path overhead
+        # MoE experts use FP16 fused_moe (highly optimized Triton kernel)
+        # Ternary quantization is used for dense layers (attention, non-MoE MLP)
         self.experts = get_moe_impl_class(quant_config)(
             num_experts=config.num_experts
             + get_global_server_args().ep_num_redundant_experts,
@@ -111,7 +111,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             layer_id=layer_id,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
-            quant_config=None,  # Use FP16 instead of ternary quantization for MoE experts
+            quant_config=quant_config,  # Use ternary quantization for MoE experts
             prefix=add_prefix("experts", prefix),
         )
 

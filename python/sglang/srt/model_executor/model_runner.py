@@ -2210,17 +2210,20 @@ class ModelRunner:
         
         # Detailed profiling: set phase context (decode/prefill/mixed)
         phase_context = None
+        phase_name = "other"
         try:
             from sglang.srt.layers.quantization.ternary import _detailed_profiler
+            if forward_batch.forward_mode.is_decode():
+                phase_name = "decode"
+            elif forward_batch.forward_mode.is_extend():
+                phase_name = "prefill"
+            elif forward_batch.forward_mode.is_mixed():
+                phase_name = "mixed"
+            
+            # Always call on_batch_start for torch profiler
+            _detailed_profiler.on_batch_start(phase_name)
+            
             if _detailed_profiler.enabled:
-                if forward_batch.forward_mode.is_decode():
-                    phase_name = "decode"
-                elif forward_batch.forward_mode.is_extend():
-                    phase_name = "prefill"
-                elif forward_batch.forward_mode.is_mixed():
-                    phase_name = "mixed"
-                else:
-                    phase_name = "other"
                 batch_size = forward_batch.batch_size if hasattr(forward_batch, 'batch_size') else 0
                 phase_context = _detailed_profiler.phase_context(phase_name, batch_size)
                 phase_context.__enter__()
@@ -2251,6 +2254,13 @@ class ModelRunner:
                     phase_context.__exit__(None, None, None)
                 except Exception:
                     pass
+            
+            # Always call on_batch_end for torch profiler
+            try:
+                from sglang.srt.layers.quantization.ternary import _detailed_profiler
+                _detailed_profiler.on_batch_end(phase_name)
+            except (ImportError, AttributeError):
+                pass
 
         try:
             from sglang.srt.layers.quantization.ternary import _macro_profiler

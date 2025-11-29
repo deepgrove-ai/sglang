@@ -32,6 +32,7 @@ def apply_ternary_quantization(
         from sglang.srt.layers.quantization.ternary import (
             TernaryConfig,
             TernaryLinearMethod,
+            TernaryFusedMoEMethod,
         )
         from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod, Fp8Config
     except Exception as e:
@@ -97,16 +98,43 @@ def apply_ternary_quantization(
             except Exception as e:  # best-effort; fallback will be used if needed
                 logger.debug(f"Ternary quantization skipped for {m.__class__.__name__}: {e}")
         elif isinstance(m, FusedMoE):
-            # Enable FP8 MoE by default unless explicitly disabled
+            # Enable Ternary MoE quantization (uses V4 kernel)
             import os
-            if os.environ.get("TERNARY_MOE_FP8", "1") != "0":
+            use_ternary_moe = os.environ.get("TERNARY_MOE", "1") == "1"
+            
+            existing_qm = getattr(m, "quant_method", None)
+            is_ternary_moe = existing_qm is not None and existing_qm.__class__.__name__ == "TernaryFusedMoEMethod"
+            
+            if is_ternary_moe:
+                # Already using TernaryFusedMoEMethod, just run post-processing
+                try:
+                    existing_qm.process_weights_after_loading(m)
+                    quantized += 1
+                    logger.info(f"[TERNARY MOE] Applied ternary quantization to {prefix}")
+                except Exception as e:
+                    logger.warning(f"[TERNARY MOE] Post-process failed for {prefix}: {e}")
+                applied += 1
+            elif use_ternary_moe:
+                # Apply TernaryFusedMoEMethod
+                if not hasattr(m, "quant_method") or m.quant_method is None or \
+                   m.quant_method.__class__.__name__ == "UnquantizedFusedMoEMethod":
+                    qm = TernaryFusedMoEMethod(cfg)
+                    m.quant_method = qm
+                    applied += 1
+                    try:
+                        qm.process_weights_after_loading(m)
+                        quantized += 1
+                        logger.info(f"[TERNARY MOE] Applied ternary quantization to {prefix}")
+                    except Exception as e:
+                        logger.warning(f"[TERNARY MOE] Quantization failed for {prefix}: {e}")
+            else:
+                # Fallback to FP8 MoE if TERNARY_MOE=0
                 if not hasattr(m, "quant_method") or m.quant_method is None:
                     m.quant_method = Fp8MoEMethod(Fp8Config(
                         is_checkpoint_fp8_serialized=False,
                         activation_scheme="dynamic",
                     ))
                     applied += 1
-                # MoE weights are created by the MoE layer; best-effort post-processing
                 try:
                     m.quant_method.process_weights_after_loading(m)
                     quantized += 1
