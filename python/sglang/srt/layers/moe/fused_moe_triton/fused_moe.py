@@ -322,18 +322,48 @@ def fused_experts(
         )
 
 
-@torch.compile
-def moe_sum_reduce_torch_compile(x, out, routed_scaling_factor):
+# Check if torch.compile is disabled (for profiling mode)
+_torch_compile_disabled = os.environ.get("TORCH_COMPILE_DISABLE", "0") == "1"
+
+
+@torch.inference_mode()
+def _moe_sum_reduce_eager(x, out, routed_scaling_factor):
+    """Eager fallback wrapped in inference_mode to allow inplace ops."""
     torch.sum(x, dim=1, out=out)
     out.mul_(routed_scaling_factor)
 
 
 @torch.compile
-def swiglu_with_alpha_and_limit(x, gemm1_alpha, gemm1_limit):
+def _moe_sum_reduce_compiled(x, out, routed_scaling_factor):
+    """Compiled version with inplace ops for performance."""
+    torch.sum(x, dim=1, out=out)
+    out.mul_(routed_scaling_factor)
+
+
+def moe_sum_reduce_torch_compile(x, out, routed_scaling_factor):
+    if _torch_compile_disabled:
+        _moe_sum_reduce_eager(x, out, routed_scaling_factor)
+    else:
+        _moe_sum_reduce_compiled(x, out, routed_scaling_factor)
+
+
+def _swiglu_with_alpha_and_limit_impl(x, gemm1_alpha, gemm1_limit):
     gate, up = x[..., ::2], x[..., 1::2]
     gate = gate.clamp(min=None, max=gemm1_limit)
     up = up.clamp(min=-gemm1_limit, max=gemm1_limit)
     return gate * torch.sigmoid(gate * gemm1_alpha) * (up + 1)
+
+
+@torch.compile
+def _swiglu_with_alpha_and_limit_compiled(x, gemm1_alpha, gemm1_limit):
+    return _swiglu_with_alpha_and_limit_impl(x, gemm1_alpha, gemm1_limit)
+
+
+def swiglu_with_alpha_and_limit(x, gemm1_alpha, gemm1_limit):
+    if _torch_compile_disabled:
+        return _swiglu_with_alpha_and_limit_impl(x, gemm1_alpha, gemm1_limit)
+    else:
+        return _swiglu_with_alpha_and_limit_compiled(x, gemm1_alpha, gemm1_limit)
 
 
 def fused_experts_impl(

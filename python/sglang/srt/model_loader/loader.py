@@ -601,7 +601,13 @@ class DefaultModelLoader(BaseModelLoader):
         # Apply ternary quantization (runtime hook approach)
         if model_config.quantization == "ternary":
             from sglang.srt.model_loader.ternary_hook import apply_ternary_quantization
-            model = apply_ternary_quantization(model, threshold_scale=0.7, verbose=True)
+            model = apply_ternary_quantization(
+                model,
+                threshold_scale=0.7,
+                verbose=True,
+                model_id=getattr(model_config, "model_path", None),
+                revision=getattr(model_config, "revision", None),
+            )
 
         return model.eval()
 
@@ -738,7 +744,13 @@ class DummyModelLoader(BaseModelLoader):
             # Apply ternary quantization (runtime hook approach)
             if model_config.quantization == "ternary":
                 from sglang.srt.model_loader.ternary_hook import apply_ternary_quantization
-                model = apply_ternary_quantization(model, threshold_scale=0.7, verbose=True)
+                model = apply_ternary_quantization(
+                    model,
+                    threshold_scale=0.7,
+                    verbose=True,
+                    model_id=getattr(model_config, "model_path", None),
+                    revision=getattr(model_config, "revision", None),
+                )
 
             post_load_weights(model, model_config)
 

@@ -168,7 +168,7 @@ class _MacroscaleProfiler:
                 decode_ops[op_name] = stats
             elif '(EXTEND)' in op_name or 'prefill' in op_name.lower():
                 prefill_ops[op_name] = stats
-            else:
+        else:
                 other_ops[op_name] = stats
         
         # Print decode operations first (most relevant)
@@ -797,7 +797,7 @@ class _DetailedProfiler:
                 if should and self._call_counter <= 5:
                     logger.info(f"[DETAILED PROFILER] Warmup profiling call #{self._call_counter}, batch {self._batch_counter}")
                 return should
-            else:
+        else:
                 # exceeded warmup but graphs not active yet? stop profiling ops
                 return False
         
@@ -2062,7 +2062,7 @@ def unpack_i2s_weights(weight_packed: torch.Tensor, K: int, alpha: torch.Tensor,
             weight_packed_contig = weight_packed.contiguous()
             alpha_contig = alpha.contiguous()
             weight_unpacked = torch.empty(N, K, device=device, dtype=dtype)
-            
+        
             BLOCK_N = 128
             BLOCK_K = 64
             grid = (triton.cdiv(N, BLOCK_N), triton.cdiv(K, BLOCK_K))
@@ -2073,7 +2073,7 @@ def unpack_i2s_weights(weight_packed: torch.Tensor, K: int, alpha: torch.Tensor,
                 weight_unpacked.stride(0), weight_unpacked.stride(1),
                 BLOCK_SIZE_N=BLOCK_N, BLOCK_SIZE_K=BLOCK_K,
             )
-            
+        
             return weight_unpacked
         except Exception as e:
             logger.debug(f"[TERNARY] Triton unpack kernel failed, using PyTorch fallback: {e}")
@@ -2432,7 +2432,7 @@ class TernaryConfig(QuantizationConfig):
 
 class TernaryLinearMethod(LinearMethodBase):
     """Linear method for ternary quantization."""
-    
+
     def __init__(self, quant_config: TernaryConfig):
         self.quant_config = quant_config
 
@@ -2528,7 +2528,8 @@ class TernaryLinearMethod(LinearMethodBase):
                 layer.register_buffer('ternary_alpha', alpha_flat.to(torch.float32), persistent=False)
                 
                 # Quantize alpha to int8 for V4 kernel (done once at load time)
-                if BITNET_CUDA_AVAILABLE and self.quant_config.use_bitnet_kernel and device.type == 'cuda':
+                # NOTE: Only proceed if bitnet_packed is True (meaning ternary_weight_bitnet buffer exists)
+                if bitnet_packed and BITNET_CUDA_AVAILABLE and self.quant_config.use_bitnet_kernel and device.type == 'cuda':
                     try:
                         alpha_q, alpha_scale = quantize_alpha_int8(alpha_flat)
                         alpha_scale_tensor = torch.tensor([alpha_scale], device=device, dtype=torch.float32)
@@ -3022,6 +3023,11 @@ class TernaryFusedMoEMethod(FusedMoEMethodBase, nn.Module):
         device = layer.w13_weight.device
         dtype = layer.w13_weight.dtype
         
+        # Optional: decode-only mode keeps original BF16 weights for prefill and
+        # only materializes packed weights + alpha tables for the V4 indexed kernel.
+        # This is useful together with startup caching to avoid huge BF16 rewrites.
+        moe_decode_only = os.environ.get("TERNARY_MOE_DECODE_ONLY", "0") == "1"
+        
         # Store dimensions
         hidden_size = layer.w13_weight.shape[2]  # [num_experts, 2*intermediate, hidden]
         intermediate_size = layer.w13_weight.shape[1] // 2
@@ -3044,9 +3050,10 @@ class TernaryFusedMoEMethod(FusedMoEMethodBase, nn.Module):
         alpha13 = (absW13 * mask13_f).sum(dim=1, keepdim=True) / mask13_f.sum(dim=1, keepdim=True).clamp(min=1)  # [E, 1, K]
         alpha13 = torch.where(torch.isfinite(alpha13), alpha13, torch.full_like(alpha13, 1e-6))
         
-        # Reconstruct ternary weights for fallback
-        w13_ternary = w13.sign() * alpha13 * mask13_f
-        layer.w13_weight.data.copy_(w13_ternary.to(dtype))
+        # Reconstruct ternary weights for fallback (optional)
+        if not moe_decode_only:
+            w13_ternary = w13.sign() * alpha13 * mask13_f
+            layer.w13_weight.data.copy_(w13_ternary.to(dtype))
         
         # Process w2 weights [num_experts, hidden, intermediate] - all at once
         w2 = layer.w2_weight.data.float()
@@ -3057,51 +3064,83 @@ class TernaryFusedMoEMethod(FusedMoEMethodBase, nn.Module):
         alpha2 = (absW2 * mask2_f).sum(dim=1, keepdim=True) / mask2_f.sum(dim=1, keepdim=True).clamp(min=1)
         alpha2 = torch.where(torch.isfinite(alpha2), alpha2, torch.full_like(alpha2, 1e-6))
         
-        w2_ternary = w2.sign() * alpha2 * mask2_f
-        layer.w2_weight.data.copy_(w2_ternary.to(dtype))
+        if not moe_decode_only:
+            w2_ternary = w2.sign() * alpha2 * mask2_f
+            layer.w2_weight.data.copy_(w2_ternary.to(dtype))
         
         if use_v4:
-            # Pack weights for V4 kernel - process in batches of 16 to manage memory
-            w13_packed_list = []
-            w2_packed_list = []
-            
+            # Pack weights for V4 kernel - process in batches to manage memory
+            pad_w13 = (4 - (hidden_size % 4)) % 4
+            num_packed_cols_w13 = (hidden_size + pad_w13) // 4
+            pad_w2 = (4 - (intermediate_size % 4)) % 4
+            num_packed_cols_w2 = (intermediate_size + pad_w2) // 4
+
+            w13_packed = torch.empty(
+                num_experts,
+                2 * intermediate_size,
+                num_packed_cols_w13,
+                device=device,
+                dtype=torch.uint8,
+            )
+            w2_packed = torch.empty(
+                num_experts,
+                hidden_size,
+                num_packed_cols_w2,
+                device=device,
+                dtype=torch.uint8,
+            )
+
             batch_size = 16
             for start in range(0, num_experts, batch_size):
                 end = min(start + batch_size, num_experts)
+                B = end - start
                 
                 # Pack w13 batch
-                w13_sign_batch = torch.where(mask13[start:end], w13[start:end].sign(), torch.zeros_like(w13[start:end])).to(torch.int8)
-                for e in range(end - start):
-                    packed = pack_i2s_weights(w13_sign_batch[e].float()).contiguous()
-                    w13_packed_list.append(packed)
+                w13_sign_batch = torch.where(
+                    mask13[start:end],
+                    w13[start:end].sign(),
+                    torch.zeros_like(w13[start:end]),
+                ).to(torch.int8)
+                w13_packed_flat = pack_i2s_weights(
+                    w13_sign_batch.reshape(-1, hidden_size).float()
+                )
+                w13_packed[start:end].copy_(
+                    w13_packed_flat.view(B, 2 * intermediate_size, num_packed_cols_w13)
+                )
                 
                 # Pack w2 batch
-                w2_sign_batch = torch.where(mask2[start:end], w2[start:end].sign(), torch.zeros_like(w2[start:end])).to(torch.int8)
-                for e in range(end - start):
-                    packed = pack_i2s_weights(w2_sign_batch[e].float()).contiguous()
-                    w2_packed_list.append(packed)
+                w2_sign_batch = torch.where(
+                    mask2[start:end],
+                    w2[start:end].sign(),
+                    torch.zeros_like(w2[start:end]),
+                ).to(torch.int8)
+                w2_packed_flat = pack_i2s_weights(
+                    w2_sign_batch.reshape(-1, intermediate_size).float()
+                )
+                w2_packed[start:end].copy_(
+                    w2_packed_flat.view(B, hidden_size, num_packed_cols_w2)
+                )
             
             # Free large tensors (keep alpha tensors for later buffers)
-            del w13, absW13, mask13, mask13_f, w13_ternary
-            del w2, absW2, mask2, mask2_f, w2_ternary
+            del w13, absW13, mask13, mask13_f
+            del w2, absW2, mask2, mask2_f
+            if not moe_decode_only:
+                del w13_ternary, w2_ternary
             del w13_sign_batch, w2_sign_batch
         else:
-            del w13, absW13, mask13, mask13_f, alpha13, w13_ternary
-            del w2, absW2, mask2, mask2_f, alpha2, w2_ternary
+            del w13, absW13, mask13, mask13_f, alpha13
+            del w2, absW2, mask2, mask2_f, alpha2
+            if not moe_decode_only:
+                del w13_ternary, w2_ternary
         
         if use_v4:
-            # Stack and register packed weight buffers
-            w13_packed = torch.stack(w13_packed_list).to(device).contiguous()
-            w2_packed = torch.stack(w2_packed_list).to(device).contiguous()
-            
-            layer.register_buffer('_ternary_w13_packed', w13_packed, persistent=False)
-            layer.register_buffer('_ternary_w2_packed', w2_packed, persistent=False)
-            
-            del w13_packed_list, w2_packed_list
+            # Register packed weight buffers
+            layer.register_buffer('_ternary_w13_packed', w13_packed.contiguous(), persistent=False)
+            layer.register_buffer('_ternary_w2_packed', w2_packed.contiguous(), persistent=False)
             
             # Cache raw pointers for fast kernel calls (like V4 dense path)
-            layer._ternary_w13_packed_ptr = w13_packed.data_ptr()
-            layer._ternary_w2_packed_ptr = w2_packed.data_ptr()
+            layer._ternary_w13_packed_ptr = layer._ternary_w13_packed.data_ptr()
+            layer._ternary_w2_packed_ptr = layer._ternary_w2_packed.data_ptr()
             
             # Store per-expert alpha (float32) for activation quantization
             layer.register_buffer(
@@ -3195,9 +3234,17 @@ class TernaryFusedMoEMethod(FusedMoEMethodBase, nn.Module):
         For M=1 (decode): Uses INDEXED ternary MoE kernel (no Python gathering)
         For M>1 (prefill): Uses fused_moe with ternary-quantized BF16 weights
         """
-        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
-        from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_moe
-        from sglang.srt.layers.moe import MoeRunnerConfig
+        # Hot path: avoid repeating these imports every layer/token.
+        # Kept as a lazy import to reduce circular-import risk.
+        moe_imports = getattr(self, "_ternary_moe_imports", None)
+        if moe_imports is None:
+            from sglang.srt.layers.moe import MoeRunnerConfig
+            from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_moe
+            from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+            moe_imports = (StandardCombineInput, fused_moe, MoeRunnerConfig)
+            setattr(self, "_ternary_moe_imports", moe_imports)
+        StandardCombineInput, fused_moe, MoeRunnerConfig = moe_imports
         
         hidden_states = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
@@ -3245,10 +3292,13 @@ class TernaryFusedMoEMethod(FusedMoEMethodBase, nn.Module):
             x_scale_buf = layer._ternary_moe_x_scale[:top_k]
             inter_int8_buf = layer._ternary_moe_inter_int8[:top_k]
             inter_scale_buf = layer._ternary_moe_inter_scale[:top_k]
-            topk_ids_buf = layer._ternary_moe_topk_ids_buf[:top_k]
-            
-            expert_ids = topk_ids[0].to(torch.long)
-            topk_ids_buf.copy_(expert_ids.to(torch.int32))
+            # NOTE: SGLang TopK already produces topk_ids as CUDA int32.
+            # Avoid int32 -> int64 -> int32 conversions in the decode hot path.
+            expert_ids = topk_ids[0]
+            if expert_ids.dtype != torch.int32:
+                expert_ids = expert_ids.to(torch.int32)
+            if not expert_ids.is_contiguous():
+                expert_ids = expert_ids.contiguous()
             
             # FAST: Fused Triton quantization (4x faster than Python)
             x_row = hidden_states[0:1].to(torch.bfloat16)
@@ -3263,7 +3313,7 @@ class TernaryFusedMoEMethod(FusedMoEMethodBase, nn.Module):
             ret = BITNET_LIB.ternary_moe_gemv_indexed_batched(
                 ctypes.c_void_p(x_int8_buf.data_ptr()),
                 ctypes.c_void_p(layer._ternary_w13_packed_ptr),
-                ctypes.c_void_p(topk_ids_buf.data_ptr()),
+                ctypes.c_void_p(expert_ids.data_ptr()),
                 ctypes.c_void_p(x_scale_buf.data_ptr()),
                 ctypes.c_void_p(gate_up_out.data_ptr()),
                 ctypes.c_int(top_k),
@@ -3294,7 +3344,7 @@ class TernaryFusedMoEMethod(FusedMoEMethodBase, nn.Module):
             ret = BITNET_LIB.ternary_moe_gemv_indexed_batched(
                 ctypes.c_void_p(inter_int8_buf.data_ptr()),
                 ctypes.c_void_p(layer._ternary_w2_packed_ptr),
-                ctypes.c_void_p(topk_ids_buf.data_ptr()),
+                ctypes.c_void_p(expert_ids.data_ptr()),
                 ctypes.c_void_p(inter_scale_buf.data_ptr()),
                 ctypes.c_void_p(down_out.data_ptr()),
                 ctypes.c_int(top_k),
