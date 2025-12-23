@@ -1173,6 +1173,8 @@ except ImportError:
 BITNET_CUDA_AVAILABLE = False
 BITNET_LIB = None
 BITNET_CUDA_ACT_QUANT_AVAILABLE = False
+BITNET_CUDA_V4_MEGA_FUSED_AVAILABLE = False
+BITNET_CUDA_V4_RMSNORM_MEGA_FUSED_AVAILABLE = False
 _BITNET_ACT_FAST_FN = None
 _bitnet_act_fast_error_logged = False
 try:
@@ -1206,6 +1208,48 @@ try:
             BITNET_CUDA_AVAILABLE = True
             logger.info(f"[TERNARY] BitNet CUDA V4 kernel loaded successfully from {lib_path}")
             logger.info("[TERNARY] V4 kernel features: Pre-scaled activations, 1.8-2.0x speedup, correct production output")
+
+            # Optional: single-kernel "megafused" path (BF16 -> prescale+quant -> DP4A) for M=1 decode.
+            if hasattr(BITNET_LIB, "bitlinear_bf16xint2_v4_megafused"):
+                BITNET_LIB.bitlinear_bf16xint2_v4_megafused.argtypes = [
+                    ctypes.c_void_p,  # input_bf16 [M, K]
+                    ctypes.c_void_p,  # packed weights
+                    ctypes.c_void_p,  # alpha_fp32 [K]
+                    ctypes.c_void_p,  # output_bf16 [M, N]
+                    ctypes.c_int,     # M
+                    ctypes.c_int,     # N
+                    ctypes.c_int,     # K
+                    ctypes.c_void_p,  # stream
+                ]
+                BITNET_LIB.bitlinear_bf16xint2_v4_megafused.restype = ctypes.c_int
+                BITNET_CUDA_V4_MEGA_FUSED_AVAILABLE = True
+                logger.info("[TERNARY] V4 megafused kernel available (bitlinear_bf16xint2_v4_megafused)")
+
+            # Optional: single-kernel RMSNorm(+residual) + v4 megafused linear for decode M=1.
+            # Signature:
+            #   int bitlinear_rmsnorm_bf16xint2_v4_megafused(
+            #       const bf16* x, const bf16* residual_in (nullable), bf16* residual_out (nullable, must not alias),
+            #       const bf16* rms_weight, float eps,
+            #       const int8* packed_weights, const float* alpha_fp32,
+            #       bf16* out, int M, int N, int K, cudaStream_t stream)
+            if hasattr(BITNET_LIB, "bitlinear_rmsnorm_bf16xint2_v4_megafused"):
+                BITNET_LIB.bitlinear_rmsnorm_bf16xint2_v4_megafused.argtypes = [
+                    ctypes.c_void_p,  # input_bf16 [M, K]
+                    ctypes.c_void_p,  # residual_in_bf16 [M, K] (nullable, read-only)
+                    ctypes.c_void_p,  # residual_out_bf16 [M, K] (nullable, must not alias residual_in)
+                    ctypes.c_void_p,  # rms_weight_bf16 [K]
+                    ctypes.c_float,   # eps
+                    ctypes.c_void_p,  # packed weights
+                    ctypes.c_void_p,  # alpha_fp32 [K]
+                    ctypes.c_void_p,  # output_bf16 [M, N]
+                    ctypes.c_int,     # M
+                    ctypes.c_int,     # N
+                    ctypes.c_int,     # K
+                    ctypes.c_void_p,  # stream
+                ]
+                BITNET_LIB.bitlinear_rmsnorm_bf16xint2_v4_megafused.restype = ctypes.c_int
+                BITNET_CUDA_V4_RMSNORM_MEGA_FUSED_AVAILABLE = True
+                logger.info("[TERNARY] V4 RMSNorm+megafused kernel available (bitlinear_rmsnorm_bf16xint2_v4_megafused)")
 
             # Define batched MoE GEMV kernel function (optimized with shared memory)
             if hasattr(BITNET_LIB, 'ternary_moe_gemv_batched'):
@@ -1255,6 +1299,39 @@ try:
                 BITNET_LIB.ternary_moe_gemv_indexed_batched.restype = ctypes.c_int
                 logger.info("[TERNARY] Indexed batched MoE GEMV kernel loaded (down, per-expert input)")
                 logger.info("[TERNARY] Optimized MoE GEMV kernel available (3.1x faster than FP16)")
+
+            # MoE MEGAFUSED kernels: fuse quantization + ternary GEMV (eliminates Triton quant kernels)
+            if hasattr(BITNET_LIB, 'ternary_moe_megafused_gemv_indexed_shared'):
+                BITNET_LIB.ternary_moe_megafused_gemv_indexed_shared.argtypes = [
+                    ctypes.c_void_p,  # x_bf16 [K] BF16 shared input
+                    ctypes.c_void_p,  # all_weights_packed [num_experts, N, K/4]
+                    ctypes.c_void_p,  # topk_ids [top_k] int32
+                    ctypes.c_void_p,  # all_alpha [num_experts, K] FP32
+                    ctypes.c_void_p,  # output [top_k, N] BF16
+                    ctypes.c_int,     # top_k
+                    ctypes.c_int,     # N
+                    ctypes.c_int,     # K
+                    ctypes.c_int,     # num_experts
+                    ctypes.c_void_p,  # stream
+                ]
+                BITNET_LIB.ternary_moe_megafused_gemv_indexed_shared.restype = ctypes.c_int
+                logger.info("[TERNARY] MoE megafused GEMV (shared input) loaded - fuses quant+GEMV")
+
+            if hasattr(BITNET_LIB, 'ternary_moe_megafused_gemv_indexed_batched'):
+                BITNET_LIB.ternary_moe_megafused_gemv_indexed_batched.argtypes = [
+                    ctypes.c_void_p,  # x_bf16 [top_k, K] BF16 per-expert input
+                    ctypes.c_void_p,  # all_weights_packed [num_experts, N, K/4]
+                    ctypes.c_void_p,  # topk_ids [top_k] int32
+                    ctypes.c_void_p,  # all_alpha [num_experts, K] FP32
+                    ctypes.c_void_p,  # output [top_k, N] BF16
+                    ctypes.c_int,     # top_k
+                    ctypes.c_int,     # N
+                    ctypes.c_int,     # K
+                    ctypes.c_int,     # num_experts
+                    ctypes.c_void_p,  # stream
+                ]
+                BITNET_LIB.ternary_moe_megafused_gemv_indexed_batched.restype = ctypes.c_int
+                logger.info("[TERNARY] MoE megafused GEMV (batched input) loaded - fuses quant+GEMV")
 
             if hasattr(BITNET_LIB, 'ternary_quantize_activation_fast'):
                 BITNET_LIB.ternary_quantize_activation_fast.argtypes = [
@@ -1566,6 +1643,46 @@ if TRITON_AVAILABLE:
         out_offset = expert_local * K + k_offs
         tl.store(out_int8_ptr + out_offset, q_val.to(tl.int8), mask=mask)
 
+    # =========================================================================
+    # MoE-specific fused combine (remove elementwise_mul + reduce_sum)
+    # =========================================================================
+
+    @triton.jit
+    def _fused_moe_combine_topk_kernel(
+        down_ptr,           # [top_k, H] BF16
+        weights_ptr,        # [top_k] FP32
+        out_ptr,            # [H] BF16
+        stride_down0,       # stride for down_ptr dim0
+        stride_down1,       # stride for down_ptr dim1
+        H,                  # hidden size
+        top_k,              # runtime top-k (<= MAX_TOPK)
+        BLOCK_H: tl.constexpr,
+        MAX_TOPK: tl.constexpr,
+    ):
+        """
+        Fused MoE combine for decode: out[h] = sum_i down[i,h] * w[i]
+        - Single kernel launch (replaces mul + reduce_sum)
+        - Accumulates in FP32 for stability, stores BF16.
+        """
+        pid = tl.program_id(0)
+        offs = pid * BLOCK_H + tl.arange(0, BLOCK_H)
+        mask_h = offs < H
+
+        acc = tl.zeros([BLOCK_H], dtype=tl.float32)
+
+        # Unroll up to MAX_TOPK and mask inactive experts at runtime.
+        for i in tl.static_range(0, MAX_TOPK):
+            active = i < top_k
+            w = tl.load(weights_ptr + i, mask=active, other=0.0).to(tl.float32)
+            x = tl.load(
+                down_ptr + i * stride_down0 + offs * stride_down1,
+                mask=mask_h & active,
+                other=0.0,
+            ).to(tl.float32)
+            acc += x * w
+
+        tl.store(out_ptr + offs, acc.to(tl.bfloat16), mask=mask_h)
+
 def get_tensor_memory_bytes(t: torch.Tensor) -> int:
     """Get the memory usage of a tensor in bytes."""
     if t is None or not hasattr(t, 'element_size'):
@@ -1712,7 +1829,7 @@ def get_memory_snapshot(device: Optional[torch.device] = None) -> Dict[str, int]
         'max_allocated': torch.cuda.max_memory_allocated(device),
     }
 
-@torch.inference_mode()
+@torch.no_grad()
 def _quantize_activation_fast_cuda(
     x: torch.Tensor,
     alpha: torch.Tensor,
@@ -1775,7 +1892,7 @@ def _quantize_activation_fast_cuda(
     return x_int8, scale
 
 
-@torch.inference_mode()
+@torch.no_grad()
 def quantize_activation_prescale_fused(
     x: torch.Tensor, 
     alpha: torch.Tensor,
@@ -1858,7 +1975,7 @@ def quantize_activation_prescale_fused(
 # MoE-specific fused quantization functions (4x faster than Python)
 # =========================================================================
 
-@torch.inference_mode()
+@torch.no_grad()
 def fused_moe_quantize_input(
     x: torch.Tensor,           # [1, K] BF16
     alpha_table: torch.Tensor, # [num_experts, K] FP32
@@ -1901,7 +2018,7 @@ def fused_moe_quantize_input(
     return out_int8, out_scale
 
 
-@torch.inference_mode()
+@torch.no_grad()
 def fused_moe_quantize_intermediate(
     inter: torch.Tensor,       # [top_k, K] BF16
     alpha_table: torch.Tensor, # [num_experts, K] FP32
@@ -1942,7 +2059,7 @@ def fused_moe_quantize_intermediate(
     return out_int8, out_scale
 
 
-@torch.inference_mode()
+@torch.no_grad()
 def fused_moe_silu_gate(
     gate_up: torch.Tensor,      # [top_k, 2*intermediate] BF16
     intermediate: torch.Tensor, # [top_k, intermediate] BF16 (pre-allocated)
@@ -1969,6 +2086,54 @@ def fused_moe_silu_gate(
         BLOCK_SIZE=BLOCK_SIZE,
     )
     return intermediate
+
+
+@torch.no_grad()
+def fused_moe_combine_topk(
+    down: torch.Tensor,          # [top_k, H] BF16
+    topk_weights_1d: torch.Tensor,  # [top_k] FP32
+    out: torch.Tensor,           # [H] BF16 (pre-allocated)
+) -> torch.Tensor:
+    """Fused top-k weighted sum for MoE decode (single kernel)."""
+    top_k = down.shape[0]
+    H = down.shape[1]
+
+    if (
+        TRITON_AVAILABLE
+        and down.is_cuda
+        and topk_weights_1d.is_cuda
+        and down.dtype == torch.bfloat16
+        and out.dtype == torch.bfloat16
+        and out.numel() == H
+    ):
+        # Ensure weights are contiguous FP32 for fast loads (top_k <= 8, so any copy is tiny).
+        w = topk_weights_1d
+        if w.dtype != torch.float32:
+            w = w.to(torch.float32)
+        if not w.is_contiguous():
+            w = w.contiguous()
+
+        BLOCK_H = 256
+        grid = (triton.cdiv(H, BLOCK_H),)
+        _fused_moe_combine_topk_kernel[grid](
+            down,
+            w,
+            out,
+            down.stride(0),
+            down.stride(1),
+            H,
+            top_k,
+            BLOCK_H=BLOCK_H,
+            MAX_TOPK=8,
+            num_warps=4,
+        )
+        return out
+
+    # Fallback: two ops (mul + sum).
+    # Avoid allocations by writing into out.
+    tmp = (down * topk_weights_1d.to(down.dtype).unsqueeze(1)).sum(dim=0)
+    out.copy_(tmp.to(out.dtype))
+    return out
 
 
 def quantize_activation_int8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -2628,7 +2793,7 @@ class TernaryLinearMethod(LinearMethodBase):
                 import traceback
                 logger.debug(f"Quantization error traceback: {traceback.format_exc()}")
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def apply(
         self,
         layer: torch.nn.Module,
@@ -2706,6 +2871,14 @@ class TernaryLinearMethod(LinearMethodBase):
             and is_batch_supported
             and is_shape_supported
         )
+
+        # Megafused path: single-kernel BF16->(prescale+quant)->DP4A, currently decode-only (M=1).
+        use_v4_megafused = (
+            use_v4_kernel
+            and M == 1
+            and BITNET_CUDA_V4_MEGA_FUSED_AVAILABLE
+            and os.environ.get("TERNARY_V4_MEGA_FUSED", "1") == "1"
+        )
         
         # Track kernel vs fallback shapes for profiling
         if _detailed_profiler.enabled:
@@ -2752,6 +2925,48 @@ class TernaryLinearMethod(LinearMethodBase):
                 output = _get_cached_tensor(
                         layer, "_ternary_v4_output_cache", (M, N, dev_key), (M, N), torch.bfloat16, x_compute.device
                 )
+
+            # Megafused: skip explicit activation quantization and call the 1-kernel path.
+            if use_v4_megafused:
+                if prof_enabled:
+                    _ternary_profiler._safe_sync()
+                    kernel_start = time.time()
+
+                x_in = x_2d
+                if not x_in.is_contiguous():
+                    x_in = x_in.contiguous()
+                alpha_fp32 = layer.ternary_alpha
+                if not alpha_fp32.is_contiguous():
+                    alpha_fp32 = alpha_fp32.contiguous()
+
+                ret_code = BITNET_LIB.bitlinear_bf16xint2_v4_megafused(
+                    ctypes.c_void_p(x_in.data_ptr()),
+                    ctypes.c_void_p(layer._ternary_weight_bitnet_ptr),
+                    ctypes.c_void_p(alpha_fp32.data_ptr()),
+                    ctypes.c_void_p(output.data_ptr()),
+                    ctypes.c_int(M),
+                    ctypes.c_int(N),
+                    ctypes.c_int(K),
+                    ctypes.c_void_p(cuda_stream),
+                )
+
+                if ret_code == 0:
+                    if prof_enabled:
+                        _ternary_profiler._safe_sync()
+                        kernel_duration = (time.time() - kernel_start) * 1000
+                        _ternary_profiler.record(f"ternary_apply_v4_megafused_M{M}_N{N}_K{K}", kernel_duration)
+
+                    output = output.view(*x_shape[:-1], N)
+                    if b_compute is not None:
+                        output = output + b_compute
+                    if output.dtype != x.dtype:
+                        output = output.to(x.dtype)
+                    _fast_apply_profiler.stop(prof_ctx)
+                    return output
+                else:
+                    # If megafused is unavailable for this shape at runtime, fall back to 2-step.
+                    if _detailed_profiler.enabled:
+                        _detailed_profiler.fallback_reasons[f"{N}x{K}_megafused_ret{ret_code}"] += 1
             
             # Profiling for quantization
             if prof_enabled:
@@ -3186,6 +3401,14 @@ class TernaryFusedMoEMethod(FusedMoEMethodBase, nn.Module):
             # Intermediate buffer for fused SiLU (avoids allocation in forward)
             layer.register_buffer('_ternary_moe_intermediate_buf',
                 torch.empty(max_top_k, intermediate_size, device=device, dtype=torch.bfloat16), persistent=False)
+
+            # Final combined output buffer for decode: [hidden] BF16
+            # Used by fused_moe_combine_topk to avoid per-token allocations.
+            layer.register_buffer(
+                "_ternary_moe_combined_buf",
+                torch.empty(hidden_size, device=device, dtype=torch.bfloat16),
+                persistent=False,
+            )
             
             layer._ternary_moe_v4_enabled = True
             logger.info(f"[TERNARY MOE] V4 indexed kernel enabled for {num_experts} experts")
@@ -3300,28 +3523,53 @@ class TernaryFusedMoEMethod(FusedMoEMethodBase, nn.Module):
             if not expert_ids.is_contiguous():
                 expert_ids = expert_ids.contiguous()
             
-            # FAST: Fused Triton quantization (4x faster than Python)
-            x_row = hidden_states[0:1].to(torch.bfloat16)
-            fused_moe_quantize_input(
-                x_row,
-                layer._ternary_moe_alpha_w13,  # Full alpha table [num_experts, K]
-                expert_ids,                     # Expert IDs [top_k]
-                x_int8_buf,
-                x_scale_buf,
+            # Avoid dtype churn: use BF16 input directly.
+            x_row = hidden_states[0:1]
+            if not x_row.is_contiguous():
+                x_row = x_row.contiguous()
+            
+            # Check if megafused kernels are available (fuses quant+GEMV, eliminates 2 Triton kernels)
+            use_megafused = (
+                hasattr(BITNET_LIB, 'ternary_moe_megafused_gemv_indexed_shared')
+                and hasattr(BITNET_LIB, 'ternary_moe_megafused_gemv_indexed_batched')
+                and hidden_states.dtype == torch.bfloat16
             )
             
-            ret = BITNET_LIB.ternary_moe_gemv_indexed_batched(
-                ctypes.c_void_p(x_int8_buf.data_ptr()),
-                ctypes.c_void_p(layer._ternary_w13_packed_ptr),
-                ctypes.c_void_p(expert_ids.data_ptr()),
-                ctypes.c_void_p(x_scale_buf.data_ptr()),
-                ctypes.c_void_p(gate_up_out.data_ptr()),
-                ctypes.c_int(top_k),
-                ctypes.c_int(N_w13),
-                ctypes.c_int(K_w13),
-                ctypes.c_int(num_experts),
-                ctypes.c_void_p(cuda_stream),
-            )
+            if use_megafused:
+                # MEGAFUSED path: quant+GEMV in one kernel (eliminates Triton quant kernels)
+                ret = BITNET_LIB.ternary_moe_megafused_gemv_indexed_shared(
+                    ctypes.c_void_p(x_row.data_ptr()),
+                    ctypes.c_void_p(layer._ternary_w13_packed_ptr),
+                    ctypes.c_void_p(expert_ids.data_ptr()),
+                    ctypes.c_void_p(layer._ternary_moe_alpha_w13.data_ptr()),
+                    ctypes.c_void_p(gate_up_out.data_ptr()),
+                    ctypes.c_int(top_k),
+                    ctypes.c_int(N_w13),
+                    ctypes.c_int(K_w13),
+                    ctypes.c_int(num_experts),
+                    ctypes.c_void_p(cuda_stream),
+                )
+            else:
+                # Fallback: Triton quant + CUDA GEMV
+                fused_moe_quantize_input(
+                    x_row,
+                    layer._ternary_moe_alpha_w13,
+                    expert_ids,
+                    x_int8_buf,
+                    x_scale_buf,
+                )
+                ret = BITNET_LIB.ternary_moe_gemv_indexed_batched(
+                    ctypes.c_void_p(x_int8_buf.data_ptr()),
+                    ctypes.c_void_p(layer._ternary_w13_packed_ptr),
+                    ctypes.c_void_p(expert_ids.data_ptr()),
+                    ctypes.c_void_p(x_scale_buf.data_ptr()),
+                    ctypes.c_void_p(gate_up_out.data_ptr()),
+                    ctypes.c_int(top_k),
+                    ctypes.c_int(N_w13),
+                    ctypes.c_int(K_w13),
+                    ctypes.c_int(num_experts),
+                    ctypes.c_void_p(cuda_stream),
+                )
             
             if ret != 0:
                 # Fallback to fused_moe (config already fetched above)
@@ -3332,36 +3580,52 @@ class TernaryFusedMoEMethod(FusedMoEMethodBase, nn.Module):
             intermediate_buf = layer._ternary_moe_intermediate_buf[:top_k]
             fused_moe_silu_gate(gate_up_out, intermediate_buf, intermediate_size)
             
-            # OPTIMIZED: Single-pass Triton quantization for intermediate
-            fused_moe_quantize_intermediate(
-                intermediate_buf,
-                layer._ternary_moe_alpha_w2,  # Full alpha table [num_experts, K]
-                expert_ids,                    # Expert IDs [top_k]
-                inter_int8_buf,
-                inter_scale_buf,
-            )
-            
-            ret = BITNET_LIB.ternary_moe_gemv_indexed_batched(
-                ctypes.c_void_p(inter_int8_buf.data_ptr()),
-                ctypes.c_void_p(layer._ternary_w2_packed_ptr),
-                ctypes.c_void_p(expert_ids.data_ptr()),
-                ctypes.c_void_p(inter_scale_buf.data_ptr()),
-                ctypes.c_void_p(down_out.data_ptr()),
-                ctypes.c_int(top_k),
-                ctypes.c_int(N_w2),
-                ctypes.c_int(K_w2),
-                ctypes.c_int(num_experts),
-                ctypes.c_void_p(cuda_stream),
-            )
+            if use_megafused:
+                # MEGAFUSED path: quant+GEMV in one kernel
+                ret = BITNET_LIB.ternary_moe_megafused_gemv_indexed_batched(
+                    ctypes.c_void_p(intermediate_buf.data_ptr()),
+                    ctypes.c_void_p(layer._ternary_w2_packed_ptr),
+                    ctypes.c_void_p(expert_ids.data_ptr()),
+                    ctypes.c_void_p(layer._ternary_moe_alpha_w2.data_ptr()),
+                    ctypes.c_void_p(down_out.data_ptr()),
+                    ctypes.c_int(top_k),
+                    ctypes.c_int(N_w2),
+                    ctypes.c_int(K_w2),
+                    ctypes.c_int(num_experts),
+                    ctypes.c_void_p(cuda_stream),
+                )
+            else:
+                # Fallback: Triton quant + CUDA GEMV
+                fused_moe_quantize_intermediate(
+                    intermediate_buf,
+                    layer._ternary_moe_alpha_w2,
+                    expert_ids,
+                    inter_int8_buf,
+                    inter_scale_buf,
+                )
+                ret = BITNET_LIB.ternary_moe_gemv_indexed_batched(
+                    ctypes.c_void_p(inter_int8_buf.data_ptr()),
+                    ctypes.c_void_p(layer._ternary_w2_packed_ptr),
+                    ctypes.c_void_p(expert_ids.data_ptr()),
+                    ctypes.c_void_p(inter_scale_buf.data_ptr()),
+                    ctypes.c_void_p(down_out.data_ptr()),
+                    ctypes.c_int(top_k),
+                    ctypes.c_int(N_w2),
+                    ctypes.c_int(K_w2),
+                    ctypes.c_int(num_experts),
+                    ctypes.c_void_p(cuda_stream),
+                )
             
             if ret != 0:
                 # Fallback to fused_moe (config already fetched above)
                 output = fused_moe(hidden_states, layer.w13_weight, layer.w2_weight, topk_output, moe_runner_config)
                 return StandardCombineInput(hidden_states=output)
             
-            # Weighted sum [top_k, hidden] * [top_k, 1] -> [1, hidden]
-            selected_weights = topk_weights[0].to(down_out.dtype).unsqueeze(1)
-            output = (down_out * selected_weights).sum(dim=0, keepdim=True)
+            # Fused combine: remove elementwise_mul + reduce_sum kernels.
+            # TopK returns weights in FP32, which we consume directly without casting.
+            out_buf = layer._ternary_moe_combined_buf
+            fused_moe_combine_topk(down_out, topk_weights[0], out_buf)
+            output = out_buf.view(1, -1)
             
             if output.dtype != dtype:
                 output = output.to(dtype)

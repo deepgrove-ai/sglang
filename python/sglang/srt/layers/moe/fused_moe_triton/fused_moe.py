@@ -326,7 +326,7 @@ def fused_experts(
 _torch_compile_disabled = os.environ.get("TORCH_COMPILE_DISABLE", "0") == "1"
 
 
-@torch.inference_mode()
+@torch.no_grad()
 def _moe_sum_reduce_eager(x, out, routed_scaling_factor):
     """Eager fallback wrapped in inference_mode to allow inplace ops."""
     torch.sum(x, dim=1, out=out)

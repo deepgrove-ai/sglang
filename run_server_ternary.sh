@@ -84,6 +84,11 @@ export SGLANG_TERNARY_CACHE_WRITE="${SGLANG_TERNARY_CACHE_WRITE:-1}"
 # - 0: quantize MoE BF16 weights too (slower startup)
 export TERNARY_MOE_DECODE_ONLY="${TERNARY_MOE_DECODE_ONLY:-1}"
 
+# Decode fusion knobs (safe defaults; guarded in code by tp=1 + decode + supported shapes)
+# - 1: fuse input RMSNorm(+residual update) into ternary QKV for decode (removes per-layer RMSNorm kernel)
+# - 0: disable and use standard RMSNorm path
+export TERNARY_FUSE_RMSNORM_QKV="${TERNARY_FUSE_RMSNORM_QKV:-1}"
+
 # Enable ternary profiling (set to 1 to enable for debugging)
 # When enabled, tracks timing for ternary operations and saves to JSON file
 export TERNARY_ENABLE_PROFILING="${TERNARY_ENABLE_PROFILING:-0}"
@@ -153,12 +158,15 @@ MODEL_NAME="sft_dist_l_q-$QUANT_MODE"
 SERVER_PORT=30080
 DEFAULT_REQUEST_GPU_MEMORY="0.85"
 REQUEST_GPU_MEMORY="${REQUEST_GPU_MEMORY:-$DEFAULT_REQUEST_GPU_MEMORY}"
-# Performance-tuned defaults for ternary decode
-# CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:--1}"
-# CUDA_GRAPH_MAX_BS="${CUDA_GRAPH_MAX_BS:-1}"
-# DISABLE_RADIX_CACHE="${DISABLE_RADIX_CACHE:-1}"
-# DISABLE_OVERLAP="${DISABLE_OVERLAP:-1}"
-# MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-1}"
+# Optional performance knobs (defaults keep SGLang auto-tuning behavior).
+# For batch=1 decode-latency experiments, good starting point:
+#   CUDA_GRAPH_BS="1" MAX_RUNNING_REQUESTS="1" CHUNKED_PREFILL_SIZE="-1"
+CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-}"
+CUDA_GRAPH_MAX_BS="${CUDA_GRAPH_MAX_BS:-}"
+CUDA_GRAPH_BS="${CUDA_GRAPH_BS:-}"
+DISABLE_RADIX_CACHE="${DISABLE_RADIX_CACHE:-0}"
+DISABLE_OVERLAP="${DISABLE_OVERLAP:-0}"  # maps to --disable-overlap-schedule
+MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-}"
 
 echo "========================================"
 echo "Starting SGLang server"
@@ -168,15 +176,17 @@ echo "Port: $SERVER_PORT"
 echo "Tensor Parallelism: $TP_SIZE GPU(s)"
 echo "GPU memory allocation: $REQUEST_GPU_MEMORY"
 echo "Ternary log level: $SGLANG_TERNARY_LOG_LEVEL"
+echo "Fuse RMSNorm+QKV (decode,tp=1): $TERNARY_FUSE_RMSNORM_QKV"
 if [[ "$TERNARY_ENABLE_PROFILING" == "1" ]]; then
     echo "Ternary profiling: ENABLED (output: $TERNARY_PROFILE_OUTPUT)"
 else
     echo "Ternary profiling: DISABLED"
 fi
 echo "Chunked prefill size: $CHUNKED_PREFILL_SIZE"
+echo "CUDA graph batch sizes: $CUDA_GRAPH_BS"
 echo "CUDA graph max batch size: $CUDA_GRAPH_MAX_BS"
 echo "Disable radix cache: $DISABLE_RADIX_CACHE"
-echo "Disable overlap: $DISABLE_OVERLAP"
+echo "Disable overlap schedule: $DISABLE_OVERLAP"
 echo "Max running requests: $MAX_RUNNING_REQUESTS"
 echo "========================================"
 
@@ -198,16 +208,29 @@ CMD="python -m sglang.launch_server \
     --trust-remote-code \
     --attention-backend flashinfer"
 
-#     --chunked-prefill-size $CHUNKED_PREFILL_SIZE \
+# Optional knobs (mostly useful for batch=1 decode latency experiments)
+if [[ -n "$CHUNKED_PREFILL_SIZE" ]]; then
+    CMD="$CMD --chunked-prefill-size $CHUNKED_PREFILL_SIZE"
+fi
 
-#     # --max-running-requests $MAX_RUNNING_REQUESTS \
-# Optional knobs
-# if [[ "$DISABLE_RADIX_CACHE" == "1" ]]; then
-#     CMD="$CMD --disable-radix-cache"
-# fi
-# if [[ "$DISABLE_OVERLAP" == "1" ]]; then
-#     CMD="$CMD --disable-overlap"
-# fi
+# Prefer an explicit capture list; fall back to max-bs if provided.
+if [[ -n "$CUDA_GRAPH_BS" ]]; then
+    CMD="$CMD --cuda-graph-bs $CUDA_GRAPH_BS"
+elif [[ -n "$CUDA_GRAPH_MAX_BS" ]]; then
+    CMD="$CMD --cuda-graph-max-bs $CUDA_GRAPH_MAX_BS"
+fi
+
+if [[ -n "$MAX_RUNNING_REQUESTS" ]]; then
+    CMD="$CMD --max-running-requests $MAX_RUNNING_REQUESTS"
+fi
+
+if [[ "$DISABLE_RADIX_CACHE" == "1" ]]; then
+    CMD="$CMD --disable-radix-cache"
+fi
+
+if [[ "$DISABLE_OVERLAP" == "1" ]]; then
+    CMD="$CMD --disable-overlap-schedule"
+fi
 
 # Add quantization flag if set
 if [ -n "$QUANT_FLAG" ]; then

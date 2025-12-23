@@ -469,6 +469,13 @@ def _try_load_moe_cache(
             torch.empty(max_top_k, intermediate_size, device=device, dtype=torch.bfloat16),
             persistent=False,
         )
+        # Final combined output buffer for decode: [hidden] BF16.
+        # Needed by fused ternary MoE combine kernel; must exist before CUDA graph capture.
+        layer.register_buffer(
+            "_ternary_moe_combined_buf",
+            torch.empty(hidden_size, device=device, dtype=torch.bfloat16),
+            persistent=False,
+        )
 
         layer._ternary_moe_v4_enabled = True
     else:

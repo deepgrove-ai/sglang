@@ -17,7 +17,9 @@
 
 """Inference-only Qwen3MoE model compatible with HuggingFace weights."""
 
+import ctypes
 import logging
+import os
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import torch
@@ -77,6 +79,31 @@ _is_flashinfer_available = is_flashinfer_available()
 
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
+
+# Enable decode-only fusion: input RMSNorm (+ residual update) + ternary QKV in one kernel.
+_TERNARY_FUSE_RMSNORM_QKV = os.environ.get("TERNARY_FUSE_RMSNORM_QKV", "0") == "1"
+_TERNARY_FUSE_RMSNORM_QKV_DEBUG = (
+    os.environ.get("TERNARY_FUSE_RMSNORM_QKV_DEBUG", "0") == "1"
+)
+
+# Supported (N, K) pairs for bitlinear_rmsnorm_bf16xint2_v4_megafused in libternary_bitnet.so
+_TERNARY_RMSNORM_QKV_SUPPORTED_NK = {
+    (5120, 2048),
+    (2048, 4096),
+    (2048, 2048),
+    (1536, 2048),
+    (2048, 768),
+    (768, 2048),
+}
+
+_ternary_rmsnorm_qkv_hit_logged = False
+_ternary_rmsnorm_qkv_skip_logged = False
+
+if _TERNARY_FUSE_RMSNORM_QKV:
+    logger.info(
+        "[TERNARY] Qwen3MoE RMSNorm+QKV fusion enabled (TERNARY_FUSE_RMSNORM_QKV=1). "
+        "Set TERNARY_FUSE_RMSNORM_QKV_DEBUG=1 to log first hit/skip reason."
+    )
 
 
 class Qwen3MoeSparseMoeBlock(nn.Module):
@@ -383,11 +410,19 @@ class Qwen3MoeAttention(nn.Module):
         return q, k
 
     def op_prepare(self, state):
-        state.attn_intermediate_state = self.forward_prepare(
-            positions=state.positions,
-            hidden_states=state.pop("hidden_states_after_comm_pre_attn"),
-            forward_batch=state.forward_batch,
-        )
+        qkv_fused = state.pop("qkv_fused", None)
+        if qkv_fused is not None:
+            state.attn_intermediate_state = self.forward_prepare_from_qkv(
+                positions=state.positions,
+                qkv=qkv_fused,
+                forward_batch=state.forward_batch,
+            )
+        else:
+            state.attn_intermediate_state = self.forward_prepare(
+                positions=state.positions,
+                hidden_states=state.pop("hidden_states_after_comm_pre_attn"),
+                forward_batch=state.forward_batch,
+            )
 
     def op_core(self, state):
         state.hidden_states_after_attn = self.forward_core(
@@ -403,6 +438,15 @@ class Qwen3MoeAttention(nn.Module):
         if hidden_states.shape[0] == 0:
             return hidden_states, forward_batch, None
         qkv, _ = self.qkv_proj(hidden_states)
+        return self.forward_prepare_from_qkv(positions=positions, qkv=qkv, forward_batch=forward_batch)
+
+    def forward_prepare_from_qkv(
+        self,
+        positions: torch.Tensor,
+        qkv: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ):
+        """Like forward_prepare(), but qkv projection is already computed."""
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self._apply_qk_norm(q, k)
         q, k = self.rotary_emb(
@@ -549,11 +593,136 @@ class Qwen3MoeDecoderLayer(nn.Module):
         except (ImportError, AttributeError):
             mode_str = "UNKNOWN"
 
-        hidden_states, residual = self.layer_communicator.prepare_attn(
-            hidden_states, residual, forward_batch
-        )
+        # Decode-only fusion: input RMSNorm(+residual update) + ternary QKV in one kernel.
+        # Only for tp=1; otherwise LayerCommunicator must run (communication + layernorm).
+        did_fused_qkv = False
+        if (
+            _TERNARY_FUSE_RMSNORM_QKV
+            and forward_batch.forward_mode.is_decode()
+            and self.attn_tp_size == 1
+            and hidden_states is not None
+            and hidden_states.shape[0] == 1
+        ):
+            try:
+                from sglang.srt.layers.quantization import ternary as ternary_quant
 
-        if hidden_states.shape[0] != 0:
+                qkv_proj = self.self_attn.qkv_proj
+                weight_shape = getattr(qkv_proj, "_ternary_weight_shape", None)
+                if _TERNARY_FUSE_RMSNORM_QKV_DEBUG and not _ternary_rmsnorm_qkv_skip_logged:
+                    if weight_shape is None:
+                        logger.warning(
+                            "[TERNARY] RMSNorm+QKV fusion SKIP: qkv_proj is not ternary-quantized (no _ternary_weight_shape)."
+                        )
+                        globals()["_ternary_rmsnorm_qkv_skip_logged"] = True
+                    elif (weight_shape[0], weight_shape[1]) not in _TERNARY_RMSNORM_QKV_SUPPORTED_NK:
+                        logger.warning(
+                            "[TERNARY] RMSNorm+QKV fusion SKIP: unsupported qkv_proj weight_shape=%s; supported=%s",
+                            weight_shape,
+                            sorted(_TERNARY_RMSNORM_QKV_SUPPORTED_NK),
+                        )
+                        globals()["_ternary_rmsnorm_qkv_skip_logged"] = True
+                    elif not hidden_states.is_cuda:
+                        logger.warning("[TERNARY] RMSNorm+QKV fusion SKIP: hidden_states not on CUDA")
+                        globals()["_ternary_rmsnorm_qkv_skip_logged"] = True
+                    elif hidden_states.dtype != torch.bfloat16:
+                        logger.warning(
+                            "[TERNARY] RMSNorm+QKV fusion SKIP: hidden_states dtype=%s (need bf16).",
+                            hidden_states.dtype,
+                        )
+                        globals()["_ternary_rmsnorm_qkv_skip_logged"] = True
+
+                can_use = (
+                    getattr(ternary_quant, "BITNET_CUDA_V4_RMSNORM_MEGA_FUSED_AVAILABLE", False)
+                    and ternary_quant.BITNET_LIB is not None
+                    and hasattr(ternary_quant.BITNET_LIB, "bitlinear_rmsnorm_bf16xint2_v4_megafused")
+                    and getattr(qkv_proj, "_ternary_bitnet_enabled", False)
+                    and weight_shape is not None
+                    and (weight_shape[0], weight_shape[1]) in _TERNARY_RMSNORM_QKV_SUPPORTED_NK
+                    and qkv_proj.bias is None
+                    and hidden_states.is_cuda
+                    and hidden_states.dtype == torch.bfloat16
+                )
+                if can_use:
+                    N, K = weight_shape
+                    if K != hidden_states.shape[1]:
+                        raise RuntimeError(f"Unexpected qkv_proj K={K} for hidden_states K={hidden_states.shape[1]}")
+
+                    qkv_out = getattr(qkv_proj, "_ternary_output_M1", None)
+                    if qkv_out is None or qkv_out.shape != (1, N) or qkv_out.dtype != torch.bfloat16 or qkv_out.device != hidden_states.device:
+                        qkv_out = torch.empty((1, N), device=hidden_states.device, dtype=torch.bfloat16)
+                        setattr(qkv_proj, "_ternary_output_M1", qkv_out)
+
+                    ln_w = getattr(self, "_ternary_input_ln_weight_bf16", None)
+                    w_src = self.input_layernorm.weight.data
+                    if ln_w is None or ln_w.device != hidden_states.device:
+                        ln_w = w_src.to(device=hidden_states.device, dtype=torch.bfloat16).contiguous()
+                        setattr(self, "_ternary_input_ln_weight_bf16", ln_w)
+                    elif ln_w.dtype != torch.bfloat16 or not ln_w.is_contiguous():
+                        ln_w = ln_w.to(dtype=torch.bfloat16).contiguous()
+                        setattr(self, "_ternary_input_ln_weight_bf16", ln_w)
+
+                    if residual is None:
+                        residual_in_ptr = 0
+                        residual_out_ptr = 0
+                        residual_out = hidden_states
+                    else:
+                        buf = getattr(self, "_ternary_input_ln_residual_buf", None)
+                        if buf is None or buf.shape != (1, K) or buf.dtype != torch.bfloat16 or buf.device != hidden_states.device:
+                            buf = torch.empty((1, K), device=hidden_states.device, dtype=torch.bfloat16)
+                            setattr(self, "_ternary_input_ln_residual_buf", buf)
+                        residual_in_ptr = residual.data_ptr()
+                        residual_out_ptr = buf.data_ptr()
+                        residual_out = buf
+
+                    cuda_stream = torch.cuda.current_stream().cuda_stream
+                    ret = ternary_quant.BITNET_LIB.bitlinear_rmsnorm_bf16xint2_v4_megafused(
+                        ctypes.c_void_p(hidden_states.data_ptr()),
+                        ctypes.c_void_p(residual_in_ptr),
+                        ctypes.c_void_p(residual_out_ptr),
+                        ctypes.c_void_p(ln_w.data_ptr()),
+                        ctypes.c_float(self.input_layernorm.variance_epsilon),
+                        ctypes.c_void_p(qkv_proj._ternary_weight_bitnet_ptr),
+                        ctypes.c_void_p(qkv_proj.ternary_alpha.data_ptr()),
+                        ctypes.c_void_p(qkv_out.data_ptr()),
+                        ctypes.c_int(1),
+                        ctypes.c_int(N),
+                        ctypes.c_int(K),
+                        ctypes.c_void_p(cuda_stream),
+                    )
+                    if ret == 0:
+                        if _TERNARY_FUSE_RMSNORM_QKV_DEBUG and not _ternary_rmsnorm_qkv_hit_logged:
+                            logger.info(
+                                "[TERNARY] RMSNorm+QKV fusion HIT (decode,tp=1): qkv_proj weight_shape=%s",
+                                weight_shape,
+                            )
+                            globals()["_ternary_rmsnorm_qkv_hit_logged"] = True
+                        # Run attention using precomputed qkv.
+                        residual = residual_out
+                        did_fused_qkv = True
+                        hidden_states = None  # forward_prepare_from_qkv doesn't need hidden_states
+                        s = self.self_attn.forward_prepare_from_qkv(
+                            positions=positions,
+                            qkv=qkv_out,
+                            forward_batch=forward_batch,
+                        )
+                        hidden_states = self.self_attn.forward_core(s)
+                    else:
+                        if _TERNARY_FUSE_RMSNORM_QKV_DEBUG and not _ternary_rmsnorm_qkv_skip_logged:
+                            logger.warning(
+                                "[TERNARY] RMSNorm+QKV fusion SKIP: kernel returned %s for weight_shape=%s",
+                                ret,
+                                weight_shape,
+                            )
+                            globals()["_ternary_rmsnorm_qkv_skip_logged"] = True
+            except Exception:
+                did_fused_qkv = False
+
+        if not did_fused_qkv:
+            hidden_states, residual = self.layer_communicator.prepare_attn(
+                hidden_states, residual, forward_batch
+            )
+
+        if not did_fused_qkv and hidden_states.shape[0] != 0:
             try:
                 from sglang.srt.layers.quantization.ternary import _macro_profiler
                 _macro_profiler.start(f"attention_all_layers({mode_str})")
@@ -621,6 +790,137 @@ class Qwen3MoeDecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         tbo_subbatch_index: Optional[int] = None,
     ):
+        # Decode-only fusion: skip input RMSNorm kernel and fuse it into ternary QKV.
+        # Only enabled for tp=1 and only when ternary kernels are available.
+        if (
+            _TERNARY_FUSE_RMSNORM_QKV
+            and forward_batch.forward_mode.is_decode()
+            and self.attn_tp_size == 1
+            and hidden_states is not None
+            and hidden_states.shape[0] == 1
+        ):
+            try:
+                from sglang.srt.layers.quantization import ternary as ternary_quant
+
+                qkv_proj = self.self_attn.qkv_proj
+                weight_shape = getattr(qkv_proj, "_ternary_weight_shape", None)
+                if _TERNARY_FUSE_RMSNORM_QKV_DEBUG and not _ternary_rmsnorm_qkv_skip_logged:
+                    if weight_shape is None:
+                        logger.warning(
+                            "[TERNARY] RMSNorm+QKV fusion SKIP: qkv_proj is not ternary-quantized (no _ternary_weight_shape)."
+                        )
+                        globals()["_ternary_rmsnorm_qkv_skip_logged"] = True
+                    elif (weight_shape[0], weight_shape[1]) not in _TERNARY_RMSNORM_QKV_SUPPORTED_NK:
+                        logger.warning(
+                            "[TERNARY] RMSNorm+QKV fusion SKIP: unsupported qkv_proj weight_shape=%s; supported=%s",
+                            weight_shape,
+                            sorted(_TERNARY_RMSNORM_QKV_SUPPORTED_NK),
+                        )
+                        globals()["_ternary_rmsnorm_qkv_skip_logged"] = True
+                    elif not hidden_states.is_cuda:
+                        logger.warning("[TERNARY] RMSNorm+QKV fusion SKIP: hidden_states not on CUDA")
+                        globals()["_ternary_rmsnorm_qkv_skip_logged"] = True
+                    elif hidden_states.dtype != torch.bfloat16:
+                        logger.warning(
+                            "[TERNARY] RMSNorm+QKV fusion SKIP: hidden_states dtype=%s (need bf16).",
+                            hidden_states.dtype,
+                        )
+                        globals()["_ternary_rmsnorm_qkv_skip_logged"] = True
+
+                can_use = (
+                    getattr(ternary_quant, "BITNET_CUDA_V4_RMSNORM_MEGA_FUSED_AVAILABLE", False)
+                    and ternary_quant.BITNET_LIB is not None
+                    and hasattr(ternary_quant.BITNET_LIB, "bitlinear_rmsnorm_bf16xint2_v4_megafused")
+                    and getattr(qkv_proj, "_ternary_bitnet_enabled", False)
+                    and weight_shape is not None
+                    and qkv_proj.bias is None
+                    and hidden_states.is_cuda
+                    and hidden_states.dtype == torch.bfloat16
+                )
+                if can_use:
+                    N, K = weight_shape
+                    if (N, K) not in _TERNARY_RMSNORM_QKV_SUPPORTED_NK:
+                        # Defensive: don't even call into the .so if wrapper doesn't support it.
+                        raise RuntimeError(f"Unsupported fused RMSNorm+QKV shape {(N, K)}")
+                    if K != hidden_states.shape[1]:
+                        raise RuntimeError(f"Unexpected qkv_proj K={K} for hidden_states K={hidden_states.shape[1]}")
+                    # Output buffer (reuse ternary layer prealloc if available)
+                    qkv_out = getattr(qkv_proj, "_ternary_output_M1", None)
+                    if qkv_out is None or qkv_out.shape != (1, N) or qkv_out.dtype != torch.bfloat16 or qkv_out.device != hidden_states.device:
+                        qkv_out = torch.empty((1, N), device=hidden_states.device, dtype=torch.bfloat16)
+                        setattr(qkv_proj, "_ternary_output_M1", qkv_out)
+
+                    # RMSNorm weight: ensure BF16 contiguous without per-step casts.
+                    ln_w = getattr(self, "_ternary_input_ln_weight_bf16", None)
+                    w_src = self.input_layernorm.weight.data
+                    if ln_w is None or ln_w.device != hidden_states.device:
+                        ln_w = w_src.to(device=hidden_states.device, dtype=torch.bfloat16).contiguous()
+                        setattr(self, "_ternary_input_ln_weight_bf16", ln_w)
+                    elif ln_w.dtype != torch.bfloat16 or not ln_w.is_contiguous():
+                        ln_w = ln_w.to(dtype=torch.bfloat16).contiguous()
+                        setattr(self, "_ternary_input_ln_weight_bf16", ln_w)
+
+                    # Residual handling: residual_out must not alias residual_in.
+                    if residual is None:
+                        residual_in_ptr = 0
+                        residual_out_ptr = 0
+                        residual_out = hidden_states
+                    else:
+                        buf = getattr(self, "_ternary_input_ln_residual_buf", None)
+                        if buf is None or buf.shape != (1, K) or buf.dtype != torch.bfloat16 or buf.device != hidden_states.device:
+                            buf = torch.empty((1, K), device=hidden_states.device, dtype=torch.bfloat16)
+                            setattr(self, "_ternary_input_ln_residual_buf", buf)
+                        residual_in_ptr = residual.data_ptr()
+                        residual_out_ptr = buf.data_ptr()
+                        residual_out = buf
+
+                    # Call fused kernel: RMSNorm(+residual) + ternary QKV.
+                    cuda_stream = torch.cuda.current_stream().cuda_stream
+                    ret = ternary_quant.BITNET_LIB.bitlinear_rmsnorm_bf16xint2_v4_megafused(
+                        ctypes.c_void_p(hidden_states.data_ptr()),
+                        ctypes.c_void_p(residual_in_ptr),
+                        ctypes.c_void_p(residual_out_ptr),
+                        ctypes.c_void_p(ln_w.data_ptr()),
+                        ctypes.c_float(self.input_layernorm.variance_epsilon),
+                        ctypes.c_void_p(qkv_proj._ternary_weight_bitnet_ptr),
+                        ctypes.c_void_p(qkv_proj.ternary_alpha.data_ptr()),
+                        ctypes.c_void_p(qkv_out.data_ptr()),
+                        ctypes.c_int(1),
+                        ctypes.c_int(N),
+                        ctypes.c_int(K),
+                        ctypes.c_void_p(cuda_stream),
+                    )
+                    if ret == 0:
+                        if _TERNARY_FUSE_RMSNORM_QKV_DEBUG and not _ternary_rmsnorm_qkv_hit_logged:
+                            logger.info(
+                                "[TERNARY] RMSNorm+QKV fusion HIT (decode,tp=1): qkv_proj weight_shape=%s",
+                                weight_shape,
+                            )
+                            globals()["_ternary_rmsnorm_qkv_hit_logged"] = True
+                        # Provide qkv directly to attention op_prepare.
+                        state.qkv_fused = qkv_out
+                        state.hidden_states_after_comm_pre_attn = None
+                        state.residual_after_input_ln = residual_out
+                        state.update(
+                            dict(
+                                forward_batch=forward_batch,
+                                positions=positions,
+                                tbo_subbatch_index=tbo_subbatch_index,
+                            )
+                        )
+                        return
+                    else:
+                        if _TERNARY_FUSE_RMSNORM_QKV_DEBUG and not _ternary_rmsnorm_qkv_skip_logged:
+                            logger.warning(
+                                "[TERNARY] RMSNorm+QKV fusion SKIP: kernel returned %s for weight_shape=%s",
+                                ret,
+                                weight_shape,
+                            )
+                            globals()["_ternary_rmsnorm_qkv_skip_logged"] = True
+            except Exception:
+                # Fall back to standard path on any error.
+                pass
+
         state.hidden_states_after_comm_pre_attn, state.residual_after_input_ln = (
             self.layer_communicator.prepare_attn(hidden_states, residual, forward_batch)
         )
