@@ -3902,12 +3902,8 @@ class TernaryFusedMoEMethod(FusedMoEMethodBase, nn.Module):
                 # down + combine: [top_k, 768] → [2048]
                 out_buf = layer._ternary_moe_combined_buf
                 
-                # Need temp buffer for float accumulation
-                temp_buf = getattr(layer, '_ternary_moe_temp_fp32_buf', None)
-                if temp_buf is None or temp_buf.shape[0] != N_w2:
-                    # Temp buffer is zeroed inside the CUDA wrapper before accumulation.
-                    temp_buf = torch.empty(N_w2, dtype=torch.float32, device=intermediate_buf.device)
-                    setattr(layer, '_ternary_moe_temp_fp32_buf', temp_buf)
+                # Zero output buffer for atomic accumulation
+                out_buf.zero_()
                 
                 # Ensure weights are contiguous
                 w = topk_weights[0]
@@ -3916,8 +3912,29 @@ class TernaryFusedMoEMethod(FusedMoEMethodBase, nn.Module):
                 
                 _kp_start = _kernel_profiler.start(f"moe_full_down_combine_{N_w2}x{K_w2}")
                 
-                # Choose kernel based on weight dtype to avoid expensive CPU-side cast dispatch
-                if w.dtype == torch.bfloat16 and hasattr(BITNET_LIB, 'ternary_moe_megafused_gemv_indexed_batched_combine_bf16_weights'):
+                if hasattr(BITNET_LIB, 'ternary_moe_megafused_gemv_indexed_batched_combine_bf16_acc'):
+                    ret = BITNET_LIB.ternary_moe_megafused_gemv_indexed_batched_combine_bf16_acc(
+                        ctypes.c_void_p(intermediate_buf.data_ptr()),
+                        ctypes.c_void_p(layer._ternary_w2_packed.data_ptr()),
+                        ctypes.c_void_p(expert_ids.data_ptr()),
+                        ctypes.c_void_p(layer._ternary_moe_alpha_w2.data_ptr()),
+                        ctypes.c_void_p(w.data_ptr()),
+                        ctypes.c_void_p(out_buf.data_ptr()),
+                        ctypes.c_int(top_k),
+                        ctypes.c_int(N_w2),
+                        ctypes.c_int(K_w2),
+                        ctypes.c_int(num_experts),
+                        ctypes.c_void_p(cuda_stream),
+                    )
+                # Fallback to old float-accumulate kernels
+                elif w.dtype == torch.bfloat16 and hasattr(BITNET_LIB, 'ternary_moe_megafused_gemv_indexed_batched_combine_bf16_weights'):
+                    # Need temp buffer for float accumulation
+                    temp_buf = getattr(layer, '_ternary_moe_temp_fp32_buf', None)
+                    if temp_buf is None or temp_buf.shape[0] != N_w2:
+                        # Temp buffer is zeroed inside the CUDA wrapper before accumulation.
+                        temp_buf = torch.empty(N_w2, dtype=torch.float32, device=intermediate_buf.device)
+                        setattr(layer, '_ternary_moe_temp_fp32_buf', temp_buf)
+
                     ret = BITNET_LIB.ternary_moe_megafused_gemv_indexed_batched_combine_bf16_weights(
                         ctypes.c_void_p(intermediate_buf.data_ptr()),
                         ctypes.c_void_p(layer._ternary_w2_packed.data_ptr()),
@@ -3933,6 +3950,12 @@ class TernaryFusedMoEMethod(FusedMoEMethodBase, nn.Module):
                         ctypes.c_void_p(cuda_stream),
                     )
                 else:
+                    # Need temp buffer for float accumulation
+                    temp_buf = getattr(layer, '_ternary_moe_temp_fp32_buf', None)
+                    if temp_buf is None or temp_buf.shape[0] != N_w2:
+                        temp_buf = torch.empty(N_w2, dtype=torch.float32, device=intermediate_buf.device)
+                        setattr(layer, '_ternary_moe_temp_fp32_buf', temp_buf)
+
                     # Fallback to FP32 kernel (cast if needed)
                     if w.dtype != torch.float32:
                         w = w.to(torch.float32)

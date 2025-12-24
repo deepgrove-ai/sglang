@@ -321,6 +321,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print("Top CPU ops (by total CPU time):")
         print(_format_top_rows(rep["top"]["cpu_ops"], limit=args.print_limit), end="")
         print("-" * 100)
+        print("Top CUDA runtime calls (memcpy/launch/sync) (by total CPU time):")
+        print(_format_top_rows(rep["top"]["cuda_runtime"], limit=args.print_limit), end="")
+        print("-" * 100)
         print(f"Micro-kernel swarm (CUDA kernels <= {args.micro_us} us) — ranked by call count:")
         mk_rows = rep["top"]["micro_kernels_by_count"]
         if not mk_rows:

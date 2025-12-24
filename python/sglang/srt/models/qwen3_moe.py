@@ -395,6 +395,47 @@ class Qwen3MoeAttention(nn.Module):
     def _apply_qk_norm(
         self, q: torch.Tensor, k: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Try fused QK Norm kernel (Qwen3 optimization)
+        # Only if BF16, CUDA, head_dim=128 (kernel hardcoded for 128)
+        if (
+            q.is_cuda and q.dtype == torch.bfloat16
+            and k.is_cuda and k.dtype == torch.bfloat16
+            and self.head_dim == 128
+        ):
+            try:
+                from sglang.srt.layers.quantization import ternary as ternary_quant
+                if (
+                    hasattr(ternary_quant, "BITNET_LIB") 
+                    and ternary_quant.BITNET_LIB is not None
+                    and hasattr(ternary_quant.BITNET_LIB, "fused_qk_rmsnorm")
+                ):
+                    cuda_stream = torch.cuda.current_stream().cuda_stream
+                    # View as [Tokens, Heads, HeadDim] to get strides
+                    q_view = q.view(q.shape[0], self.num_heads, self.head_dim)
+                    k_view = k.view(k.shape[0], self.num_kv_heads, self.head_dim)
+                    
+                    ret = ternary_quant.BITNET_LIB.fused_qk_rmsnorm(
+                        ctypes.c_void_p(q.data_ptr()),
+                        ctypes.c_void_p(k.data_ptr()),
+                        ctypes.c_void_p(self.q_norm.weight.data_ptr()),
+                        ctypes.c_void_p(self.k_norm.weight.data_ptr()),
+                        ctypes.c_float(self.q_norm.variance_epsilon),
+                        ctypes.c_float(self.k_norm.variance_epsilon),
+                        ctypes.c_int(q.shape[0]),
+                        ctypes.c_int(self.num_heads),
+                        ctypes.c_int(self.num_kv_heads),
+                        ctypes.c_int(self.head_dim),
+                        ctypes.c_int(q_view.stride(0)),
+                        ctypes.c_int(k_view.stride(0)),
+                        ctypes.c_int(q_view.stride(1)),
+                        ctypes.c_int(k_view.stride(1)),
+                        ctypes.c_void_p(cuda_stream),
+                    )
+                    if ret == 0:
+                        return q, k
+            except Exception:
+                pass
+
         # overlap qk norm
         if self.alt_stream is not None and get_is_capture_mode():
             current_stream = torch.cuda.current_stream()
