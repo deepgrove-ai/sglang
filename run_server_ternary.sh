@@ -84,10 +84,20 @@ export SGLANG_TERNARY_CACHE_WRITE="${SGLANG_TERNARY_CACHE_WRITE:-1}"
 # - 0: quantize MoE BF16 weights too (slower startup)
 export TERNARY_MOE_DECODE_ONLY="${TERNARY_MOE_DECODE_ONLY:-1}"
 
+# Optional: quantize LM head (vocab projection) to ternary for decode speed.
+# Can affect output quality; enable only for experiments.
+export TERNARY_QUANTIZE_LM_HEAD="${TERNARY_QUANTIZE_LM_HEAD:-1}"
+
 # Decode fusion knobs (safe defaults; guarded in code by tp=1 + decode + supported shapes)
 # - 1: fuse input RMSNorm(+residual update) into ternary QKV for decode (removes per-layer RMSNorm kernel)
 # - 0: disable and use standard RMSNorm path
 export TERNARY_FUSE_RMSNORM_QKV="${TERNARY_FUSE_RMSNORM_QKV:-1}"
+export TERNARY_FUSE_RMSNORM_QKV_ALLOW_CAPTURE="${TERNARY_FUSE_RMSNORM_QKV_ALLOW_CAPTURE:-1}"
+
+# Overlap/scheduler knob: use pinned host memory for true async GPU->CPU copies of small tensors.
+# This is critical for avoiding the per-step ~3ms stall seen as aten::to/copy_ + cudaMemcpyAsync.
+export SGLANG_ENABLE_PINNED_OUTPUT_COPY="${SGLANG_ENABLE_PINNED_OUTPUT_COPY:-1}"
+export SGLANG_PINNED_OUTPUT_COPY_MAX_BYTES="${SGLANG_PINNED_OUTPUT_COPY_MAX_BYTES:-1048576}"
 
 # Enable ternary profiling (set to 1 to enable for debugging)
 # When enabled, tracks timing for ternary operations and saves to JSON file
@@ -177,6 +187,12 @@ echo "Tensor Parallelism: $TP_SIZE GPU(s)"
 echo "GPU memory allocation: $REQUEST_GPU_MEMORY"
 echo "Ternary log level: $SGLANG_TERNARY_LOG_LEVEL"
 echo "Fuse RMSNorm+QKV (decode,tp=1): $TERNARY_FUSE_RMSNORM_QKV"
+echo "Fuse RMSNorm+QKV allow during CUDA graph capture: $TERNARY_FUSE_RMSNORM_QKV_ALLOW_CAPTURE"
+echo "MoE decode-only (ternary MoE only on decode): $TERNARY_MOE_DECODE_ONLY"
+echo "Quantize LM head (TERNARY_QUANTIZE_LM_HEAD): $TERNARY_QUANTIZE_LM_HEAD"
+echo "SGLANG_PROFILE_OPLEVEL (1 disables cuda graphs/overlap/compile): $SGLANG_PROFILE_OPLEVEL"
+echo "TORCH_COMPILE_DISABLE: ${TORCH_COMPILE_DISABLE:-0}  TORCHINDUCTOR_DISABLE: ${TORCHINDUCTOR_DISABLE:-0}"
+echo "Pinned output copy: $SGLANG_ENABLE_PINNED_OUTPUT_COPY (max_bytes=$SGLANG_PINNED_OUTPUT_COPY_MAX_BYTES)"
 if [[ "$TERNARY_ENABLE_PROFILING" == "1" ]]; then
     echo "Ternary profiling: ENABLED (output: $TERNARY_PROFILE_OUTPUT)"
 else

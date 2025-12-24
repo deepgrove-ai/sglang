@@ -589,7 +589,19 @@ class LogitsProcessor(nn.Module):
             )
             dp_gather_replicate(hidden_states, local_hidden_states, logits_metadata)
 
-        if hasattr(lm_head, "weight"):
+        # Ternary LM head: if lm_head weights are ternary-quantized, we must use
+        # the quant_method.apply() path (lm_head.weight is packed int2/i2s, not BF16).
+        ternary_lm_head = bool(
+            getattr(lm_head, "_ternary_i2s_enabled", False)
+            or getattr(lm_head, "_ternary_fp16_enabled", False)
+        )
+
+        if ternary_lm_head and hasattr(lm_head, "quant_method"):
+            bias = embedding_bias
+            if bias is None and getattr(lm_head, "bias", None) is not None:
+                bias = lm_head.bias
+            logits = lm_head.quant_method.apply(lm_head, hidden_states, bias)
+        elif hasattr(lm_head, "weight"):
             if self.use_fp32_lm_head:
                 logits = torch.matmul(
                     hidden_states.to(torch.float32), lm_head.weight.to(torch.float32).T

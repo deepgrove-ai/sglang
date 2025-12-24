@@ -140,6 +140,11 @@ class Envs:
 
     # Scheduler: others:
     SGLANG_EMPTY_CACHE_INTERVAL = EnvFloat(-1)  # in seconds. Set if you observe high memory accumulation over a long serving period.
+    # Scheduler/Overlap: use pinned host memory for async D2H copies.
+    # This avoids per-step stalls from pageable GPU->CPU transfers (e.g., next_token_ids).
+    SGLANG_ENABLE_PINNED_OUTPUT_COPY = EnvBool(False)
+    # Only use pinned copy when tensor byte size <= max_bytes (<=0 disables size check).
+    SGLANG_PINNED_OUTPUT_COPY_MAX_BYTES = EnvInt(1 * 1024 * 1024)
     # Test: pd-disaggregation
     SGLANG_TEST_PD_DISAGG_BACKEND = EnvStr("mooncake")
     SGLANG_TEST_PD_DISAGG_DEVICES = EnvStr(None)

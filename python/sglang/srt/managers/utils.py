@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.overlap_utils import FutureIndices
 from sglang.srt.managers.schedule_batch import Req
@@ -49,28 +50,51 @@ class GenerationBatchResult:
         Only the tensors which are needed for processing results are copied,
         e.g., next_token_ids, logits outputs
         """
+        def _to_cpu_nonblocking_maybe_pinned(t: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+            if t is None:
+                return None
+            if not isinstance(t, torch.Tensor) or (not t.is_cuda):
+                return t
+
+            # Default behavior (historical)
+            if not envs.SGLANG_ENABLE_PINNED_OUTPUT_COPY.get():
+                return t.to("cpu", non_blocking=True)
+
+            # Only pin/copy small tensors by default (avoid pinning large logit tensors).
+            max_bytes = envs.SGLANG_PINNED_OUTPUT_COPY_MAX_BYTES.get()
+            if max_bytes is not None and max_bytes > 0:
+                nbytes = t.numel() * t.element_size()
+                if nbytes > max_bytes:
+                    return t.to("cpu", non_blocking=True)
+
+            # Pinned host buffer enables true async D2H copy.
+            cpu = torch.empty(t.shape, dtype=t.dtype, device="cpu", pin_memory=True)
+            cpu.copy_(t, non_blocking=True)
+            return cpu
+
         if return_logprob:
             if self.logits_output.next_token_logits is not None:
-                self.logits_output.next_token_logits = (
-                    self.logits_output.next_token_logits.to("cpu", non_blocking=True)
+                self.logits_output.next_token_logits = _to_cpu_nonblocking_maybe_pinned(
+                    self.logits_output.next_token_logits
                 )
             if self.logits_output.input_token_logprobs is not None:
-                self.logits_output.input_token_logprobs = (
-                    self.logits_output.input_token_logprobs.to("cpu", non_blocking=True)
+                self.logits_output.input_token_logprobs = _to_cpu_nonblocking_maybe_pinned(
+                    self.logits_output.input_token_logprobs
                 )
         if self.logits_output.hidden_states is not None:
-            self.logits_output.hidden_states = self.logits_output.hidden_states.to(
-                "cpu", non_blocking=True
+            self.logits_output.hidden_states = _to_cpu_nonblocking_maybe_pinned(
+                self.logits_output.hidden_states
             )
-        self.next_token_ids = self.next_token_ids.to("cpu", non_blocking=True)
+        self.next_token_ids = _to_cpu_nonblocking_maybe_pinned(self.next_token_ids)
 
         if self.accept_lens is not None:
-            self.accept_lens = self.accept_lens.to("cpu", non_blocking=True)
+            self.accept_lens = _to_cpu_nonblocking_maybe_pinned(self.accept_lens)
 
         if self.allocate_lens is not None:
-            self.allocate_lens = self.allocate_lens.to("cpu", non_blocking=True)
+            self.allocate_lens = _to_cpu_nonblocking_maybe_pinned(self.allocate_lens)
 
-        self.copy_done.record()
+        if self.copy_done is not None:
+            self.copy_done.record()
 
     @classmethod
     def from_pp_proxy(

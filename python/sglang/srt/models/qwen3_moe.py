@@ -85,6 +85,11 @@ _TERNARY_FUSE_RMSNORM_QKV = os.environ.get("TERNARY_FUSE_RMSNORM_QKV", "0") == "
 _TERNARY_FUSE_RMSNORM_QKV_DEBUG = (
     os.environ.get("TERNARY_FUSE_RMSNORM_QKV_DEBUG", "0") == "1"
 )
+# Allow fused RMSNorm+QKV during CUDA graph capture (recommended for performance).
+# Set to 0 to quickly revert to the capture-safe baseline if any capture issues appear.
+_TERNARY_FUSE_RMSNORM_QKV_ALLOW_CAPTURE = (
+    os.environ.get("TERNARY_FUSE_RMSNORM_QKV_ALLOW_CAPTURE", "1") == "1"
+)
 
 # Supported (N, K) pairs for bitlinear_rmsnorm_bf16xint2_v4_megafused in libternary_bitnet.so
 _TERNARY_RMSNORM_QKV_SUPPORTED_NK = {
@@ -632,7 +637,8 @@ class Qwen3MoeDecoderLayer(nn.Module):
                         globals()["_ternary_rmsnorm_qkv_skip_logged"] = True
 
                 can_use = (
-                    getattr(ternary_quant, "BITNET_CUDA_V4_RMSNORM_MEGA_FUSED_AVAILABLE", False)
+                    (not get_is_capture_mode() or _TERNARY_FUSE_RMSNORM_QKV_ALLOW_CAPTURE)
+                    and getattr(ternary_quant, "BITNET_CUDA_V4_RMSNORM_MEGA_FUSED_AVAILABLE", False)
                     and ternary_quant.BITNET_LIB is not None
                     and hasattr(ternary_quant.BITNET_LIB, "bitlinear_rmsnorm_bf16xint2_v4_megafused")
                     and getattr(qkv_proj, "_ternary_bitnet_enabled", False)
@@ -828,7 +834,8 @@ class Qwen3MoeDecoderLayer(nn.Module):
                         globals()["_ternary_rmsnorm_qkv_skip_logged"] = True
 
                 can_use = (
-                    getattr(ternary_quant, "BITNET_CUDA_V4_RMSNORM_MEGA_FUSED_AVAILABLE", False)
+                    (not get_is_capture_mode() or _TERNARY_FUSE_RMSNORM_QKV_ALLOW_CAPTURE)
+                    and getattr(ternary_quant, "BITNET_CUDA_V4_RMSNORM_MEGA_FUSED_AVAILABLE", False)
                     and ternary_quant.BITNET_LIB is not None
                     and hasattr(ternary_quant.BITNET_LIB, "bitlinear_rmsnorm_bf16xint2_v4_megafused")
                     and getattr(qkv_proj, "_ternary_bitnet_enabled", False)

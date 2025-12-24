@@ -49,7 +49,216 @@ SUPPORTED_V4_NK_SHAPES = {
     (768, 2048),   # gate_proj, up_proj: hidden -> intermediate  
     (2048, 768),   # down_proj: intermediate -> hidden
     (1536, 2048),  # fused gate_up (2*768=1536) for MoE
+    # LM head (vocab projection) - enable only if you also enable TERNARY_QUANTIZE_LM_HEAD=1
+    (151936, 2048),  # lm_head: hidden -> vocab_size
 }
+
+
+# Debug knobs (kept off by default; guarded to avoid log spam)
+TERNARY_MOE_MEGA_FUSED_DEBUG = os.environ.get("TERNARY_MOE_MEGA_FUSED_DEBUG", "0") == "1"
+_ternary_moe_megafused_hit_logged = False
+_ternary_moe_megafused_skip_logged = False
+
+# ============================================================================
+# Kernel-Level Profiler (CUDA event timing for individual kernel calls)
+# ============================================================================
+
+class _KernelProfiler:
+    """
+    Kernel-level profiler using CUDA events.
+    
+    Unlike the macroscale profiler, this measures actual GPU kernel time
+    using CUDA events, which works correctly even with CUDA graphs.
+    
+    Enable with TERNARY_KERNEL_PROFILE=1
+    
+    NOTE: Automatically disabled during CUDA graph capture since CUDA events
+    cannot be created during capture mode.
+    """
+    
+    def __init__(self):
+        self.enabled = os.environ.get("TERNARY_KERNEL_PROFILE", "0") == "1"
+        self.stats = defaultdict(lambda: {
+            'count': 0,
+            'total_ms': 0.0,
+            'min_ms': float('inf'),
+            'max_ms': 0.0,
+        })
+        self._start_events = {}
+        self._end_events = {}
+        self._pending = []  # (name, start_event, end_event) tuples waiting to be measured
+        self._measure_interval = 50  # Measure pending events every N kernel calls
+        self._call_count = 0
+        
+        if self.enabled:
+            logger.info("[KERNEL PROFILER] Enabled - tracking individual CUDA kernel times")
+    
+    def _is_capture_mode(self) -> bool:
+        """Check if we're in CUDA graph capture mode (must skip event recording)."""
+        try:
+            from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+            return get_is_capture_mode()
+        except (ImportError, AttributeError):
+            return False
+    
+    def start(self, name: str):
+        """Record start event for a kernel."""
+        if not self.enabled:
+            return None
+        # Skip during CUDA graph capture - events cannot be created during capture
+        if self._is_capture_mode():
+            return None
+        try:
+            start_event = torch.cuda.Event(enable_timing=True)
+            start_event.record()
+            return (name, start_event)
+        except Exception:
+            return None
+    
+    def end(self, start_info):
+        """Record end event and queue for measurement."""
+        if not self.enabled or start_info is None:
+            return
+        # Skip during CUDA graph capture
+        if self._is_capture_mode():
+            return
+        try:
+            name, start_event = start_info
+            end_event = torch.cuda.Event(enable_timing=True)
+            end_event.record()
+            self._pending.append((name, start_event, end_event))
+            
+            self._call_count += 1
+            if self._call_count % self._measure_interval == 0:
+                self._measure_pending()
+        except Exception:
+            pass
+    
+    def _measure_pending(self):
+        """Measure all pending events that have completed."""
+        still_pending = []
+        for name, start_event, end_event in self._pending:
+            try:
+                if end_event.query():  # Check if event has completed
+                    elapsed_ms = start_event.elapsed_time(end_event)
+                    stats = self.stats[name]
+                    stats['count'] += 1
+                    stats['total_ms'] += elapsed_ms
+                    stats['min_ms'] = min(stats['min_ms'], elapsed_ms)
+                    stats['max_ms'] = max(stats['max_ms'], elapsed_ms)
+                else:
+                    still_pending.append((name, start_event, end_event))
+            except Exception:
+                pass
+        self._pending = still_pending
+    
+    def flush(self):
+        """Synchronize and measure all pending events."""
+        if not self.enabled:
+            return
+        try:
+            torch.cuda.synchronize()
+            self._measure_pending()
+        except Exception:
+            pass
+    
+    def get_summary(self) -> Dict:
+        """Get profiling summary."""
+        self.flush()
+        
+        total_time = sum(s['total_ms'] for s in self.stats.values())
+        summary = {
+            'total_kernel_time_ms': total_time,
+            'kernels': {}
+        }
+        
+        for name, stats in sorted(self.stats.items(), key=lambda x: -x[1]['total_ms']):
+            if stats['count'] > 0:
+                summary['kernels'][name] = {
+                    'count': stats['count'],
+                    'total_ms': stats['total_ms'],
+                    'avg_ms': stats['total_ms'] / stats['count'],
+                    'min_ms': stats['min_ms'] if stats['min_ms'] != float('inf') else 0,
+                    'max_ms': stats['max_ms'],
+                    'pct': (stats['total_ms'] / total_time * 100) if total_time > 0 else 0,
+                }
+        
+        return summary
+    
+    def print_summary(self):
+        """Print detailed kernel-level summary."""
+        if not self.enabled or not self.stats:
+            return
+        
+        summary = self.get_summary()
+        total_time = summary['total_kernel_time_ms']
+        
+        print("\n" + "="*100, file=sys.stderr)
+        print("KERNEL-LEVEL PROFILE (CUDA Event Timing)", file=sys.stderr)
+        print("="*100, file=sys.stderr)
+        print(f"\nTotal GPU kernel time: {total_time:.2f} ms", file=sys.stderr)
+        print(f"Total kernel calls: {sum(k['count'] for k in summary['kernels'].values())}", file=sys.stderr)
+        print("", file=sys.stderr)
+        
+        # Header
+        print(f"{'Kernel':<55} {'Count':>8} {'Total(ms)':>10} {'Avg(µs)':>10} {'%':>6}", file=sys.stderr)
+        print("-"*95, file=sys.stderr)
+        
+        # Group kernels by category
+        categories = {
+            'ternary_linear': [],
+            'ternary_moe': [],
+            'quantization': [],
+            'rmsnorm_fused': [],
+            'other': [],
+        }
+        
+        for name, stats in summary['kernels'].items():
+            nl = name.lower()
+            if 'moe' in nl:
+                categories['ternary_moe'].append((name, stats))
+            elif 'rmsnorm' in nl:
+                categories['rmsnorm_fused'].append((name, stats))
+            elif 'quantize' in nl or 'quant' in nl:
+                categories['quantization'].append((name, stats))
+            elif 'ladder' in nl or 'megafused' in nl or 'bitlinear' in nl:
+                categories['ternary_linear'].append((name, stats))
+            else:
+                categories['other'].append((name, stats))
+        
+        # Print by category
+        category_names = {
+            'ternary_linear': 'TERNARY LINEAR (QKV, O, gate_up, down)',
+            'ternary_moe': 'TERNARY MoE (expert GEMV)',
+            'rmsnorm_fused': 'FUSED RMSNorm + Linear',
+            'quantization': 'ACTIVATION QUANTIZATION',
+            'other': 'OTHER KERNELS',
+        }
+        
+        for cat_key, cat_name in category_names.items():
+            kernels = categories[cat_key]
+            if kernels:
+                cat_total = sum(k[1]['total_ms'] for k in kernels)
+                cat_pct = (cat_total / total_time * 100) if total_time > 0 else 0
+                print(f"\n[{cat_name}] ({cat_total:.2f} ms, {cat_pct:.1f}%)", file=sys.stderr)
+                
+                for name, stats in sorted(kernels, key=lambda x: -x[1]['total_ms']):
+                    avg_us = stats['avg_ms'] * 1000  # Convert to microseconds
+                    short_name = name[:53] + ".." if len(name) > 55 else name
+                    print(f"  {short_name:<53} {stats['count']:>8} {stats['total_ms']:>10.2f} "
+                          f"{avg_us:>10.1f} {stats['pct']:>5.1f}%", file=sys.stderr)
+        
+        print("\n" + "="*100, file=sys.stderr)
+
+
+# Global kernel profiler instance
+_kernel_profiler = _KernelProfiler()
+
+# Register cleanup hook
+if _kernel_profiler.enabled:
+    import atexit
+    atexit.register(_kernel_profiler.print_summary)
+
 
 # ============================================================================
 # Macroscale Profiler (function-level timing for decode batch breakdown)
@@ -619,12 +828,24 @@ class _DetailedProfiler:
         self.torch_profile_enabled = os.environ.get("TERNARY_TORCH_PROFILE", "0") == "1"
         self._torch_profiler = None
         self._torch_trace_dir = "/tmp/ternary_torch_profile"
+        # Which DECODE batches to profile with torch.profiler (graphs-on)
+        # Defaults to a long window to avoid graph-capture transients, but can be overridden
+        # for short experiments.
+        self._torch_profile_decode_start = int(
+            os.environ.get("TERNARY_TORCH_PROFILE_START_DECODE", "200")
+        )
+        self._torch_profile_decode_end = int(
+            os.environ.get("TERNARY_TORCH_PROFILE_END_DECODE", "500")
+        )
         
         # Print status if torch profiler is enabled (even without detailed profiler)
         if self.torch_profile_enabled and not self.enabled:
             print(f"\n{'='*70}", file=sys.stderr)
             print(f"[TORCH PROFILER] ENABLED - Will show GPU kernel breakdown", file=sys.stderr)
-            print(f"[TORCH PROFILER] Profiles DECODE batches 200-500", file=sys.stderr)
+            print(
+                f"[TORCH PROFILER] Profiles DECODE batches {self._torch_profile_decode_start}-{self._torch_profile_decode_end}",
+                file=sys.stderr,
+            )
             print(f"[TORCH PROFILER] Run benchmark to generate enough decode batches", file=sys.stderr)
             print(f"{'='*70}\n", file=sys.stderr)
             sys.stderr.flush()
@@ -821,17 +1042,27 @@ class _DetailedProfiler:
             
             # Only start profiler during DECODE phase after warmup
             if self.torch_profile_enabled and self._torch_profiler is None:
-                if self._decode_batch_count == 200:
-                    print(f"[PROFILER] Starting torch.profiler (decode batch {self._decode_batch_count})...", file=sys.stderr)
+                if self._decode_batch_count == self._torch_profile_decode_start:
+                    print(
+                        f"[PROFILER] Starting torch.profiler (decode batch {self._decode_batch_count})...",
+                        file=sys.stderr,
+                    )
                     sys.stderr.flush()
                     self.start_torch_profile()
     
     def on_batch_end(self, phase: str):
         """Called at end of each batch."""
         if phase == "decode" and hasattr(self, '_decode_batch_count'):
-            # Stop after 300 decode batches (profile 200-500)
-            if self.torch_profile_enabled and self._decode_batch_count == 500 and self._torch_profiler is not None:
-                print(f"[PROFILER] Stopping torch.profiler (decode batch {self._decode_batch_count})...", file=sys.stderr)
+            # Stop after the configured end batch
+            if (
+                self.torch_profile_enabled
+                and self._decode_batch_count == self._torch_profile_decode_end
+                and self._torch_profiler is not None
+            ):
+                print(
+                    f"[PROFILER] Stopping torch.profiler (decode batch {self._decode_batch_count})...",
+                    file=sys.stderr,
+                )
                 sys.stderr.flush()
                 self.stop_torch_profile()
     
@@ -1333,6 +1564,59 @@ try:
                 BITNET_LIB.ternary_moe_megafused_gemv_indexed_batched.restype = ctypes.c_int
                 logger.info("[TERNARY] MoE megafused GEMV (batched input) loaded - fuses quant+GEMV")
 
+            # NEW: Fully fused kernels (eliminate Triton silu_gate and combine_topk)
+            if hasattr(BITNET_LIB, 'ternary_moe_megafused_gemv_indexed_shared_silu'):
+                BITNET_LIB.ternary_moe_megafused_gemv_indexed_shared_silu.argtypes = [
+                    ctypes.c_void_p,  # x_bf16 [K] BF16 shared input
+                    ctypes.c_void_p,  # all_weights_packed [num_experts, N, K/4]
+                    ctypes.c_void_p,  # topk_ids [top_k] int32
+                    ctypes.c_void_p,  # all_alpha [num_experts, K] FP32
+                    ctypes.c_void_p,  # output [top_k, N/2] BF16 (after SiLU)
+                    ctypes.c_int,     # top_k
+                    ctypes.c_int,     # N (full, = 2*intermediate)
+                    ctypes.c_int,     # K
+                    ctypes.c_int,     # num_experts
+                    ctypes.c_void_p,  # stream
+                ]
+                BITNET_LIB.ternary_moe_megafused_gemv_indexed_shared_silu.restype = ctypes.c_int
+                logger.info("[TERNARY] MoE FULL FUSION (gate_up+silu) loaded - eliminates silu_gate Triton kernel")
+
+            if hasattr(BITNET_LIB, 'ternary_moe_megafused_gemv_indexed_batched_combine'):
+                BITNET_LIB.ternary_moe_megafused_gemv_indexed_batched_combine.argtypes = [
+                    ctypes.c_void_p,  # x_bf16 [top_k, K] BF16 per-expert input
+                    ctypes.c_void_p,  # all_weights_packed [num_experts, N, K/4]
+                    ctypes.c_void_p,  # topk_ids [top_k] int32
+                    ctypes.c_void_p,  # all_alpha [num_experts, K] FP32
+                    ctypes.c_void_p,  # expert_weights [top_k] FP32
+                    ctypes.c_void_p,  # temp_output [N] FP32 (accumulation buffer)
+                    ctypes.c_void_p,  # output [N] BF16
+                    ctypes.c_int,     # top_k
+                    ctypes.c_int,     # N
+                    ctypes.c_int,     # K
+                    ctypes.c_int,     # num_experts
+                    ctypes.c_void_p,  # stream
+                ]
+                BITNET_LIB.ternary_moe_megafused_gemv_indexed_batched_combine.restype = ctypes.c_int
+                logger.info("[TERNARY] MoE FULL FUSION (down+combine) loaded - eliminates combine_topk Triton kernel")
+
+            if hasattr(BITNET_LIB, 'ternary_moe_megafused_gemv_indexed_batched_combine_bf16_weights'):
+                BITNET_LIB.ternary_moe_megafused_gemv_indexed_batched_combine_bf16_weights.argtypes = [
+                    ctypes.c_void_p,  # x_bf16 [top_k, K] BF16 per-expert input
+                    ctypes.c_void_p,  # all_weights_packed [num_experts, N, K/4]
+                    ctypes.c_void_p,  # topk_ids [top_k] int32
+                    ctypes.c_void_p,  # all_alpha [num_experts, K] FP32
+                    ctypes.c_void_p,  # expert_weights [top_k] BF16
+                    ctypes.c_void_p,  # temp_output [N] FP32 (accumulation buffer)
+                    ctypes.c_void_p,  # output [N] BF16
+                    ctypes.c_int,     # top_k
+                    ctypes.c_int,     # N
+                    ctypes.c_int,     # K
+                    ctypes.c_int,     # num_experts
+                    ctypes.c_void_p,  # stream
+                ]
+                BITNET_LIB.ternary_moe_megafused_gemv_indexed_batched_combine_bf16_weights.restype = ctypes.c_int
+                logger.info("[TERNARY] MoE FULL FUSION (down+combine, BF16 weights) loaded")
+
             if hasattr(BITNET_LIB, 'ternary_quantize_activation_fast'):
                 BITNET_LIB.ternary_quantize_activation_fast.argtypes = [
                     ctypes.c_void_p,  # activations (bf16)
@@ -1581,13 +1865,15 @@ if TRITON_AVAILABLE:
         """
         Fused SiLU + gating: intermediate = silu(gate) * up
         
-        1.32x faster than PyTorch's separate operations.
+        OPTIMIZED: 2D grid (expert_idx, block_idx) for better GPU utilization.
         """
         expert_idx = tl.program_id(0)
+        block_idx = tl.program_id(1)
+        
         if expert_idx >= top_k:
             return
         
-        offs = tl.arange(0, BLOCK_SIZE)
+        offs = block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
         mask = offs < intermediate_size
         
         # Load gate (first half) and up (second half)
@@ -1661,8 +1947,8 @@ if TRITON_AVAILABLE:
     ):
         """
         Fused MoE combine for decode: out[h] = sum_i down[i,h] * w[i]
-        - Single kernel launch (replaces mul + reduce_sum)
-        - Accumulates in FP32 for stability, stores BF16.
+        
+        OPTIMIZED: Uses larger blocks for better memory coalescing.
         """
         pid = tl.program_id(0)
         offs = pid * BLOCK_H + tl.arange(0, BLOCK_H)
@@ -2067,7 +2353,7 @@ def fused_moe_silu_gate(
 ) -> torch.Tensor:
     """Fused SiLU + gating: intermediate = silu(gate) * up
     
-    1.32x faster than PyTorch's separate operations.
+    OPTIMIZED: Uses 2D grid for better GPU utilization (8x more blocks).
     """
     if not TRITON_AVAILABLE:
         # Fallback to PyTorch
@@ -2077,13 +2363,17 @@ def fused_moe_silu_gate(
         return intermediate
     
     top_k = gate_up.shape[0]
-    BLOCK_SIZE = triton.next_power_of_2(intermediate_size)
+    # Use smaller blocks to get more parallelism
+    BLOCK_SIZE = 128  # 768/128 = 6 blocks per expert
+    num_blocks = triton.cdiv(intermediate_size, BLOCK_SIZE)
     
-    grid = (top_k,)
+    # 2D grid: (top_k experts, num_blocks per expert)
+    grid = (top_k, num_blocks)
     _fused_moe_silu_gate_kernel[grid](
         gate_up, intermediate,
         intermediate_size, top_k,
         BLOCK_SIZE=BLOCK_SIZE,
+        num_warps=4,
     )
     return intermediate
 
@@ -2094,7 +2384,10 @@ def fused_moe_combine_topk(
     topk_weights_1d: torch.Tensor,  # [top_k] FP32
     out: torch.Tensor,           # [H] BF16 (pre-allocated)
 ) -> torch.Tensor:
-    """Fused top-k weighted sum for MoE decode (single kernel)."""
+    """Fused top-k weighted sum for MoE decode (single kernel).
+    
+    OPTIMIZED: Uses smaller blocks for more parallelism (32 blocks vs 8).
+    """
     top_k = down.shape[0]
     H = down.shape[1]
 
@@ -2113,7 +2406,8 @@ def fused_moe_combine_topk(
         if not w.is_contiguous():
             w = w.contiguous()
 
-        BLOCK_H = 256
+        # Use smaller blocks for more parallelism: H=2048, BLOCK_H=64 → 32 blocks
+        BLOCK_H = 64
         grid = (triton.cdiv(H, BLOCK_H),)
         _fused_moe_combine_topk_kernel[grid](
             down,
@@ -2125,7 +2419,7 @@ def fused_moe_combine_topk(
             top_k,
             BLOCK_H=BLOCK_H,
             MAX_TOPK=8,
-            num_warps=4,
+            num_warps=2,  # Fewer warps for smaller blocks
         )
         return out
 
@@ -2562,7 +2856,12 @@ class TernaryConfig(QuantizationConfig):
         pref = prefix or ""
         lower_pref = pref.lower()
 
-        if ("embed" in lower_pref) or ("lm_head" in lower_pref):
+        # Always skip embedding layers (must stay FP for token lookup)
+        if "embed" in lower_pref:
+            return None
+
+        # lm_head: optionally quantize for speed (can affect quality)
+        if "lm_head" in lower_pref and os.environ.get("TERNARY_QUANTIZE_LM_HEAD", "0") != "1":
             return None
 
         # Skip MoE gates/routers, but allow MLP gate_proj (SwiGLU)
@@ -2571,7 +2870,7 @@ class TernaryConfig(QuantizationConfig):
             ("router" in lower_pref)):
             return None
 
-        if isinstance(layer, LinearBase):
+        if isinstance(layer, LinearBase) or layer.__class__.__name__ == "ParallelLMHead":
             return TernaryLinearMethod(self)
         
         # Handle FusedMoE layers with ternary quantization
@@ -2615,6 +2914,7 @@ class TernaryLinearMethod(LinearMethodBase):
         **kwargs,
     ):
         output_size_per_partition = sum(output_partition_sizes)
+        weight_loader = kwargs.get("weight_loader", self.weight_loader)
         
         weight = Parameter(
             torch.empty(
@@ -2629,7 +2929,7 @@ class TernaryLinearMethod(LinearMethodBase):
         set_weight_attrs(weight, {
             "input_dim": 1,
             "output_dim": 0,
-            "weight_loader": self.weight_loader,
+            "weight_loader": weight_loader,
         })
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
@@ -2860,6 +3160,11 @@ class TernaryLinearMethod(LinearMethodBase):
         # Check conditions individually for profiling
         is_shape_supported = (N, K) in SUPPORTED_V4_NK_SHAPES
         is_batch_supported = M <= DEFAULT_PREFILL_SKIP_M
+
+        # lm_head is only implemented for the v4 *megafused* M=1 path right now.
+        # Avoid paying activation quantization cost for M>1 just to fall back.
+        if (N, K) == (151936, 2048) and M != 1:
+            is_shape_supported = False
         
         use_v4_kernel = (
             bitnet_enabled
@@ -2906,25 +3211,25 @@ class TernaryLinearMethod(LinearMethodBase):
                 buf_attr_scale = f"_ternary_act_scale_M{M}"
                 buf_attr_output = f"_ternary_output_M{M}"
             
-            if hasattr(layer, buf_attr_int8):
-                out_int8 = getattr(layer, buf_attr_int8)
-                out_scale = getattr(layer, buf_attr_scale)
-                output = getattr(layer, buf_attr_output)
-                if out_int8.shape[0] < M:
-                    out_int8 = torch.empty(M, K, device=x_compute.device, dtype=torch.int8)
-                    out_scale = torch.empty(M, device=x_compute.device, dtype=torch.bfloat16)
-                    output = torch.empty(M, N, device=x_compute.device, dtype=torch.bfloat16)
-            else:
-                dev_key = _device_cache_key(x_compute.device)
-                out_int8 = _get_cached_tensor(
-                        layer, "_ternary_act_int8_cache", (M, K, dev_key), (M, K), torch.int8, x_compute.device
-                )
-                out_scale = _get_cached_tensor(
-                        layer, "_ternary_act_scale_cache", (M, dev_key), (M,), torch.bfloat16, x_compute.device
-                )
-                output = _get_cached_tensor(
-                        layer, "_ternary_v4_output_cache", (M, N, dev_key), (M, N), torch.bfloat16, x_compute.device
-                )
+                if hasattr(layer, buf_attr_int8):
+                    out_int8 = getattr(layer, buf_attr_int8)
+                    out_scale = getattr(layer, buf_attr_scale)
+                    output = getattr(layer, buf_attr_output)
+                    if out_int8.shape[0] < M:
+                        out_int8 = torch.empty(M, K, device=x_compute.device, dtype=torch.int8)
+                        out_scale = torch.empty(M, device=x_compute.device, dtype=torch.bfloat16)
+                        output = torch.empty(M, N, device=x_compute.device, dtype=torch.bfloat16)
+                else:
+                    dev_key = _device_cache_key(x_compute.device)
+                    out_int8 = _get_cached_tensor(
+                            layer, "_ternary_act_int8_cache", (M, K, dev_key), (M, K), torch.int8, x_compute.device
+                    )
+                    out_scale = _get_cached_tensor(
+                            layer, "_ternary_act_scale_cache", (M, dev_key), (M,), torch.bfloat16, x_compute.device
+                    )
+                    output = _get_cached_tensor(
+                            layer, "_ternary_v4_output_cache", (M, N, dev_key), (M, N), torch.bfloat16, x_compute.device
+                    )
 
             # Megafused: skip explicit activation quantization and call the 1-kernel path.
             if use_v4_megafused:
@@ -2939,6 +3244,7 @@ class TernaryLinearMethod(LinearMethodBase):
                 if not alpha_fp32.is_contiguous():
                     alpha_fp32 = alpha_fp32.contiguous()
 
+                _kp_start = _kernel_profiler.start(f"bf16xint2_megafused_{N}x{K}")
                 ret_code = BITNET_LIB.bitlinear_bf16xint2_v4_megafused(
                     ctypes.c_void_p(x_in.data_ptr()),
                     ctypes.c_void_p(layer._ternary_weight_bitnet_ptr),
@@ -2949,6 +3255,7 @@ class TernaryLinearMethod(LinearMethodBase):
                     ctypes.c_int(K),
                     ctypes.c_void_p(cuda_stream),
                 )
+                _kernel_profiler.end(_kp_start)
 
                 if ret_code == 0:
                     if prof_enabled:
@@ -3014,6 +3321,7 @@ class TernaryLinearMethod(LinearMethodBase):
                 kernel_start = time.time()
             
             # DETAILED PROFILING: kernel launch and execution
+            _kp_start = _kernel_profiler.start(f"int8xint2_v4_simple_{N}x{K}")
             if detailed_prof:
                 with _detailed_profiler.operation_timer("v4_kernel", "kernel_exec", M=M, N=N, K=K):
                     ret_code = BITNET_LIB.bitlinear_int8xint2_v4_simple(
@@ -3041,6 +3349,7 @@ class TernaryLinearMethod(LinearMethodBase):
                     ctypes.c_int(K),
                     ctypes.c_void_p(cuda_stream),
             )
+            _kernel_profiler.end(_kp_start)
             
             if ret_code == 0:
                 if prof_enabled:
@@ -3353,10 +3662,6 @@ class TernaryFusedMoEMethod(FusedMoEMethodBase, nn.Module):
             layer.register_buffer('_ternary_w13_packed', w13_packed.contiguous(), persistent=False)
             layer.register_buffer('_ternary_w2_packed', w2_packed.contiguous(), persistent=False)
             
-            # Cache raw pointers for fast kernel calls (like V4 dense path)
-            layer._ternary_w13_packed_ptr = layer._ternary_w13_packed.data_ptr()
-            layer._ternary_w2_packed_ptr = layer._ternary_w2_packed.data_ptr()
-            
             # Store per-expert alpha (float32) for activation quantization
             layer.register_buffer(
                 '_ternary_moe_alpha_w13',
@@ -3534,12 +3839,136 @@ class TernaryFusedMoEMethod(FusedMoEMethodBase, nn.Module):
                 and hasattr(BITNET_LIB, 'ternary_moe_megafused_gemv_indexed_batched')
                 and hidden_states.dtype == torch.bfloat16
             )
+
+            global _ternary_moe_megafused_hit_logged, _ternary_moe_megafused_skip_logged
+            if TERNARY_MOE_MEGA_FUSED_DEBUG:
+                if use_megafused and not _ternary_moe_megafused_hit_logged:
+                    logger.info(
+                        "[TERNARY MOE] Megafused quant+GEMV HIT (decode): "
+                        "w13=(%d,%d) w2=(%d,%d) top_k=%d dtype=%s",
+                        N_w13,
+                        K_w13,
+                        N_w2,
+                        K_w2,
+                        int(top_k),
+                        str(hidden_states.dtype),
+                    )
+                    _ternary_moe_megafused_hit_logged = True
+                elif (not use_megafused) and (not _ternary_moe_megafused_skip_logged):
+                    logger.warning(
+                        "[TERNARY MOE] Megafused quant+GEMV SKIP (decode): "
+                        "has_shared=%s has_batched=%s dtype=%s (need bf16)",
+                        hasattr(BITNET_LIB, "ternary_moe_megafused_gemv_indexed_shared"),
+                        hasattr(BITNET_LIB, "ternary_moe_megafused_gemv_indexed_batched"),
+                        str(hidden_states.dtype),
+                    )
+                    _ternary_moe_megafused_skip_logged = True
             
-            if use_megafused:
+            # Check if fully-fused kernels are available (eliminate silu_gate and combine Triton kernels)
+            use_full_fusion = (
+                use_megafused
+                and hasattr(BITNET_LIB, 'ternary_moe_megafused_gemv_indexed_shared_silu')
+                and hasattr(BITNET_LIB, 'ternary_moe_megafused_gemv_indexed_batched_combine')
+                and N_w13 == 1536 and K_w13 == 2048  # gate_up shape
+                and N_w2 == 2048 and K_w2 == 768     # down shape
+            )
+            
+            if use_full_fusion:
+                # FULLY FUSED path: gate_up+silu in one kernel, down+combine in one kernel
+                # This eliminates the slow Triton silu_gate and combine_topk kernels
+                
+                intermediate_buf = layer._ternary_moe_intermediate_buf[:top_k]
+                
+                # gate_up + silu: x → [top_k, 768]
+                _kp_start = _kernel_profiler.start(f"moe_full_gate_up_silu_{N_w13}x{K_w13}")
+                ret = BITNET_LIB.ternary_moe_megafused_gemv_indexed_shared_silu(
+                    ctypes.c_void_p(x_row.data_ptr()),
+                    ctypes.c_void_p(layer._ternary_w13_packed.data_ptr()),
+                    ctypes.c_void_p(expert_ids.data_ptr()),
+                    ctypes.c_void_p(layer._ternary_moe_alpha_w13.data_ptr()),
+                    ctypes.c_void_p(intermediate_buf.data_ptr()),
+                    ctypes.c_int(top_k),
+                    ctypes.c_int(N_w13),
+                    ctypes.c_int(K_w13),
+                    ctypes.c_int(num_experts),
+                    ctypes.c_void_p(cuda_stream),
+                )
+                _kernel_profiler.end(_kp_start)
+                
+                if ret != 0:
+                    output = fused_moe(hidden_states, layer.w13_weight, layer.w2_weight, topk_output, moe_runner_config)
+                    return StandardCombineInput(hidden_states=output)
+                
+                # down + combine: [top_k, 768] → [2048]
+                out_buf = layer._ternary_moe_combined_buf
+                
+                # Need temp buffer for float accumulation
+                temp_buf = getattr(layer, '_ternary_moe_temp_fp32_buf', None)
+                if temp_buf is None or temp_buf.shape[0] != N_w2:
+                    # Temp buffer is zeroed inside the CUDA wrapper before accumulation.
+                    temp_buf = torch.empty(N_w2, dtype=torch.float32, device=intermediate_buf.device)
+                    setattr(layer, '_ternary_moe_temp_fp32_buf', temp_buf)
+                
+                # Ensure weights are contiguous
+                w = topk_weights[0]
+                if not w.is_contiguous():
+                    w = w.contiguous()
+                
+                _kp_start = _kernel_profiler.start(f"moe_full_down_combine_{N_w2}x{K_w2}")
+                
+                # Choose kernel based on weight dtype to avoid expensive CPU-side cast dispatch
+                if w.dtype == torch.bfloat16 and hasattr(BITNET_LIB, 'ternary_moe_megafused_gemv_indexed_batched_combine_bf16_weights'):
+                    ret = BITNET_LIB.ternary_moe_megafused_gemv_indexed_batched_combine_bf16_weights(
+                        ctypes.c_void_p(intermediate_buf.data_ptr()),
+                        ctypes.c_void_p(layer._ternary_w2_packed.data_ptr()),
+                        ctypes.c_void_p(expert_ids.data_ptr()),
+                        ctypes.c_void_p(layer._ternary_moe_alpha_w2.data_ptr()),
+                        ctypes.c_void_p(w.data_ptr()),
+                        ctypes.c_void_p(temp_buf.data_ptr()),
+                        ctypes.c_void_p(out_buf.data_ptr()),
+                        ctypes.c_int(top_k),
+                        ctypes.c_int(N_w2),
+                        ctypes.c_int(K_w2),
+                        ctypes.c_int(num_experts),
+                        ctypes.c_void_p(cuda_stream),
+                    )
+                else:
+                    # Fallback to FP32 kernel (cast if needed)
+                    if w.dtype != torch.float32:
+                        w = w.to(torch.float32)
+                        
+                    ret = BITNET_LIB.ternary_moe_megafused_gemv_indexed_batched_combine(
+                        ctypes.c_void_p(intermediate_buf.data_ptr()),
+                        ctypes.c_void_p(layer._ternary_w2_packed.data_ptr()),
+                        ctypes.c_void_p(expert_ids.data_ptr()),
+                        ctypes.c_void_p(layer._ternary_moe_alpha_w2.data_ptr()),
+                        ctypes.c_void_p(w.data_ptr()),
+                        ctypes.c_void_p(temp_buf.data_ptr()),
+                        ctypes.c_void_p(out_buf.data_ptr()),
+                        ctypes.c_int(top_k),
+                        ctypes.c_int(N_w2),
+                        ctypes.c_int(K_w2),
+                        ctypes.c_int(num_experts),
+                        ctypes.c_void_p(cuda_stream),
+                    )
+                _kernel_profiler.end(_kp_start)
+                _kernel_profiler.end(_kp_start)
+                
+                if ret != 0:
+                    output = fused_moe(hidden_states, layer.w13_weight, layer.w2_weight, topk_output, moe_runner_config)
+                    return StandardCombineInput(hidden_states=output)
+                
+                output = out_buf.view(1, -1)
+                if output.dtype != dtype:
+                    output = output.to(dtype)
+                return StandardCombineInput(hidden_states=output)
+            
+            elif use_megafused:
                 # MEGAFUSED path: quant+GEMV in one kernel (eliminates Triton quant kernels)
+                _kp_start = _kernel_profiler.start(f"moe_megafused_gate_up_{N_w13}x{K_w13}")
                 ret = BITNET_LIB.ternary_moe_megafused_gemv_indexed_shared(
                     ctypes.c_void_p(x_row.data_ptr()),
-                    ctypes.c_void_p(layer._ternary_w13_packed_ptr),
+                    ctypes.c_void_p(layer._ternary_w13_packed.data_ptr()),
                     ctypes.c_void_p(expert_ids.data_ptr()),
                     ctypes.c_void_p(layer._ternary_moe_alpha_w13.data_ptr()),
                     ctypes.c_void_p(gate_up_out.data_ptr()),
@@ -3549,8 +3978,10 @@ class TernaryFusedMoEMethod(FusedMoEMethodBase, nn.Module):
                     ctypes.c_int(num_experts),
                     ctypes.c_void_p(cuda_stream),
                 )
+                _kernel_profiler.end(_kp_start)
             else:
                 # Fallback: Triton quant + CUDA GEMV
+                _kp_start = _kernel_profiler.start(f"moe_triton_quant_input_{K_w13}")
                 fused_moe_quantize_input(
                     x_row,
                     layer._ternary_moe_alpha_w13,
@@ -3558,9 +3989,11 @@ class TernaryFusedMoEMethod(FusedMoEMethodBase, nn.Module):
                     x_int8_buf,
                     x_scale_buf,
                 )
+                _kernel_profiler.end(_kp_start)
+                _kp_start = _kernel_profiler.start(f"moe_gemv_gate_up_{N_w13}x{K_w13}")
                 ret = BITNET_LIB.ternary_moe_gemv_indexed_batched(
                     ctypes.c_void_p(x_int8_buf.data_ptr()),
-                    ctypes.c_void_p(layer._ternary_w13_packed_ptr),
+                    ctypes.c_void_p(layer._ternary_w13_packed.data_ptr()),
                     ctypes.c_void_p(expert_ids.data_ptr()),
                     ctypes.c_void_p(x_scale_buf.data_ptr()),
                     ctypes.c_void_p(gate_up_out.data_ptr()),
@@ -3570,6 +4003,7 @@ class TernaryFusedMoEMethod(FusedMoEMethodBase, nn.Module):
                     ctypes.c_int(num_experts),
                     ctypes.c_void_p(cuda_stream),
                 )
+                _kernel_profiler.end(_kp_start)
             
             if ret != 0:
                 # Fallback to fused_moe (config already fetched above)
@@ -3578,13 +4012,16 @@ class TernaryFusedMoEMethod(FusedMoEMethodBase, nn.Module):
             
             # OPTIMIZED: Fused SiLU + gating (1.32x faster than PyTorch)
             intermediate_buf = layer._ternary_moe_intermediate_buf[:top_k]
+            _kp_start = _kernel_profiler.start("moe_silu_gate")
             fused_moe_silu_gate(gate_up_out, intermediate_buf, intermediate_size)
+            _kernel_profiler.end(_kp_start)
             
             if use_megafused:
                 # MEGAFUSED path: quant+GEMV in one kernel
+                _kp_start = _kernel_profiler.start(f"moe_megafused_down_{N_w2}x{K_w2}")
                 ret = BITNET_LIB.ternary_moe_megafused_gemv_indexed_batched(
                     ctypes.c_void_p(intermediate_buf.data_ptr()),
-                    ctypes.c_void_p(layer._ternary_w2_packed_ptr),
+                    ctypes.c_void_p(layer._ternary_w2_packed.data_ptr()),
                     ctypes.c_void_p(expert_ids.data_ptr()),
                     ctypes.c_void_p(layer._ternary_moe_alpha_w2.data_ptr()),
                     ctypes.c_void_p(down_out.data_ptr()),
@@ -3594,8 +4031,10 @@ class TernaryFusedMoEMethod(FusedMoEMethodBase, nn.Module):
                     ctypes.c_int(num_experts),
                     ctypes.c_void_p(cuda_stream),
                 )
+                _kernel_profiler.end(_kp_start)
             else:
                 # Fallback: Triton quant + CUDA GEMV
+                _kp_start = _kernel_profiler.start(f"moe_triton_quant_inter_{K_w2}")
                 fused_moe_quantize_intermediate(
                     intermediate_buf,
                     layer._ternary_moe_alpha_w2,
@@ -3603,9 +4042,11 @@ class TernaryFusedMoEMethod(FusedMoEMethodBase, nn.Module):
                     inter_int8_buf,
                     inter_scale_buf,
                 )
+                _kernel_profiler.end(_kp_start)
+                _kp_start = _kernel_profiler.start(f"moe_gemv_down_{N_w2}x{K_w2}")
                 ret = BITNET_LIB.ternary_moe_gemv_indexed_batched(
                     ctypes.c_void_p(inter_int8_buf.data_ptr()),
-                    ctypes.c_void_p(layer._ternary_w2_packed_ptr),
+                    ctypes.c_void_p(layer._ternary_w2_packed.data_ptr()),
                     ctypes.c_void_p(expert_ids.data_ptr()),
                     ctypes.c_void_p(inter_scale_buf.data_ptr()),
                     ctypes.c_void_p(down_out.data_ptr()),
@@ -3615,6 +4056,7 @@ class TernaryFusedMoEMethod(FusedMoEMethodBase, nn.Module):
                     ctypes.c_int(num_experts),
                     ctypes.c_void_p(cuda_stream),
                 )
+                _kernel_profiler.end(_kp_start)
             
             if ret != 0:
                 # Fallback to fused_moe (config already fetched above)
@@ -3624,7 +4066,9 @@ class TernaryFusedMoEMethod(FusedMoEMethodBase, nn.Module):
             # Fused combine: remove elementwise_mul + reduce_sum kernels.
             # TopK returns weights in FP32, which we consume directly without casting.
             out_buf = layer._ternary_moe_combined_buf
+            _kp_start = _kernel_profiler.start("moe_combine_topk")
             fused_moe_combine_topk(down_out, topk_weights[0], out_buf)
+            _kernel_profiler.end(_kp_start)
             output = out_buf.view(1, -1)
             
             if output.dtype != dtype:
