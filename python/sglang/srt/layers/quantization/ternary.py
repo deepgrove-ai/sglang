@@ -3211,25 +3211,25 @@ class TernaryLinearMethod(LinearMethodBase):
                 buf_attr_scale = f"_ternary_act_scale_M{M}"
                 buf_attr_output = f"_ternary_output_M{M}"
             
-                if hasattr(layer, buf_attr_int8):
-                    out_int8 = getattr(layer, buf_attr_int8)
-                    out_scale = getattr(layer, buf_attr_scale)
-                    output = getattr(layer, buf_attr_output)
-                    if out_int8.shape[0] < M:
-                        out_int8 = torch.empty(M, K, device=x_compute.device, dtype=torch.int8)
-                        out_scale = torch.empty(M, device=x_compute.device, dtype=torch.bfloat16)
-                        output = torch.empty(M, N, device=x_compute.device, dtype=torch.bfloat16)
-                else:
-                    dev_key = _device_cache_key(x_compute.device)
-                    out_int8 = _get_cached_tensor(
-                            layer, "_ternary_act_int8_cache", (M, K, dev_key), (M, K), torch.int8, x_compute.device
-                    )
-                    out_scale = _get_cached_tensor(
-                            layer, "_ternary_act_scale_cache", (M, dev_key), (M,), torch.bfloat16, x_compute.device
-                    )
-                    output = _get_cached_tensor(
-                            layer, "_ternary_v4_output_cache", (M, N, dev_key), (M, N), torch.bfloat16, x_compute.device
-                    )
+            if hasattr(layer, buf_attr_int8):
+                out_int8 = getattr(layer, buf_attr_int8)
+                out_scale = getattr(layer, buf_attr_scale)
+                output = getattr(layer, buf_attr_output)
+                if out_int8.shape[0] < M:
+                    out_int8 = torch.empty(M, K, device=x_compute.device, dtype=torch.int8)
+                    out_scale = torch.empty(M, device=x_compute.device, dtype=torch.bfloat16)
+                    output = torch.empty(M, N, device=x_compute.device, dtype=torch.bfloat16)
+            else:
+                dev_key = _device_cache_key(x_compute.device)
+                out_int8 = _get_cached_tensor(
+                        layer, "_ternary_act_int8_cache", (M, K, dev_key), (M, K), torch.int8, x_compute.device
+                )
+                out_scale = _get_cached_tensor(
+                        layer, "_ternary_act_scale_cache", (M, dev_key), (M,), torch.bfloat16, x_compute.device
+                )
+                output = _get_cached_tensor(
+                        layer, "_ternary_v4_output_cache", (M, N, dev_key), (M, N), torch.bfloat16, x_compute.device
+                )
 
             # Megafused: skip explicit activation quantization and call the 1-kernel path.
             if use_v4_megafused:
@@ -3613,7 +3613,7 @@ class TernaryFusedMoEMethod(FusedMoEMethodBase, nn.Module):
                 device=device,
                 dtype=torch.uint8,
             )
-
+            
             batch_size = 16
             for start in range(0, num_experts, batch_size):
                 end = min(start + batch_size, num_experts)
