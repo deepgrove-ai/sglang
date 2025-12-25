@@ -1617,6 +1617,23 @@ try:
                 BITNET_LIB.ternary_moe_megafused_gemv_indexed_batched_combine_bf16_weights.restype = ctypes.c_int
                 logger.info("[TERNARY] MoE FULL FUSION (down+combine, BF16 weights) loaded")
 
+            if hasattr(BITNET_LIB, 'ternary_moe_megafused_gemv_indexed_batched_combine_bf16_acc'):
+                BITNET_LIB.ternary_moe_megafused_gemv_indexed_batched_combine_bf16_acc.argtypes = [
+                    ctypes.c_void_p,  # x_bf16 [top_k, K] BF16 per-expert input
+                    ctypes.c_void_p,  # all_weights_packed [num_experts, N, K/4]
+                    ctypes.c_void_p,  # topk_ids [top_k] int32
+                    ctypes.c_void_p,  # all_alpha [num_experts, K] FP32
+                    ctypes.c_void_p,  # expert_weights [top_k] BF16
+                    ctypes.c_void_p,  # output [N] BF16 (MUST BE ZEROED beforehand)
+                    ctypes.c_int,     # top_k
+                    ctypes.c_int,     # N
+                    ctypes.c_int,     # K
+                    ctypes.c_int,     # num_experts
+                    ctypes.c_void_p,  # stream
+                ]
+                BITNET_LIB.ternary_moe_megafused_gemv_indexed_batched_combine_bf16_acc.restype = ctypes.c_int
+                logger.info("[TERNARY] MoE FULL FUSION (down+combine, BF16 atomic acc) loaded")
+
             if hasattr(BITNET_LIB, 'ternary_quantize_activation_fast'):
                 BITNET_LIB.ternary_quantize_activation_fast.argtypes = [
                     ctypes.c_void_p,  # activations (bf16)
