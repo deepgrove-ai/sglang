@@ -61,8 +61,8 @@ FetchContent_Populate(repo-cutlass)
 FetchContent_Declare(
     repo-deepgemm
     GIT_REPOSITORY https://github.com/sgl-project/DeepGEMM
-    GIT_TAG        4d23df0a07b057fbb4a44ff8666e528a600feb5e
-    GIT_SHALLOW    OFF
+    GIT_TAG        sgl-release
+    GIT_SHALLOW    ON
 )
 FetchContent_Populate(repo-deepgemm)
 
@@ -139,7 +139,8 @@ if(CCACHE_FOUND AND ENABLE_CCACHE AND DEFINED ENV{CCACHE_DIR})
 endif()
 
 # Enable gencode below SM90
-option(ENABLE_BELOW_SM90 "Enable below SM90" ON)
+# DEV BUILD: Force OFF for faster compilation
+option(ENABLE_BELOW_SM90 "Enable below SM90" OFF)
 
 if (CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64")
     set(ENABLE_BELOW_SM90 OFF)
@@ -237,7 +238,8 @@ if (ENABLE_BELOW_SM90)
 
 endif()
 
-if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
+# DEV BUILD: Skip sm_100a/sm_120a for faster compilation
+if (FALSE AND ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A))
     list(APPEND SGL_KERNEL_CUDA_FLAGS
         "-gencode=arch=compute_100a,code=sm_100a"
         "-gencode=arch=compute_120a,code=sm_120a"

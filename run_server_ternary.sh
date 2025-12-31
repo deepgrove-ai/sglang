@@ -17,6 +17,7 @@ source "$SCRIPT_DIR/activate_env.sh"
 # Default values
 QUANT_MODE="i2s"
 TP_SIZE=1
+MODEL_PRESET="qwen3-moe"  # Default model preset
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -25,12 +26,16 @@ while [[ $# -gt 0 ]]; do
             TP_SIZE="$2"
             shift 2
             ;;
+        --model)
+            MODEL_PRESET="$2"
+            shift 2
+            ;;
         fp16|i2s|i2s-tuned|i2s-kvfp8|i2s-fp8)
             QUANT_MODE="$1"
             shift
             ;;
         -h|--help)
-            echo "Usage: $0 [MODE] [--tp N]"
+            echo "Usage: $0 [MODE] [--tp N] [--model MODEL]"
             echo ""
             echo "Modes:"
             echo "  fp16:      Pure FP16/BF16 (no quantization, baseline)"
@@ -40,11 +45,17 @@ while [[ $# -gt 0 ]]; do
             echo "  i2s-fp8:   Ternary + I2_S + FP8 tensor cores (fastest inference)"
             echo ""
             echo "Options:"
-            echo "  --tp N     Tensor parallelism: shard model across N GPUs (default: 1)"
+            echo "  --tp N       Tensor parallelism: shard model across N GPUs (default: 1)"
+            echo "  --model M    Model preset: qwen3-moe (default), klear-20b"
+            echo ""
+            echo "Models:"
+            echo "  qwen3-moe:  Qwen3 MoE 30B A3B (RedMod/sft_dist_l_q)"
+            echo "  klear-20b:  Klear 20B MoE (/home/ubuntu/raghav/20ba1b)"
             echo ""
             echo "Examples:"
-            echo "  $0 i2s --tp 2    # Run i2s mode on 2 GPUs"
-            echo "  $0 fp16 --tp 8   # Run fp16 mode on 8 GPUs"
+            echo "  $0 i2s --tp 2              # Run Qwen3 MoE with i2s mode on 2 GPUs"
+            echo "  $0 fp16 --model klear-20b  # Run Klear 20B in fp16 mode"
+            echo "  $0 i2s-tuned --model klear-20b  # Run Klear 20B with tuned i2s"
             exit 0
             ;;
         *)
@@ -163,8 +174,21 @@ case "$QUANT_MODE" in
 esac
 
 # Model and server configuration
-MODEL_ID="RedMod/sft_dist_l_q"
-MODEL_NAME="sft_dist_l_q-$QUANT_MODE"
+case "$MODEL_PRESET" in
+    qwen3-moe)
+        MODEL_ID="RedMod/sft_dist_l_q"
+        MODEL_NAME="qwen3-moe-$QUANT_MODE"
+        ;;
+    klear-20b)
+        MODEL_ID="/home/ubuntu/raghav/20ba1b"
+        MODEL_NAME="klear-20b-$QUANT_MODE"
+        ;;
+    *)
+        echo "Error: Unknown model preset '$MODEL_PRESET'"
+        echo "Valid presets: qwen3-moe, klear-20b"
+        exit 1
+        ;;
+esac
 SERVER_PORT=30080
 DEFAULT_REQUEST_GPU_MEMORY="0.85"
 REQUEST_GPU_MEMORY="${REQUEST_GPU_MEMORY:-$DEFAULT_REQUEST_GPU_MEMORY}"
@@ -174,14 +198,26 @@ REQUEST_GPU_MEMORY="${REQUEST_GPU_MEMORY:-$DEFAULT_REQUEST_GPU_MEMORY}"
 CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-}"
 CUDA_GRAPH_MAX_BS="${CUDA_GRAPH_MAX_BS:-}"
 CUDA_GRAPH_BS="${CUDA_GRAPH_BS:-}"
+DISABLE_CUDA_GRAPH="${DISABLE_CUDA_GRAPH:-0}"  # Test: disable CUDA graphs entirely
 DISABLE_RADIX_CACHE="${DISABLE_RADIX_CACHE:-0}"
 DISABLE_OVERLAP="${DISABLE_OVERLAP:-0}"  # maps to --disable-overlap-schedule
 MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-}"
+# torch.compile: enables torch.compile optimization for reduced Python overhead
+# Use TORCH_COMPILE_MAX_BS=1 for batch-1 decode latency optimization
+TORCH_COMPILE_MAX_BS="${TORCH_COMPILE_MAX_BS:-}"
+
+# torch.compile + CustomOp behavior:
+# SGLang's default torch.compile path swaps many CustomOps (e.g., RMSNorm, RoPE)
+# to their PyTorch-native implementations for traceability, which can be *much*
+# slower than fused CUDA kernels on H100. For our ternary stack, preserving the
+# original CUDA implementations is usually better (torch.compile will graph-break).
+SGLANG_TORCH_COMPILE_CUSTOM_OP_MODE="${SGLANG_TORCH_COMPILE_CUSTOM_OP_MODE:-}"
 
 echo "========================================"
 echo "Starting SGLang server"
 echo "Mode: $QUANT_DESC"
-echo "Model: $MODEL_ID"
+echo "Model preset: $MODEL_PRESET"
+echo "Model path: $MODEL_ID"
 echo "Port: $SERVER_PORT"
 echo "Tensor Parallelism: $TP_SIZE GPU(s)"
 echo "GPU memory allocation: $REQUEST_GPU_MEMORY"
@@ -201,9 +237,12 @@ fi
 echo "Chunked prefill size: $CHUNKED_PREFILL_SIZE"
 echo "CUDA graph batch sizes: $CUDA_GRAPH_BS"
 echo "CUDA graph max batch size: $CUDA_GRAPH_MAX_BS"
+echo "Disable CUDA graphs: $DISABLE_CUDA_GRAPH"
 echo "Disable radix cache: $DISABLE_RADIX_CACHE"
 echo "Disable overlap schedule: $DISABLE_OVERLAP"
 echo "Max running requests: $MAX_RUNNING_REQUESTS"
+echo "torch.compile max batch size: ${TORCH_COMPILE_MAX_BS:-disabled}"
+echo "torch.compile CustomOp mode: ${SGLANG_TORCH_COMPILE_CUSTOM_OP_MODE:-default(native)}"
 echo "========================================"
 
 # Check if server is already running on the port
@@ -240,12 +279,27 @@ if [[ -n "$MAX_RUNNING_REQUESTS" ]]; then
     CMD="$CMD --max-running-requests $MAX_RUNNING_REQUESTS"
 fi
 
+if [[ "$DISABLE_CUDA_GRAPH" == "1" ]]; then
+    CMD="$CMD --disable-cuda-graph"
+fi
+
 if [[ "$DISABLE_RADIX_CACHE" == "1" ]]; then
     CMD="$CMD --disable-radix-cache"
 fi
 
 if [[ "$DISABLE_OVERLAP" == "1" ]]; then
     CMD="$CMD --disable-overlap-schedule"
+fi
+
+# torch.compile optimization (reduces Python overhead significantly for batch-1)
+if [[ -n "$TORCH_COMPILE_MAX_BS" ]]; then
+    # Default to preserving CUDA CustomOps unless explicitly overridden.
+    if [[ -z "$SGLANG_TORCH_COMPILE_CUSTOM_OP_MODE" ]]; then
+        export SGLANG_TORCH_COMPILE_CUSTOM_OP_MODE="preserve"
+    else
+        export SGLANG_TORCH_COMPILE_CUSTOM_OP_MODE="$SGLANG_TORCH_COMPILE_CUSTOM_OP_MODE"
+    fi
+    CMD="$CMD --enable-torch-compile --torch-compile-max-bs $TORCH_COMPILE_MAX_BS"
 fi
 
 # Add quantization flag if set

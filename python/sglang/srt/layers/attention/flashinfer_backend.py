@@ -49,7 +49,8 @@ if is_flashinfer_available():
         BatchPrefillWithRaggedKVCacheWrapper,
         fast_decode_plan,
     )
-    from flashinfer.cascade import merge_state
+    # Use sgl_kernel's PDL-enabled merge_state instead of FlashInfer's for better kernel chaining
+    from sglang.srt.layers.attention.merge_state import merge_state
 
 
 class WrapperDispatch(Enum):

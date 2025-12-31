@@ -27,9 +27,9 @@ inline __device__ void from_float(__nv_bfloat16& d, float s) {
   d = __float2bfloat16(s);
 }
 
-// Implements section 2.2 of https://www.arxiv.org/pdf/2501.01005
-template <typename scalar_t, const uint NUM_THREADS>
-__global__ void merge_attn_states_kernel(
+// PDL-enabled version: Implements section 2.2 of https://www.arxiv.org/pdf/2501.01005
+template <bool enable_pdl, typename scalar_t, const uint NUM_THREADS>
+__global__ void merge_attn_states_kernel_pdl(
     scalar_t* output,
     float* output_lse,
     const scalar_t* prefix_output,
@@ -39,6 +39,12 @@ __global__ void merge_attn_states_kernel(
     const uint num_tokens,
     const uint num_heads,
     const uint head_size) {
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  if constexpr (enable_pdl) {
+    asm volatile("griddepcontrol.wait;");
+  }
+#endif
+
   using pack_128b_t = uint4;
   const uint pack_size = 16 / sizeof(scalar_t);
   const uint threads_per_head = head_size / pack_size;
@@ -46,7 +52,14 @@ __global__ void merge_attn_states_kernel(
   const uint global_idx = blockIdx.x * NUM_THREADS + threadIdx.x;
   const uint token_head_threads = num_tokens * num_heads * threads_per_head;
 
-  if (global_idx >= token_head_threads) return;
+  if (global_idx >= token_head_threads) {
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    if constexpr (enable_pdl) {
+      asm volatile("griddepcontrol.launch_dependents;");
+    }
+#endif
+    return;
+  }
 
   // global_idx -> token_idx + head_idx + pack_idx
   const uint token_head_idx = global_idx / threads_per_head;
@@ -103,6 +116,12 @@ __global__ void merge_attn_states_kernel(
     float out_lse = logf(out_se) + max_lse;
     output_lse[token_idx * num_heads + head_idx] = out_lse;
   }
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  if constexpr (enable_pdl) {
+    asm volatile("griddepcontrol.launch_dependents;");
+  }
+#endif
 }
 
 // The following macro is used to dispatch the conversion function based on
@@ -121,18 +140,44 @@ __global__ void merge_attn_states_kernel(
     }                                                                   \
   }
 
-#define LAUNCH_MERGE_ATTN_STATES(scalar_t, NUM_THREADS)                          \
-  {                                                                              \
-    merge_attn_states_kernel<scalar_t, NUM_THREADS><<<grid, block, 0, stream>>>( \
-        reinterpret_cast<scalar_t*>(output.data_ptr()),                          \
-        reinterpret_cast<float*>(output_lse.data_ptr()),                         \
-        reinterpret_cast<scalar_t*>(prefix_output.data_ptr()),                   \
-        reinterpret_cast<float*>(prefix_lse.data_ptr()),                         \
-        reinterpret_cast<scalar_t*>(suffix_output.data_ptr()),                   \
-        reinterpret_cast<float*>(suffix_lse.data_ptr()),                         \
-        num_tokens,                                                              \
-        num_heads,                                                               \
-        head_size);                                                              \
+#define LAUNCH_MERGE_ATTN_STATES_PDL(scalar_t, NUM_THREADS, ENABLE_PDL)                           \
+  {                                                                                               \
+    auto kernel = merge_attn_states_kernel_pdl<ENABLE_PDL, scalar_t, NUM_THREADS>;                \
+    if constexpr (ENABLE_PDL) {                                                                   \
+      cudaLaunchConfig_t config = {};                                                             \
+      config.gridDim = grid;                                                                      \
+      config.blockDim = block;                                                                    \
+      config.dynamicSmemBytes = 0;                                                                \
+      config.stream = stream;                                                                     \
+      cudaLaunchAttribute attrs[1] = {};                                                          \
+      attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;                           \
+      attrs[0].val.programmaticStreamSerializationAllowed = true;                                 \
+      config.numAttrs = 1;                                                                        \
+      config.attrs = attrs;                                                                       \
+      cudaLaunchKernelEx(                                                                         \
+          &config,                                                                                \
+          kernel,                                                                                 \
+          reinterpret_cast<scalar_t*>(output.data_ptr()),                                         \
+          reinterpret_cast<float*>(output_lse.data_ptr()),                                        \
+          reinterpret_cast<scalar_t*>(prefix_output.data_ptr()),                                  \
+          reinterpret_cast<float*>(prefix_lse.data_ptr()),                                        \
+          reinterpret_cast<scalar_t*>(suffix_output.data_ptr()),                                  \
+          reinterpret_cast<float*>(suffix_lse.data_ptr()),                                        \
+          num_tokens,                                                                             \
+          num_heads,                                                                              \
+          head_size);                                                                             \
+    } else {                                                                                      \
+      kernel<<<grid, block, 0, stream>>>(                                                         \
+          reinterpret_cast<scalar_t*>(output.data_ptr()),                                         \
+          reinterpret_cast<float*>(output_lse.data_ptr()),                                        \
+          reinterpret_cast<scalar_t*>(prefix_output.data_ptr()),                                  \
+          reinterpret_cast<float*>(prefix_lse.data_ptr()),                                        \
+          reinterpret_cast<scalar_t*>(suffix_output.data_ptr()),                                  \
+          reinterpret_cast<float*>(suffix_lse.data_ptr()),                                        \
+          num_tokens,                                                                             \
+          num_heads,                                                                              \
+          head_size);                                                                             \
+    }                                                                                             \
   }
 
 /*@brief Merges the attention states from prefix and suffix
@@ -146,8 +191,9 @@ __global__ void merge_attn_states_kernel(
  * @param suffix_output [n,h,d] The suffix attention states.
  * @param suffix_lse [n,h] The log-sum-exp values for the suffix attention
  * states.
+ * @param enable_pdl Whether to enable programmatic dependent launch for kernel chaining.
  */
-template <typename scalar_t>
+template <bool enable_pdl, typename scalar_t>
 void merge_attn_states_launcher(
     const at::Tensor& prefix_output,  // [NUM_TOKENS, NUM_HEADS, HEAD_SIZE]
     const at::Tensor& prefix_lse,     // [NUM_TOKENS, NUM_HEADS]
@@ -173,14 +219,21 @@ void merge_attn_states_launcher(
   const c10::cuda::OptionalCUDAGuard device_guard(prefix_output.device());
   auto stream = at::cuda::getCurrentCUDAStream();
 
-  LAUNCH_MERGE_ATTN_STATES(scalar_t, NUM_THREADS);
+  LAUNCH_MERGE_ATTN_STATES_PDL(scalar_t, NUM_THREADS, enable_pdl);
 }
 
-#define CALL_MERGE_ATTN_STATES_LAUNCHER(scalar_t) \
-  { merge_attn_states_launcher<scalar_t>(v_a, s_a, v_b, s_b, v_merged, s_merged); }
+#define CALL_MERGE_ATTN_STATES_LAUNCHER_PDL(scalar_t)                                    \
+  {                                                                                      \
+    if (enable_pdl) {                                                                    \
+      merge_attn_states_launcher<true, scalar_t>(v_a, s_a, v_b, s_b, v_merged, s_merged);  \
+    } else {                                                                             \
+      merge_attn_states_launcher<false, scalar_t>(v_a, s_a, v_b, s_b, v_merged, s_merged); \
+    }                                                                                    \
+  }
 
 void merge_state_v2(
-    at::Tensor v_a, at::Tensor s_a, at::Tensor v_b, at::Tensor s_b, at::Tensor v_merged, at::Tensor s_merged) {
+    at::Tensor v_a, at::Tensor s_a, at::Tensor v_b, at::Tensor s_b, at::Tensor v_merged, at::Tensor s_merged,
+    bool enable_pdl) {
   // Input tensors must be contiguous
   CHECK_INPUT(v_a);  // v_a prefix_output (seq_len, num_heads, head_dim)
   CHECK_INPUT(s_a);  // s_a prefix_lse (seq_len, num_heads)
@@ -200,5 +253,5 @@ void merge_state_v2(
   CHECK_SHAPE(s_a, s_b);
   CHECK_EQ(v_a.size(0), s_a.size(0));
   CHECK_EQ(v_a.size(1), s_b.size(1));
-  DISPATCH_BY_SCALAR_DTYPE(v_merged.dtype(), CALL_MERGE_ATTN_STATES_LAUNCHER);
+  DISPATCH_BY_SCALAR_DTYPE(v_merged.dtype(), CALL_MERGE_ATTN_STATES_LAUNCHER_PDL);
 }

@@ -2,6 +2,8 @@ from typing import Optional, Tuple
 
 import torch
 
+from sgl_kernel.utils import is_arch_support_pdl
+
 
 def lightning_attention_decode(q, k, v, past_kv, slope, output, new_kv):
     torch.ops.sgl_kernel.lightning_attention_decode.default(
@@ -35,19 +37,57 @@ def merge_state_v2(
     s_b: torch.Tensor,
     v_merged: Optional[torch.Tensor] = None,
     s_merged: Optional[torch.Tensor] = None,
+    enable_pdl: Optional[bool] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    r"""Merge two attention states (output, lse) into one.
+
+    Parameters
+    ----------
+    v_a : torch.Tensor
+        The first attention output, shape: ``(num_tokens, num_heads, head_dim)``.
+    s_a : torch.Tensor
+        The first log-sum-exp values, shape: ``(num_tokens, num_heads)``.
+    v_b : torch.Tensor
+        The second attention output, shape: ``(num_tokens, num_heads, head_dim)``.
+    s_b : torch.Tensor
+        The second log-sum-exp values, shape: ``(num_tokens, num_heads)``.
+    v_merged : Optional[torch.Tensor]
+        The merged attention output, if specified, the kernel will update this tensor inplace.
+    s_merged : Optional[torch.Tensor]
+        The merged log-sum-exp values, if specified, the kernel will update this tensor inplace.
+    enable_pdl : Optional[bool]
+        Whether to enable `programmatic dependent launch
+        <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
+        If None, will be automatically enabled on Hopper architecture.
+
+    Returns
+    -------
+    v_merged : torch.Tensor
+        The merged attention output, shape: ``(num_tokens, num_heads, head_dim)``.
+    s_merged : torch.Tensor
+        The merged log-sum-exp values, shape: ``(num_tokens, num_heads)``.
+    """
     s_a = s_a.to(torch.float32)
     s_b = s_b.to(torch.float32)
     # TODO(DefTruth): Currently, the custom merge_attn_states kernel
     # does not support the FP8 data type and non - CUDA devices.
     # It may be necessary to fall back to using the Triton kernel.
 
+    if enable_pdl is None:
+        enable_pdl = is_arch_support_pdl()
+
     # Avoid creating new tensors if they are already provided
     if v_merged is None:
         v_merged = torch.empty_like(v_a)
     if s_merged is None:
         s_merged = torch.empty_like(s_a)
-    torch.ops.sgl_kernel.merge_state_v2.default(v_a, s_a, v_b, s_b, v_merged, s_merged)
+    # Note: PDL support requires a custom build of sgl-kernel with enable_pdl parameter.
+    # For stock sgl-kernel, we call without enable_pdl parameter.
+    try:
+        torch.ops.sgl_kernel.merge_state_v2.default(v_a, s_a, v_b, s_b, v_merged, s_merged, enable_pdl)
+    except TypeError:
+        # Stock kernel doesn't have enable_pdl parameter
+        torch.ops.sgl_kernel.merge_state_v2.default(v_a, s_a, v_b, s_b, v_merged, s_merged)
     return v_merged, s_merged
 
 

@@ -12,6 +12,8 @@
 # limitations under the License.
 # ==============================================================================
 
+import os
+
 import torch
 
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -27,6 +29,15 @@ if _is_cuda:
 
 def enable_fused_set_kv_buffer(forward_batch: ForwardBatch):
     """Enable fused set_kv_buffer only on CUDA with bfloat16 KV cache."""
+    # torch.compile compatibility:
+    # During torch.compile SGLang patches CustomOp modules (e.g., RotaryEmbedding) to use
+    # their `forward_native` implementations. The native RoPE path does not support
+    # `fused_set_kv_buffer_arg` (and will assert). Disable the fused set-kv-buffer path
+    # when torch.compile is enabled so KV cache is saved via the standard attention path.
+    if os.environ.get("SGLANG_ENABLE_TORCH_COMPILE", "0") == "1" and os.environ.get(
+        "SGLANG_TORCH_COMPILE_CUSTOM_OP_MODE", "native"
+    ).lower() in ("native", "torch", "pytorch"):
+        return False
     return (
         _is_cuda
         and hasattr(forward_batch.token_to_kv_pool, "dtype")

@@ -25,6 +25,28 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import torch
 from torch import nn
 
+# torch.compile compatibility: disable dynamo tracing for ctypes FFI calls
+try:
+    import torch._dynamo
+    _dynamo_disable = torch._dynamo.disable
+    
+    # Force graph breaks around ctypes calls by marking ctypes module as skip
+    torch._dynamo.config.suppress_errors = True
+    
+    def _is_compiling() -> bool:
+        """True while torch.compile is tracing/compiling (not during normal execution)."""
+        try:
+            # Preferred public API (torch>=2.1)
+            return torch.compiler.is_compiling()
+        except Exception:
+            # Fallback for older versions / edge cases
+            return torch._dynamo.is_compiling()
+except (ImportError, AttributeError):
+    def _dynamo_disable(fn):
+        return fn
+    def _is_compiling() -> bool:
+        return False
+
 from sglang.srt.distributed import (
     get_moe_expert_parallel_world_size,
     get_pp_group,
@@ -625,6 +647,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
             is_last_layer=(self.layer_id == self.config.num_hidden_layers - 1),
         )
 
+    @_dynamo_disable  # Disable torch.compile tracing for ctypes FFI calls in fused kernels
     def forward(
         self,
         positions: torch.Tensor,
@@ -649,6 +672,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
             and hidden_states is not None
             and hidden_states.shape[0] == 1
         ):
+            _hidden_states_backup = hidden_states
             try:
                 from sglang.srt.layers.quantization import ternary as ternary_quant
 
@@ -678,7 +702,8 @@ class Qwen3MoeDecoderLayer(nn.Module):
                         globals()["_ternary_rmsnorm_qkv_skip_logged"] = True
 
                 can_use = (
-                    (not get_is_capture_mode() or _TERNARY_FUSE_RMSNORM_QKV_ALLOW_CAPTURE)
+                    not _is_compiling()  # Skip ctypes calls during torch.compile tracing
+                    and (not get_is_capture_mode() or _TERNARY_FUSE_RMSNORM_QKV_ALLOW_CAPTURE)
                     and getattr(ternary_quant, "BITNET_CUDA_V4_RMSNORM_MEGA_FUSED_AVAILABLE", False)
                     and ternary_quant.BITNET_LIB is not None
                     and hasattr(ternary_quant.BITNET_LIB, "bitlinear_rmsnorm_bf16xint2_v4_megafused")
@@ -746,7 +771,6 @@ class Qwen3MoeDecoderLayer(nn.Module):
                         # Run attention using precomputed qkv.
                         residual = residual_out
                         did_fused_qkv = True
-                        hidden_states = None  # forward_prepare_from_qkv doesn't need hidden_states
                         s = self.self_attn.forward_prepare_from_qkv(
                             positions=positions,
                             qkv=qkv_out,
@@ -761,8 +785,19 @@ class Qwen3MoeDecoderLayer(nn.Module):
                                 weight_shape,
                             )
                             globals()["_ternary_rmsnorm_qkv_skip_logged"] = True
-            except Exception:
+            except Exception as e:
                 did_fused_qkv = False
+                # Exception-safety: never leave hidden_states as None for the fallback path.
+                if hidden_states is None:
+                    hidden_states = _hidden_states_backup
+                # Log once so we don't silently lose the fused path.
+                if not globals().get("_ternary_rmsnorm_qkv_exc_logged", False):
+                    logger.warning(
+                        "[TERNARY] RMSNorm+QKV fusion ERROR (falling back to standard path): %s",
+                        e,
+                        exc_info=True,
+                    )
+                    globals()["_ternary_rmsnorm_qkv_exc_logged"] = True
 
         if not did_fused_qkv:
             hidden_states, residual = self.layer_communicator.prepare_attn(
@@ -875,7 +910,8 @@ class Qwen3MoeDecoderLayer(nn.Module):
                         globals()["_ternary_rmsnorm_qkv_skip_logged"] = True
 
                 can_use = (
-                    (not get_is_capture_mode() or _TERNARY_FUSE_RMSNORM_QKV_ALLOW_CAPTURE)
+                    not _is_compiling()  # Skip ctypes calls during torch.compile tracing
+                    and (not get_is_capture_mode() or _TERNARY_FUSE_RMSNORM_QKV_ALLOW_CAPTURE)
                     and getattr(ternary_quant, "BITNET_CUDA_V4_RMSNORM_MEGA_FUSED_AVAILABLE", False)
                     and ternary_quant.BITNET_LIB is not None
                     and hasattr(ternary_quant.BITNET_LIB, "bitlinear_rmsnorm_bf16xint2_v4_megafused")

@@ -1,3 +1,5 @@
+import os
+
 from torch import nn
 
 from sglang.srt.utils import (
@@ -27,6 +29,20 @@ class CustomOp(nn.Module):
         self.is_torch_compile = False
 
     def enter_torch_compile(self, num_tokens: int):
+        # Optional escape hatch:
+        # SGLang's default torch.compile integration swaps many CustomOps to their
+        # PyTorch-native implementations for traceability. This can be *much* slower
+        # than the fused CUDA kernels (e.g. RMSNorm forward_native does FP32 math).
+        #
+        # For kernels-heavy fast paths (like our ternary stack), it can be better to
+        # preserve the original CUDA implementations and let torch.compile graph-break
+        # around them.
+        #
+        # Values:
+        # - "native"   (default): current behavior (swap to forward_native)
+        # - "preserve": keep original _forward_method (typically forward_cuda)
+        mode = os.environ.get("SGLANG_TORCH_COMPILE_CUSTOM_OP_MODE", "native").lower()
+
         # Skip if Op is already entered compile mode.
         # NOTE(alcanderian): Some Ops(for example RotaryEmbedding) will be reused
         # among layers and `enter_torch_compile` will be called many times.
@@ -36,6 +52,11 @@ class CustomOp(nn.Module):
             return
 
         self._original_forward_method = self._forward_method
+
+        if mode in ("preserve", "cuda", "keep", "none"):
+            # Keep original implementation (usually fused CUDA kernels).
+            self.is_torch_compile = True
+            return
         # NOTE: Temporarily workaround MoE
         # The performance of torch.compile on this layer is not always good when bs > 1,
         # so we decide to only use torch.compile when bs=1

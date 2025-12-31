@@ -478,8 +478,18 @@ def _try_load_moe_cache(
         )
 
         layer._ternary_moe_v4_enabled = True
+        
+        # Check if full fusion is available (same logic as in TernaryFusedMoEMethod.process_weights_after_loading)
+        from sglang.srt.layers.quantization.ternary import _KERNEL_CAPS
+        layer._use_full_fusion = (
+            _KERNEL_CAPS is not None
+            and _KERNEL_CAPS.get('has_megafused', False)
+            and _KERNEL_CAPS.get('shared_silu', False)
+            and _KERNEL_CAPS.get('has_any_combine', False)
+        )
     else:
         layer._ternary_moe_v4_enabled = False
+        layer._use_full_fusion = False
 
     layer._ternary_moe_enabled = True
     return True

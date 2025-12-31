@@ -30,14 +30,42 @@ def merge_state(
     suffix_lse: torch.Tensor,
     output: Optional[torch.Tensor] = None,
     output_lse: Optional[torch.Tensor] = None,
+    enable_pdl: Optional[bool] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Merge two attention states (output, lse) into one.
+
+    Parameters
+    ----------
+    prefix_output : torch.Tensor
+        The prefix attention output, shape: ``(num_tokens, num_heads, head_dim)``.
+    prefix_lse : torch.Tensor
+        The prefix log-sum-exp values, shape: ``(num_tokens, num_heads)``.
+    suffix_output : torch.Tensor
+        The suffix attention output, shape: ``(num_tokens, num_heads, head_dim)``.
+    suffix_lse : torch.Tensor
+        The suffix log-sum-exp values, shape: ``(num_tokens, num_heads)``.
+    output : Optional[torch.Tensor]
+        The merged attention output, if specified, the kernel will update this tensor inplace.
+    output_lse : Optional[torch.Tensor]
+        The merged log-sum-exp values, if specified, the kernel will update this tensor inplace.
+    enable_pdl : Optional[bool]
+        Whether to enable programmatic dependent launch for kernel chaining.
+        If None, will be automatically enabled on Hopper architecture.
+
+    Returns
+    -------
+    output : torch.Tensor
+        The merged attention output, shape: ``(num_tokens, num_heads, head_dim)``.
+    output_lse : torch.Tensor
+        The merged log-sum-exp values, shape: ``(num_tokens, num_heads)``.
+    """
     if (
         _is_cuda
         and _supported_dtypes(prefix_output)
         and _supported_headdim(prefix_output)
     ):
         return merge_state_v2(
-            prefix_output, prefix_lse, suffix_output, suffix_lse, output, output_lse
+            prefix_output, prefix_lse, suffix_output, suffix_lse, output, output_lse, enable_pdl
         )
     else:
         # Fallback to Triton kernel
