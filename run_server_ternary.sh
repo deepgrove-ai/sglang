@@ -30,7 +30,7 @@ while [[ $# -gt 0 ]]; do
             MODEL_PRESET="$2"
             shift 2
             ;;
-        fp16|i2s|i2s-tuned|i2s-kvfp8|i2s-fp8)
+        fp16|i2s|i2s-tuned|i2s-kvfp8|i2s-fp8|ternary-fp4)
             QUANT_MODE="$1"
             shift
             ;;
@@ -38,11 +38,12 @@ while [[ $# -gt 0 ]]; do
             echo "Usage: $0 [MODE] [--tp N] [--model MODEL]"
             echo ""
             echo "Modes:"
-            echo "  fp16:      Pure FP16/BF16 (no quantization, baseline)"
-            echo "  i2s:       Ternary + I2_S (8x memory reduction, FP16 inference)"
-            echo "  i2s-tuned: Ternary + I2_S + Optimized FlashInfer (RECOMMENDED)"
-            echo "  i2s-kvfp8: Ternary + I2_S + FP8 KV Cache (Lower memory, faster attention)"
-            echo "  i2s-fp8:   Ternary + I2_S + FP8 tensor cores (fastest inference)"
+            echo "  fp16:        Pure FP16/BF16 (no quantization, baseline)"
+            echo "  i2s:         Ternary + I2_S (8x memory reduction, FP16 inference)"
+            echo "  i2s-tuned:   Ternary + I2_S + Optimized FlashInfer (RECOMMENDED)"
+            echo "  i2s-kvfp8:   Ternary + I2_S + FP8 KV Cache (Lower memory, faster attention)"
+            echo "  i2s-fp8:     Ternary + I2_S + FP8 tensor cores (fastest inference)"
+            echo "  ternary-fp4: Ternary → FP4 tensor cores (Blackwell optimized)"
             echo ""
             echo "Options:"
             echo "  --tp N       Tensor parallelism: shard model across N GPUs (default: 1)"
@@ -104,6 +105,26 @@ export TERNARY_QUANTIZE_LM_HEAD="${TERNARY_QUANTIZE_LM_HEAD:-1}"
 # - 0: disable and use standard RMSNorm path
 export TERNARY_FUSE_RMSNORM_QKV="${TERNARY_FUSE_RMSNORM_QKV:-1}"
 export TERNARY_FUSE_RMSNORM_QKV_ALLOW_CAPTURE="${TERNARY_FUSE_RMSNORM_QKV_ALLOW_CAPTURE:-1}"
+
+# PDL (Programmatic Dependent Launch) for Blackwell/Hopper
+# Enables hardware-accelerated kernel chaining for lower latency (M=1)
+export TERNARY_ENABLE_PDL="${TERNARY_ENABLE_PDL:-1}"
+
+# JAX Pallas Tuning (Batched Decode)
+# Use JAX for M=32 to 128 (beating cuBLAS). Below 32, CUDA kernels are faster.
+# Above 128, fallback to cuBLAS to avoid OOM.
+export TERNARY_USE_JAX_PALLAS="${TERNARY_USE_JAX_PALLAS:-1}"
+export TERNARY_JAX_MIN_BATCH="${TERNARY_JAX_MIN_BATCH:-32}"
+export TERNARY_JAX_MAX_BATCH="${TERNARY_JAX_MAX_BATCH:-128}"
+
+# FP4 MoE via CUTLASS native tensor cores (W4A4)
+# DISABLED: Profile shows 262ms quant overhead for 417ms GEMM - not worth it
+# Set MIN > MAX to effectively disable FP4
+export TERNARY_MOE_FP4_MIN_TOKENS="${TERNARY_MOE_FP4_MIN_TOKENS:-999}"
+export TERNARY_MOE_FP4_MAX_TOKENS="${TERNARY_MOE_FP4_MAX_TOKENS:-48}"
+# Scale buffer size allocated ONCE at init (65536 * topk)
+# Value here doesn't matter for perf, only for safety. Use default large value.
+export MODELOPT_MAX_TOKENS_PER_EXPERT="${MODELOPT_MAX_TOKENS_PER_EXPERT:-65536}"
 
 # Overlap/scheduler knob: use pinned host memory for true async GPU->CPU copies of small tensors.
 # This is critical for avoiding the per-step ~3ms stall seen as aten::to/copy_ + cudaMemcpyAsync.
@@ -171,12 +192,27 @@ case "$QUANT_MODE" in
         QUANT_DESC="Ternary + I2_S + FP8 tensor cores (fastest inference)"
         echo "Note: FP8 mode enabled (requires H100/Ada GPUs with torch._scaled_mm support)"
         ;;
+    
+    ternary-fp4)
+        # Experimental: Ternary with FP4 MoE dispatch for larger batches
+        # Uses our custom CUTLASS FP4 path (ternary weights -> FP4 at load)
+        # NOTE: FP4 has activation quantization overhead that may negate benefits
+        export TERNARY_MOE_FP4_MIN_TOKENS=1
+        export TERNARY_MOE_FP4_MAX_TOKENS=4096
+        export TERNARY_MOE_FP4_ALWAYS=1
+        export SGLANG_FLASHINFER_USE_TENSOR_CORE=true
+        export SGLANG_FLASHINFER_WORKSPACE_SIZE=$((1024*1024*1024))
+        QUANT_FLAG="--quantization ternary --attention-backend flashinfer"
+        QUANT_DESC="Ternary + CUTLASS FP4 MoE (experimental)"
+        echo "Note: Ternary->FP4 conversion at load, CUTLASS FP4 grouped GEMM"
+        echo "WARNING: FP4 activation quantization overhead may negate tensor core benefits"
+        ;;
 esac
 
 # Model and server configuration
 case "$MODEL_PRESET" in
     qwen3-moe)
-        MODEL_ID="RedMod/sft_dist_l_q"
+        MODEL_ID="/mnt/data/q30ba3b_redmod"
         MODEL_NAME="qwen3-moe-$QUANT_MODE"
         ;;
     klear-20b)
@@ -190,15 +226,24 @@ case "$MODEL_PRESET" in
         ;;
 esac
 SERVER_PORT=30080
-DEFAULT_REQUEST_GPU_MEMORY="0.85"
+DEFAULT_REQUEST_GPU_MEMORY="0.95"
 REQUEST_GPU_MEMORY="${REQUEST_GPU_MEMORY:-$DEFAULT_REQUEST_GPU_MEMORY}"
 # Optional performance knobs (defaults keep SGLang auto-tuning behavior).
 # For batch=1 decode-latency experiments, good starting point:
 #   CUDA_GRAPH_BS="1" MAX_RUNNING_REQUESTS="1" CHUNKED_PREFILL_SIZE="-1"
-CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-}"
+# Chunked prefill: smaller chunks = less blocking of decode, but more overhead
+# Try 512-2048 for latency optimization (default is usually 8192)
+CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-1024}"
+
+# Speculative decoding: NGRAM doesn't need a draft model
+# Uses n-gram patterns from context to predict tokens
+SPECULATIVE_ALGORITHM="${SPECULATIVE_ALGORITHM:-}"
+SPECULATIVE_NUM_DRAFT="${SPECULATIVE_NUM_DRAFT:-4}"
 CUDA_GRAPH_MAX_BS="${CUDA_GRAPH_MAX_BS:-}"
-CUDA_GRAPH_BS="${CUDA_GRAPH_BS:-}"
+CUDA_GRAPH_BS="${CUDA_GRAPH_BS:1}"
 DISABLE_CUDA_GRAPH="${DISABLE_CUDA_GRAPH:-0}"  # Test: disable CUDA graphs entirely
+# MoE runner backend: auto, deep_gemm, triton, flashinfer_cutlass, flashinfer_mxfp4, cutlass
+MOE_RUNNER_BACKEND="${MOE_RUNNER_BACKEND:-}"
 DISABLE_RADIX_CACHE="${DISABLE_RADIX_CACHE:-0}"
 DISABLE_OVERLAP="${DISABLE_OVERLAP:-0}"  # maps to --disable-overlap-schedule
 MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-}"
@@ -225,6 +270,8 @@ echo "Ternary log level: $SGLANG_TERNARY_LOG_LEVEL"
 echo "Fuse RMSNorm+QKV (decode,tp=1): $TERNARY_FUSE_RMSNORM_QKV"
 echo "Fuse RMSNorm+QKV allow during CUDA graph capture: $TERNARY_FUSE_RMSNORM_QKV_ALLOW_CAPTURE"
 echo "MoE decode-only (ternary MoE only on decode): $TERNARY_MOE_DECODE_ONLY"
+echo "Batched MoE max tokens: $TERNARY_BATCHED_MOE_MAX_TOKENS (0=disabled)"
+echo "Batched MoE debug logging: $TERNARY_BATCHED_MOE_DEBUG"
 echo "Quantize LM head (TERNARY_QUANTIZE_LM_HEAD): $TERNARY_QUANTIZE_LM_HEAD"
 echo "SGLANG_PROFILE_OPLEVEL (1 disables cuda graphs/overlap/compile): $SGLANG_PROFILE_OPLEVEL"
 echo "TORCH_COMPILE_DISABLE: ${TORCH_COMPILE_DISABLE:-0}  TORCHINDUCTOR_DISABLE: ${TORCHINDUCTOR_DISABLE:-0}"
@@ -234,7 +281,10 @@ if [[ "$TERNARY_ENABLE_PROFILING" == "1" ]]; then
 else
     echo "Ternary profiling: DISABLED"
 fi
-echo "Chunked prefill size: $CHUNKED_PREFILL_SIZE"
+echo "Chunked prefill size: ${CHUNKED_PREFILL_SIZE:-auto}"
+echo "Speculative algorithm: ${SPECULATIVE_ALGORITHM:-disabled}"
+echo "Speculative draft tokens: ${SPECULATIVE_NUM_DRAFT:-N/A}"
+echo "MoE runner backend: ${MOE_RUNNER_BACKEND:-auto}"
 echo "CUDA graph batch sizes: $CUDA_GRAPH_BS"
 echo "CUDA graph max batch size: $CUDA_GRAPH_MAX_BS"
 echo "Disable CUDA graphs: $DISABLE_CUDA_GRAPH"
@@ -289,6 +339,18 @@ fi
 
 if [[ "$DISABLE_OVERLAP" == "1" ]]; then
     CMD="$CMD --disable-overlap-schedule"
+fi
+
+# Speculative decoding (NGRAM doesn't need a draft model)
+if [[ -n "$SPECULATIVE_ALGORITHM" ]]; then
+    CMD="$CMD --speculative-algorithm $SPECULATIVE_ALGORITHM"
+    CMD="$CMD --speculative-num-draft-tokens $SPECULATIVE_NUM_DRAFT"
+    echo "Speculative decoding: $SPECULATIVE_ALGORITHM with $SPECULATIVE_NUM_DRAFT draft tokens"
+fi
+
+# MoE runner backend
+if [[ -n "$MOE_RUNNER_BACKEND" ]]; then
+    CMD="$CMD --moe-runner-backend $MOE_RUNNER_BACKEND"
 fi
 
 # torch.compile optimization (reduces Python overhead significantly for batch-1)

@@ -64,9 +64,20 @@ def merge_state(
         and _supported_dtypes(prefix_output)
         and _supported_headdim(prefix_output)
     ):
-        return merge_state_v2(
-            prefix_output, prefix_lse, suffix_output, suffix_lse, output, output_lse, enable_pdl
-        )
+        try:
+            return merge_state_v2(
+                prefix_output,
+                prefix_lse,
+                suffix_output,
+                suffix_lse,
+                output,
+                output_lse,
+                enable_pdl,
+            )
+        except TypeError:
+            return merge_state_v2(
+                prefix_output, prefix_lse, suffix_output, suffix_lse, output, output_lse
+            )
     else:
         # Fallback to Triton kernel
         return merge_state_triton(

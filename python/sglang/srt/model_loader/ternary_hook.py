@@ -479,17 +479,37 @@ def _try_load_moe_cache(
 
         layer._ternary_moe_v4_enabled = True
         
-        # Check if full fusion is available (same logic as in TernaryFusedMoEMethod.process_weights_after_loading)
-        from sglang.srt.layers.quantization.ternary import _KERNEL_CAPS
-        layer._use_full_fusion = (
-            _KERNEL_CAPS is not None
-            and _KERNEL_CAPS.get('has_megafused', False)
-            and _KERNEL_CAPS.get('shared_silu', False)
-            and _KERNEL_CAPS.get('has_any_combine', False)
-        )
+        from sglang.srt.layers.quantization.ternary import _KERNEL_CAPS, _get_fp4_max_tokens
+        layer._use_full_fusion = (_KERNEL_CAPS is not None and _KERNEL_CAPS.get('has_megafused', False) 
+                                   and _KERNEL_CAPS.get('shared_silu', False) and _KERNEL_CAPS.get('has_any_combine', False))
+        
+        # FP4 MoE init
+        FP4_MAX = _get_fp4_max_tokens()
+        layer._fp4_moe_enabled = False
+        if FP4_MAX > 0:
+            try:
+                from sglang.srt.layers.moe.fused_moe_triton.fused_moe_ternary_fp4 import unpack_ternary_to_fp4, create_fp4_blockscales_from_ternary_alpha
+                from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams, CutlassMoEType
+                from sglang.srt.layers.moe.cutlass_moe_fp4_optimized import FP4MoEBuffers
+                topk = getattr(layer, 'top_k', 8)
+                layer._fp4_w13 = unpack_ternary_to_fp4(layer._ternary_w13_packed, hidden_size)
+                layer._fp4_w2 = unpack_ternary_to_fp4(layer._ternary_w2_packed, intermediate_size)
+                layer._fp4_w13_blockscale, layer._fp4_w13_alphas = create_fp4_blockscales_from_ternary_alpha(layer._ternary_moe_alpha_w13, 2*intermediate_size, hidden_size, 16)
+                layer._fp4_w2_blockscale, layer._fp4_w2_alphas = create_fp4_blockscales_from_ternary_alpha(layer._ternary_moe_alpha_w2, hidden_size, intermediate_size, 16)
+                layer._fp4_a1_gscale = torch.ones(num_experts, device=device, dtype=torch.float32)
+                layer._fp4_a2_gscale = torch.ones(num_experts, device=device, dtype=torch.float32)
+                layer._fp4_moe_params = CutlassMoEParams(CutlassMoEType.BlockscaledFP4, device, num_experts, intermediate_size, hidden_size)
+                layer._fp4_moe_buffers = FP4MoEBuffers.create(device, torch.bfloat16, FP4_MAX, topk, hidden_size, intermediate_size)
+                layer._fp4_moe_enabled = True
+                logger.info(f"[TERNARY MOE] FP4 enabled (max={FP4_MAX}, topk={topk})")
+            except Exception as e:
+                logger.warning(f"[TERNARY MOE] FP4 init failed: {e}")
+        else:
+            layer._fp4_moe_enabled = False
     else:
         layer._ternary_moe_v4_enabled = False
         layer._use_full_fusion = False
+        layer._fp4_moe_enabled = False
 
     layer._ternary_moe_enabled = True
     return True
