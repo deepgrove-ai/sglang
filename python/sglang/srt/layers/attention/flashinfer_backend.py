@@ -161,7 +161,9 @@ class FlashInferAttnBackend(AttentionBackend):
             or "Qwen3ForCausalLM" in model_runner.model_config.hf_config.architectures
             or "MiMoForCausalLM" in model_runner.model_config.hf_config.architectures
         ):
-            envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.set(512 * 1024 * 1024)
+            # Respect explicit user override via env var / launch script.
+            if not envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.is_set():
+                envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.set(512 * 1024 * 1024)
 
         # When deterministic inference is enabled, tensor cores should be used for decode
         # Also set split tile sizes for prefill and decode from environment variables, and disable kv split for cuda graph
@@ -172,16 +174,32 @@ class FlashInferAttnBackend(AttentionBackend):
         self.prefill_split_tile_size = None
         self.decode_split_tile_size = None
         self.disable_cuda_graph_kv_split = False
-        if self.enable_deterministic:
-            self.decode_use_tensor_cores = True
+
+        # Allow tuning split tile sizes via env vars even when deterministic inference is disabled.
+        # This is especially useful for FP8 KV cache performance experiments.
+        if os.getenv("SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE") is not None:
             self.prefill_split_tile_size = get_int_env_var(
                 "SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE", 4096
             )
+        if os.getenv("SGLANG_FLASHINFER_DECODE_SPLIT_TILE_SIZE") is not None:
             self.decode_split_tile_size = get_int_env_var(
                 "SGLANG_FLASHINFER_DECODE_SPLIT_TILE_SIZE", 2048
             )
+
+        if self.enable_deterministic:
+            self.decode_use_tensor_cores = True
+            if self.prefill_split_tile_size is None:
+                self.prefill_split_tile_size = get_int_env_var(
+                    "SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE", 4096
+                )
+            if self.decode_split_tile_size is None:
+                self.decode_split_tile_size = get_int_env_var(
+                    "SGLANG_FLASHINFER_DECODE_SPLIT_TILE_SIZE", 2048
+                )
             self.disable_cuda_graph_kv_split = True
-            envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.set(2048 * 1024 * 1024)
+            # Deterministic mode prefers a larger workspace, but don't stomp on user overrides.
+            if not envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.is_set():
+                envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.set(2048 * 1024 * 1024)
 
         # Allocate buffers
         global global_workspace_buffer
@@ -229,9 +247,19 @@ class FlashInferAttnBackend(AttentionBackend):
                 for _ in range(self.num_wrappers)
             ]
 
-        fmha_backend = "auto"
-        if is_sm100_supported():
-            fmha_backend = "cutlass"
+        # NOTE: FlashInfer 0.4.x batch prefill wrappers accept backend strings:
+        #   - "auto" (default; resolves to "fa2"/"fa3")
+        #   - "fa2"
+        #   - "fa3"
+        #   - "trtllm-gen" (only if TRTLLM-GEN kernels exist for the model config)
+        # Passing "cutlass" here is invalid and will crash at runtime (Invalid backend: cutlass).
+        fmha_backend = os.getenv("SGLANG_FLASHINFER_RAGGED_PREFILL_BACKEND", "auto")
+        if fmha_backend not in ("auto", "fa2", "fa3", "trtllm-gen"):
+            logger.warning(
+                f"Invalid SGLANG_FLASHINFER_RAGGED_PREFILL_BACKEND={fmha_backend!r}; "
+                "falling back to 'auto'."
+            )
+            fmha_backend = "auto"
         self.prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
             self.workspace_buffer, "NHD", backend=fmha_backend
         )
@@ -241,13 +269,24 @@ class FlashInferAttnBackend(AttentionBackend):
         self.prefill_wrappers_paged = []
         self.prefill_wrappers_verify = []
         self.decode_wrappers = []
+        
+        self.paged_prefill_backend = os.getenv(
+            "SGLANG_FLASHINFER_PAGED_PREFILL_BACKEND", "auto"
+        )
+        if self.paged_prefill_backend not in ("auto", "fa2", "fa3", "trtllm-gen"):
+            logger.warning(
+                f"Invalid SGLANG_FLASHINFER_PAGED_PREFILL_BACKEND={self.paged_prefill_backend!r}; "
+                "falling back to 'auto'."
+            )
+            self.paged_prefill_backend = "auto"
+        
         for _ in range(self.num_wrappers):
             if not skip_prefill:
                 self.prefill_wrappers_paged.append(
                     BatchPrefillWithPagedKVCacheWrapper(
                         self.workspace_buffer,
                         "NHD",
-                        backend="fa2",
+                        backend=self.paged_prefill_backend,
                     )
                 )
                 self.prefill_wrappers_verify.append(
@@ -602,7 +641,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     BatchPrefillWithPagedKVCacheWrapper(
                         self.workspace_buffer,
                         "NHD",
-                        backend="fa2",
+                        backend=self.paged_prefill_backend,
                         use_cuda_graph=True,
                         qo_indptr_buf=self.cuda_graph_qo_indptr[i][: bs + 1],
                         paged_kv_indptr_buf=self.kv_indptr[i][: bs + 1],

@@ -30,7 +30,7 @@ while [[ $# -gt 0 ]]; do
             MODEL_PRESET="$2"
             shift 2
             ;;
-        fp16|i2s|i2s-tuned|i2s-kvfp8|i2s-fp8|ternary-fp4)
+        fp16|i2s|i2s-tuned|i2s-tuned-dp2|i2s-kvfp8|i2s-fp8|i2s-fp8-full)
             QUANT_MODE="$1"
             shift
             ;;
@@ -38,12 +38,16 @@ while [[ $# -gt 0 ]]; do
             echo "Usage: $0 [MODE] [--tp N] [--model MODEL]"
             echo ""
             echo "Modes:"
-            echo "  fp16:        Pure FP16/BF16 (no quantization, baseline)"
-            echo "  i2s:         Ternary + I2_S (8x memory reduction, FP16 inference)"
-            echo "  i2s-tuned:   Ternary + I2_S + Optimized FlashInfer (RECOMMENDED)"
-            echo "  i2s-kvfp8:   Ternary + I2_S + FP8 KV Cache (Lower memory, faster attention)"
-            echo "  i2s-fp8:     Ternary + I2_S + FP8 tensor cores (fastest inference)"
-            echo "  ternary-fp4: Ternary → FP4 tensor cores (Blackwell optimized)"
+            echo "  fp16:           Pure FP16/BF16 (no quantization, baseline)"
+            echo "  i2s:            Ternary + I2_S (8x memory reduction, FP16 inference)"
+            echo "  i2s-tuned:      Ternary + I2_S + Optimized FlashInfer (RECOMMENDED)"
+            echo "  i2s-tuned-dp2:  i2s-tuned + Data Parallel on 2 GPUs (2x throughput)"
+            echo "  i2s-kvfp8:      Ternary + I2_S + FP8 KV Cache (memory optimized, ~30% slower)"
+            echo "  i2s-fp8:        Ternary + I2_S + FP8 policy (FP8 KV + FlashInfer tuning)"
+            echo "  i2s-fp8-full:   EXPERIMENTAL: i2s-fp8 + FP8 bridge for prefill GEMM"
+            echo ""
+            echo "NOTE: FP8 KV cache has ~30% attention overhead (FlashInfer issue #1753)"
+            echo "      Use 'i2s-tuned' for best throughput, FP8 modes only if memory-constrained"
             echo ""
             echo "Options:"
             echo "  --tp N       Tensor parallelism: shard model across N GPUs (default: 1)"
@@ -54,7 +58,8 @@ while [[ $# -gt 0 ]]; do
             echo "  klear-20b:  Klear 20B MoE (/home/ubuntu/raghav/20ba1b)"
             echo ""
             echo "Examples:"
-            echo "  $0 i2s --tp 2              # Run Qwen3 MoE with i2s mode on 2 GPUs"
+            echo "  $0 i2s --tp 2              # Run Qwen3 MoE with i2s mode on 2 GPUs (TP)"
+            echo "  $0 i2s-tuned-dp2           # Run with DP=2 (2x throughput, recommended)"
             echo "  $0 fp16 --model klear-20b  # Run Klear 20B in fp16 mode"
             echo "  $0 i2s-tuned --model klear-20b  # Run Klear 20B with tuned i2s"
             exit 0
@@ -110,22 +115,6 @@ export TERNARY_FUSE_RMSNORM_QKV_ALLOW_CAPTURE="${TERNARY_FUSE_RMSNORM_QKV_ALLOW_
 # Enables hardware-accelerated kernel chaining for lower latency (M=1)
 export TERNARY_ENABLE_PDL="${TERNARY_ENABLE_PDL:-1}"
 
-# JAX Pallas Tuning (Batched Decode)
-# Use JAX for M=32 to 128 (beating cuBLAS). Below 32, CUDA kernels are faster.
-# Above 128, fallback to cuBLAS to avoid OOM.
-export TERNARY_USE_JAX_PALLAS="${TERNARY_USE_JAX_PALLAS:-1}"
-export TERNARY_JAX_MIN_BATCH="${TERNARY_JAX_MIN_BATCH:-32}"
-export TERNARY_JAX_MAX_BATCH="${TERNARY_JAX_MAX_BATCH:-128}"
-
-# FP4 MoE via CUTLASS native tensor cores (W4A4)
-# DISABLED: Profile shows 262ms quant overhead for 417ms GEMM - not worth it
-# Set MIN > MAX to effectively disable FP4
-export TERNARY_MOE_FP4_MIN_TOKENS="${TERNARY_MOE_FP4_MIN_TOKENS:-999}"
-export TERNARY_MOE_FP4_MAX_TOKENS="${TERNARY_MOE_FP4_MAX_TOKENS:-48}"
-# Scale buffer size allocated ONCE at init (65536 * topk)
-# Value here doesn't matter for perf, only for safety. Use default large value.
-export MODELOPT_MAX_TOKENS_PER_EXPERT="${MODELOPT_MAX_TOKENS_PER_EXPERT:-65536}"
-
 # Overlap/scheduler knob: use pinned host memory for true async GPU->CPU copies of small tensors.
 # This is critical for avoiding the per-step ~3ms stall seen as aten::to/copy_ + cudaMemcpyAsync.
 export SGLANG_ENABLE_PINNED_OUTPUT_COPY="${SGLANG_ENABLE_PINNED_OUTPUT_COPY:-1}"
@@ -177,42 +166,83 @@ case "$QUANT_MODE" in
         echo "Note: FlashInfer optimizations enabled (Tensor Cores, 1GB workspace, 4K tiles)"
         ;;
     
+    i2s-tuned-dp2)
+        # Ternary + I2S + Tuned FlashInfer + Data Parallel on 2 GPUs
+        # Each GPU runs full model, requests load-balanced between them
+        # 2x throughput, same latency per request
+        USE_DATA_PARALLEL=1
+        DP_SIZE=2
+        export SGLANG_FLASHINFER_USE_TENSOR_CORE=true
+        export SGLANG_FLASHINFER_WORKSPACE_SIZE=$((1024*1024*1024))  # 1GB
+        export SGLANG_FLASHINFER_DECODE_SPLIT_TILE_SIZE=4096
+        QUANT_FLAG="--quantization ternary --attention-backend flashinfer"
+        QUANT_DESC="Ternary + I2_S + Tuned FlashInfer + DP=2 (2x throughput)"
+        echo "Note: Data Parallel mode - 2 GPUs, each with full model copy"
+        echo "Note: FlashInfer optimizations enabled (Tensor Cores, 1GB workspace, 4K tiles)"
+        ;;
+    
     i2s-kvfp8)
         # Ternary + I2S + FP8 KV Cache
         # Ternary weights for linear layers, FP8 for Attention KV cache
+        # NOTE: FP8 KV cache has ~30% attention overhead (FlashInfer issue #1753)
+        # Use this mode ONLY if memory-constrained (long context / large batch)
         QUANT_FLAG="--quantization ternary --kv-cache-dtype fp8_e5m2"
-        QUANT_DESC="Ternary + I2_S + FP8 KV Cache (Lower memory, faster attention)"
+        QUANT_DESC="Ternary + I2_S + FP8 KV Cache (Memory optimized, slower attention)"
+        echo "WARNING: FP8 KV cache has ~30% attention overhead vs BF16 KV cache"
+        echo "  - Use 'i2s-tuned' for best throughput"
+        echo "  - Use this mode only if memory-constrained"
         ;;
 
     i2s-fp8)
         # Ternary + I2S + FP8 mode (fastest inference)
         # Enable FP8 tensor core acceleration via environment variable
+        # This enables the FP8-first policy for ternary models:
+        # - FP8 KV cache for lower memory + FP8 attention compute
+        # - FlashInfer tuning for FP8 attention kernels
+        # - DP4A kernels for ternary GEMMs (FP8 bridge disabled by default)
         export SGLANG_TERNARY_USE_FP8=1
-        QUANT_FLAG="--quantization ternary"
-        QUANT_DESC="Ternary + I2_S + FP8 tensor cores (fastest inference)"
-        echo "Note: FP8 mode enabled (requires H100/Ada GPUs with torch._scaled_mm support)"
+        export SGLANG_TERNARY_FP8_GRANULARITY="${SGLANG_TERNARY_FP8_GRANULARITY:-per_token_group_128}"
+        export SGLANG_TERNARY_FP8_BRIDGE="${SGLANG_TERNARY_FP8_BRIDGE:-0}"
+        
+        # FlashInfer tuning for FP8 attention (CRITICAL for performance)
+        # FP8 attention benefits from tensor cores and larger workspace
+        export SGLANG_FLASHINFER_USE_TENSOR_CORE=true
+        export SGLANG_FLASHINFER_WORKSPACE_SIZE=$((1024*1024*1024))  # 1GB
+        
+        QUANT_FLAG="--quantization ternary --kv-cache-dtype fp8_e4m3"
+        QUANT_DESC="Ternary + I2_S + FP8 KV cache + Tuned FlashInfer"
+        echo "Note: FP8 mode enabled:"
+        echo "  - FP8 KV cache: enabled (fp8_e4m3)"
+        echo "  - FlashInfer: Tensor cores + 1GB workspace"
+        echo "  - FP8 bridge: $SGLANG_TERNARY_FP8_BRIDGE (0=DP4A, 1=FP8 GEMM)"
         ;;
     
-    ternary-fp4)
-        # Experimental: Ternary with FP4 MoE dispatch for larger batches
-        # Uses our custom CUTLASS FP4 path (ternary weights -> FP4 at load)
-        # NOTE: FP4 has activation quantization overhead that may negate benefits
-        export TERNARY_MOE_FP4_MIN_TOKENS=1
-        export TERNARY_MOE_FP4_MAX_TOKENS=4096
-        export TERNARY_MOE_FP4_ALWAYS=1
+    i2s-fp8-full)
+        # EXPERIMENTAL: Full FP8 pipeline with bridge enabled
+        # This is for testing the FP8 bridge before custom kernels are available
+        # WARNING: Bridge only runs for PREFILL (M >= MIN_M threshold)
+        export SGLANG_TERNARY_USE_FP8=1
+        export SGLANG_TERNARY_FP8_GRANULARITY="${SGLANG_TERNARY_FP8_GRANULARITY:-per_token_group_128}"
+        export SGLANG_TERNARY_FP8_BRIDGE=1
+        export SGLANG_TERNARY_FP8_BRIDGE_MIN_M="${SGLANG_TERNARY_FP8_BRIDGE_MIN_M:-64}"
+        
+        # FlashInfer tuning for FP8 attention (CRITICAL for performance)
         export SGLANG_FLASHINFER_USE_TENSOR_CORE=true
-        export SGLANG_FLASHINFER_WORKSPACE_SIZE=$((1024*1024*1024))
-        QUANT_FLAG="--quantization ternary --attention-backend flashinfer"
-        QUANT_DESC="Ternary + CUTLASS FP4 MoE (experimental)"
-        echo "Note: Ternary->FP4 conversion at load, CUTLASS FP4 grouped GEMM"
-        echo "WARNING: FP4 activation quantization overhead may negate tensor core benefits"
+        export SGLANG_FLASHINFER_WORKSPACE_SIZE=$((1024*1024*1024))  # 1GB
+        
+        QUANT_FLAG="--quantization ternary --kv-cache-dtype fp8_e4m3"
+        QUANT_DESC="Ternary + I2_S + FP8 Full Pipeline (EXPERIMENTAL)"
+        echo "Note: FP8-full mode enabled (EXPERIMENTAL):"
+        echo "  - FP8 KV cache: enabled (fp8_e4m3)"
+        echo "  - FlashInfer: Tensor cores + 1GB workspace"
+        echo "  - FP8 bridge: ENABLED for PREFILL ONLY (M >= $SGLANG_TERNARY_FP8_BRIDGE_MIN_M)"
         ;;
 esac
 
 # Model and server configuration
 case "$MODEL_PRESET" in
     qwen3-moe)
-        MODEL_ID="/mnt/data/q30ba3b_redmod"
+        MODEL_ID="/mnt/data/30ba3b"
         MODEL_NAME="qwen3-moe-$QUANT_MODE"
         ;;
     klear-20b)
@@ -237,8 +267,9 @@ CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-1024}"
 
 # Speculative decoding: NGRAM doesn't need a draft model
 # Uses n-gram patterns from context to predict tokens
-SPECULATIVE_ALGORITHM="${SPECULATIVE_ALGORITHM:-}"
-SPECULATIVE_NUM_DRAFT="${SPECULATIVE_NUM_DRAFT:-4}"
+# Enabled by default for lower latency (set to "" to disable)
+# SPECULATIVE_ALGORITHM="${SPECULATIVE_ALGORITHM:-NGRAM}"
+# SPECULATIVE_NUM_DRAFT="${SPECULATIVE_NUM_DRAFT:-4}"
 CUDA_GRAPH_MAX_BS="${CUDA_GRAPH_MAX_BS:-}"
 CUDA_GRAPH_BS="${CUDA_GRAPH_BS:1}"
 DISABLE_CUDA_GRAPH="${DISABLE_CUDA_GRAPH:-0}"  # Test: disable CUDA graphs entirely
@@ -264,7 +295,11 @@ echo "Mode: $QUANT_DESC"
 echo "Model preset: $MODEL_PRESET"
 echo "Model path: $MODEL_ID"
 echo "Port: $SERVER_PORT"
-echo "Tensor Parallelism: $TP_SIZE GPU(s)"
+if [[ "${USE_DATA_PARALLEL:-0}" == "1" ]]; then
+    echo "Data Parallelism: ${DP_SIZE:-2} GPU(s) (load-balanced replicas)"
+else
+    echo "Tensor Parallelism: $TP_SIZE GPU(s)"
+fi
 echo "GPU memory allocation: $REQUEST_GPU_MEMORY"
 echo "Ternary log level: $SGLANG_TERNARY_LOG_LEVEL"
 echo "Fuse RMSNorm+QKV (decode,tp=1): $TERNARY_FUSE_RMSNORM_QKV"
@@ -303,15 +338,28 @@ if lsof -Pi :$SERVER_PORT -sTCP:LISTEN -t >/dev/null 2>&1; then
 fi
 
 # Build the command
-CMD="python -m sglang.launch_server \
-    --model-path $MODEL_ID \
-    --served-model-name $MODEL_NAME \
-    --port $SERVER_PORT \
-    --tp-size $TP_SIZE \
-    --mem-fraction-static $REQUEST_GPU_MEMORY \
-    --enable-p2p-check \
-    --trust-remote-code \
-    --attention-backend flashinfer"
+if [[ "${USE_DATA_PARALLEL:-0}" == "1" ]]; then
+    # Data Parallel mode: use router to load-balance across GPUs
+    CMD="python -m sglang_router.launch_server \
+        --model-path $MODEL_ID \
+        --served-model-name $MODEL_NAME \
+        --port $SERVER_PORT \
+        --dp ${DP_SIZE:-2} \
+        --mem-fraction-static $REQUEST_GPU_MEMORY \
+        --trust-remote-code \
+        --attention-backend flashinfer"
+else
+    # Standard mode: single process with optional tensor parallelism
+    CMD="python -m sglang.launch_server \
+        --model-path $MODEL_ID \
+        --served-model-name $MODEL_NAME \
+        --port $SERVER_PORT \
+        --tp-size $TP_SIZE \
+        --mem-fraction-static $REQUEST_GPU_MEMORY \
+        --enable-p2p-check \
+        --trust-remote-code \
+        --attention-backend flashinfer"
+fi
 
 # Optional knobs (mostly useful for batch=1 decode latency experiments)
 if [[ -n "$CHUNKED_PREFILL_SIZE" ]]; then

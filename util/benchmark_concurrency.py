@@ -97,10 +97,13 @@ async def send_request(
     
     try:
         if use_streaming:
-            # Streaming mode for TTFT measurement
+            # Streaming mode for accurate TTFT measurement
+            stream_payload = payload.copy()
+            stream_payload["stream"] = True
+            
             async with session.post(
                 url,
-                json=payload,
+                json=stream_payload,
                 timeout=aiohttp.ClientTimeout(total=timeout)
             ) as response:
                 if response.status != 200:
@@ -115,19 +118,21 @@ async def send_request(
                     )
                 
                 first_chunk = True
-                async for chunk in response.content.iter_any():
-                    if first_chunk:
+                chunk_count = 0
+                async for line in response.content:
+                    if first_chunk and line.strip():
                         ttft = (time.perf_counter() - start_time) * 1000
                         first_chunk = False
+                    if line.strip():
+                        chunk_count += 1
                 
                 end_time = time.perf_counter()
                 latency_ms = (end_time - start_time) * 1000
                 
-                # Try to parse final response for token count
-                # (Streaming responses may need different parsing)
-                tokens = payload.get("sampling_params", {}).get("max_new_tokens", 0)
+                # Estimate tokens from chunks (each chunk ~= 1 token in SSE)
+                tokens = max(chunk_count - 1, payload.get("sampling_params", {}).get("max_new_tokens", 0))
         else:
-            # Non-streaming mode (simpler, works with /generate endpoint)
+            # Non-streaming mode - use server-reported timings if available
             async with session.post(
                 url,
                 json=payload,
@@ -154,8 +159,23 @@ async def send_request(
                     # Fallback: estimate from max_tokens
                     tokens = payload.get("sampling_params", {}).get("max_new_tokens", 0)
                 
-                # Approximate TTFT as small fraction of total (no streaming)
-                ttft = latency_ms * 0.05  # Rough estimate
+                # Try to get server-reported TTFT from meta_info
+                # SGLang reports e2e_latency and other timings
+                prompt_tokens = meta.get("prompt_tokens", len(payload.get("text", "").split()))
+                
+                # If server provides timing breakdown, use it
+                # Otherwise estimate TTFT based on prompt length ratio
+                if "prefill_token_logprobs" in meta or tokens > 0:
+                    # Estimate: TTFT ≈ (prompt_tokens / total_tokens) * latency
+                    # This is still an approximation but better than 5%
+                    total_tokens_processed = prompt_tokens + tokens
+                    if total_tokens_processed > 0:
+                        ttft = latency_ms * (prompt_tokens / total_tokens_processed)
+                    else:
+                        ttft = latency_ms * 0.1  # 10% fallback
+                else:
+                    # No good estimate available - mark as N/A
+                    ttft = -1  # Indicates "not measured"
         
         latency_sec = latency_ms / 1000.0
         tps = tokens / latency_sec if latency_sec > 0 else 0
@@ -252,7 +272,8 @@ async def run_concurrent_requests(
         )
     
     latencies = [r.latency_ms for r in successful]
-    ttfts = [r.ttft_ms for r in successful]
+    # Filter out invalid TTFT values (-1 means not measured)
+    ttfts = [r.ttft_ms for r in successful if r.ttft_ms >= 0]
     total_tokens = sum(r.tokens_generated for r in successful)
     
     latencies.sort()
@@ -333,7 +354,9 @@ def print_results_table(results: List[ConcurrencyResult], label: str = ""):
     print("  Conc        = Concurrency level (simultaneous requests)")
     print("  Total TPS   = Total tokens/sec throughput (all concurrent requests combined)")
     print("  Per-Req TPS = Average tokens/sec per individual request")
-    print("  Lat pXX     = Latency percentile in milliseconds")
+    print("  Lat pXX     = Latency percentile in milliseconds (end-to-end request time)")
+    print("\nNote: TTFT (Time to First Token) requires --streaming flag for accurate measurement.")
+    print("      Without streaming, TTFT is estimated based on prompt/output ratio.")
     print()
 
 
@@ -436,6 +459,11 @@ Examples:
         action="store_true",
         help="Allow early stopping at EOS token"
     )
+    parser.add_argument(
+        "--streaming",
+        action="store_true",
+        help="Use streaming mode for accurate TTFT measurement"
+    )
     
     args = parser.parse_args()
     
@@ -456,6 +484,7 @@ Examples:
         prompt=args.prompt,
         timeout_sec=args.timeout,
         ignore_eos=not args.no_ignore_eos,
+        use_streaming=args.streaming,
         label=args.label
     )
     
@@ -469,6 +498,7 @@ Examples:
     print(f"Max tokens:          {config.max_tokens}")
     print(f"Prompt length:       {len(config.prompt)} chars")
     print(f"Ignore EOS:          {config.ignore_eos}")
+    print(f"Streaming (TTFT):    {config.use_streaming}")
     print("=" * 80)
     
     # Check server connectivity

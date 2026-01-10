@@ -4,6 +4,11 @@
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# Activate the virtual environment
+if [ -f "$SCRIPT_DIR/.venv/bin/activate" ]; then
+    source "$SCRIPT_DIR/.venv/bin/activate"
+fi
+
 # Add sglang to Python path (development mode)
 export PYTHONPATH="$SCRIPT_DIR/python:${PYTHONPATH:-}"
 

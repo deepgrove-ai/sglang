@@ -27,6 +27,7 @@
 #   --warmup N            Warmup requests (default: 5)
 #   --timeout SECS        Request timeout (default: 120)
 #   --no-ignore-eos       Allow early stopping at EOS token
+#   --streaming           Use streaming for accurate TTFT measurement
 #
 # Examples:
 #   # Quick sanity check
@@ -95,6 +96,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --no-ignore-eos)
             EXTRA_ARGS="$EXTRA_ARGS --no-ignore-eos"
+            shift
+            ;;
+        --streaming)
+            EXTRA_ARGS="$EXTRA_ARGS --streaming"
             shift
             ;;
         -h|--help)

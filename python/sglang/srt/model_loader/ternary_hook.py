@@ -15,7 +15,7 @@ import os
 import re
 import tempfile
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
 
@@ -602,17 +602,42 @@ def apply_ternary_quantization(
     # Default to i2s storage mode (can override with TERNARY_STORAGE_MODE env var if needed)
     storage_mode = os.environ.get("TERNARY_STORAGE_MODE", "i2s")
     
+    # FP8 mode: read from SGLANG_TERNARY_USE_FP8 env var
+    # When enabled, uses FP8 tensor cores and FP8 hidden state storage
+    use_fp8 = _bool_env("SGLANG_TERNARY_USE_FP8", default=False)
+    
+    # FP8 hidden state scale granularity (default: per_token_group_128 for SM100)
+    fp8_granularity = os.environ.get(
+        "SGLANG_TERNARY_FP8_GRANULARITY", "per_token_group_128"
+    )
     
     cfg = TernaryConfig(
         threshold_scale=th,
-        storage_mode=storage_mode
+        storage_mode=storage_mode,
+        use_fp8=use_fp8,
+        fp8_hidden_scale_granularity=fp8_granularity,
     )
     
-    if verbose or storage_mode == "fp16":
+    if verbose or storage_mode == "fp16" or use_fp8:
         logger.info(
             f"TernaryConfig: threshold_scale={th}, "
-            f"storage_mode={storage_mode}"
+            f"storage_mode={storage_mode}, "
+            f"use_fp8={use_fp8}"
         )
+    
+    if use_fp8:
+        logger.info(
+            f"[TERNARY FP8] FP8-first mode enabled via SGLANG_TERNARY_USE_FP8=1\n"
+            f"  - FP8 hidden state storage: {fp8_granularity}\n"
+            f"  - FP8 tensor core compute for ternary GEMMs\n"
+            f"  - Recommend: --kv-cache-dtype fp8_e4m3 for full FP8 pipeline"
+        )
+        # Log comprehensive FP8 status
+        try:
+            from sglang.srt.layers.quantization.ternary import log_fp8_status_summary
+            log_fp8_status_summary(cfg)
+        except ImportError:
+            pass
 
     cache_root = _get_cache_root(
         cache_dir=cache_dir,
@@ -766,6 +791,10 @@ def apply_ternary_quantization(
             f"Ternary hook: attached {applied} methods; post-quantized {quantized} modules."
         )
     
+    # Store the ternary config on the model for later access (e.g., KV cache validation)
+    model._ternary_config = cfg
+    model._ternary_use_fp8 = use_fp8
+    
     # Force garbage collection and clear CUDA cache after all quantization
     import gc
     gc.collect()
@@ -777,5 +806,280 @@ def apply_ternary_quantization(
     return model
 
 
+def get_ternary_config(model: torch.nn.Module):
+    """
+    Get the TernaryConfig from a model if it was applied via ternary quantization.
+    
+    Returns:
+        TernaryConfig if ternary quantization was applied, None otherwise
+    """
+    return getattr(model, "_ternary_config", None)
+
+
+def is_ternary_fp8_enabled(model: torch.nn.Module) -> bool:
+    """
+    Check if FP8-first mode is enabled for a ternary-quantized model.
+    
+    This can be used by ModelRunner or attention backends to validate
+    that FP8 KV cache is being used when FP8-first mode is enabled.
+    
+    Returns:
+        True if FP8-first mode is enabled, False otherwise
+    """
+    return getattr(model, "_ternary_use_fp8", False)
+
+
+def validate_ternary_fp8_kv_cache(model: torch.nn.Module, kv_cache_dtype: torch.dtype) -> None:
+    """
+    Validate that FP8 KV cache is used when FP8-first ternary mode is enabled.
+    
+    Logs a warning if FP8-first is enabled but KV cache is not FP8.
+    
+    Args:
+        model: The model with ternary quantization applied
+        kv_cache_dtype: The actual KV cache dtype being used
+    """
+    if not is_ternary_fp8_enabled(model):
+        return
+    
+    fp8_kv_dtypes = (
+        torch.float8_e4m3fn,
+        torch.float8_e5m2,
+    )
+    # Also check for ROCm variants
+    try:
+        fp8_kv_dtypes = fp8_kv_dtypes + (
+            torch.float8_e4m3fnuz,
+            torch.float8_e5m2fnuz,
+        )
+    except AttributeError:
+        pass
+    
+    if kv_cache_dtype not in fp8_kv_dtypes:
+        logger.warning(
+            f"[TERNARY FP8] FP8-first mode is enabled but KV cache is using {kv_cache_dtype}.\n"
+            f"  For optimal performance, use --kv-cache-dtype fp8_e4m3 or fp8_e5m2.\n"
+            f"  This avoids FP8<->BF16 conversions at attention boundaries."
+        )
+
+
+# ============================================================================
+# FP8 HIDDEN STATE STORAGE INFRASTRUCTURE
+# ============================================================================
+# These functions provide the building blocks for FP8 hidden state storage
+# between transformer layers. The actual insertion of quant/dequant ops
+# into the model forward pass is done separately.
+
+class FP8HiddenStateManager:
+    """
+    Manager for FP8 hidden state storage between transformer layers.
+    
+    This class provides:
+    1. Pre-allocated buffers for FP8 hidden states and scales (CUDA graph compatible)
+    2. Methods to quantize/dequantize hidden states to/from FP8
+    3. Configuration for scale granularity (per-token or per-token-group)
+    
+    Usage:
+        manager = FP8HiddenStateManager(hidden_size=2048, max_tokens=4096)
+        manager.allocate_buffers(device)
+        
+        # In model forward:
+        hidden_fp8, scale = manager.quantize_hidden(hidden_bf16)
+        # ... pass through layers ...
+        hidden_bf16 = manager.dequantize_hidden(hidden_fp8, scale)
+    """
+    
+    def __init__(
+        self,
+        hidden_size: int,
+        max_tokens: int = 4096,
+        scale_granularity: str = "per_token_group_128",
+        device: torch.device = None,
+    ):
+        self.hidden_size = hidden_size
+        self.max_tokens = max_tokens
+        self.scale_granularity = scale_granularity
+        self.device = device
+        
+        # Determine group size from granularity
+        if scale_granularity == "per_token":
+            self.group_size = hidden_size  # One scale per token
+        elif scale_granularity == "per_token_group_128":
+            self.group_size = 128
+        else:
+            self.group_size = 128  # Default
+        
+        # Pre-allocated buffers (None until allocate_buffers is called)
+        self._hidden_fp8_buffer = None
+        self._scale_buffer = None
+        self._buffers_allocated = False
+        
+        # Track FP8 dtype
+        self.fp8_dtype = torch.float8_e4m3fn
+    
+    def allocate_buffers(self, device: torch.device = None) -> None:
+        """
+        Pre-allocate buffers for FP8 hidden states and scales.
+        
+        Call this during model initialization to ensure buffers are available
+        during CUDA graph capture.
+        """
+        if device is not None:
+            self.device = device
+        
+        if self.device is None:
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        # Allocate FP8 hidden state buffer
+        self._hidden_fp8_buffer = torch.empty(
+            self.max_tokens, self.hidden_size,
+            device=self.device, dtype=self.fp8_dtype
+        )
+        
+        # Allocate scale buffer
+        num_groups = (self.hidden_size + self.group_size - 1) // self.group_size
+        self._scale_buffer = torch.empty(
+            self.max_tokens, num_groups,
+            device=self.device, dtype=torch.float32
+        )
+        
+        self._buffers_allocated = True
+        logger.debug(
+            f"[FP8 Hidden] Allocated buffers: "
+            f"hidden={self._hidden_fp8_buffer.shape}, "
+            f"scale={self._scale_buffer.shape}"
+        )
+    
+    def quantize_hidden(
+        self,
+        hidden: torch.Tensor,
+        use_preallocated: bool = True,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Quantize hidden states from BF16/FP16 to FP8.
+        
+        Args:
+            hidden: Input tensor of shape (num_tokens, hidden_size)
+            use_preallocated: If True, use pre-allocated buffers
+        
+        Returns:
+            (hidden_fp8, scale): FP8 hidden states and scales
+        """
+        try:
+            from sglang.srt.layers.quantization.fp8_kernel import (
+                per_token_group_quant_fp8,
+            )
+        except ImportError:
+            # Fallback to simple quantization
+            return self._quantize_simple(hidden)
+        
+        num_tokens = hidden.shape[0]
+        
+        if use_preallocated and self._buffers_allocated and num_tokens <= self.max_tokens:
+            # Use pre-allocated buffers
+            hidden_fp8 = self._hidden_fp8_buffer[:num_tokens].view_as(hidden)
+            scale = self._scale_buffer[:num_tokens]
+            
+            # Use sgl_kernel quant if available
+            hidden_fp8_new, scale_new = per_token_group_quant_fp8(
+                hidden.contiguous(), self.group_size
+            )
+            hidden_fp8.copy_(hidden_fp8_new)
+            scale[:, :scale_new.shape[1]].copy_(scale_new)
+            
+            return hidden_fp8, scale[:, :scale_new.shape[1]]
+        else:
+            # Allocate new buffers
+            return per_token_group_quant_fp8(hidden.contiguous(), self.group_size)
+    
+    def dequantize_hidden(
+        self,
+        hidden_fp8: torch.Tensor,
+        scale: torch.Tensor,
+        output_dtype: torch.dtype = torch.bfloat16,
+    ) -> torch.Tensor:
+        """
+        Dequantize hidden states from FP8 to BF16/FP16.
+        
+        Args:
+            hidden_fp8: FP8 hidden states of shape (num_tokens, hidden_size)
+            scale: Scale factors of shape (num_tokens, num_groups)
+            output_dtype: Output dtype (bfloat16 or float16)
+        
+        Returns:
+            Dequantized hidden states in output_dtype
+        """
+        # Expand scale to match hidden dimensions
+        num_tokens, hidden_size = hidden_fp8.shape
+        num_groups = scale.shape[1]
+        group_size = hidden_size // num_groups
+        
+        # Repeat scale for each element in group
+        scale_expanded = scale.repeat_interleave(group_size, dim=1)
+        if scale_expanded.shape[1] > hidden_size:
+            scale_expanded = scale_expanded[:, :hidden_size]
+        
+        # Dequantize: hidden_bf16 = hidden_fp8 * scale
+        hidden_dequant = hidden_fp8.to(torch.float32) * scale_expanded
+        
+        return hidden_dequant.to(output_dtype)
+    
+    def _quantize_simple(
+        self,
+        hidden: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Simple fallback quantization without sgl_kernel."""
+        FP8_MAX = 448.0
+        
+        # Per-token quantization
+        hidden_f32 = hidden.to(torch.float32)
+        abs_max = hidden_f32.abs().amax(dim=1, keepdim=True)
+        scale = (abs_max / FP8_MAX).clamp(min=1e-12)
+        
+        hidden_scaled = hidden_f32 / scale
+        hidden_fp8 = hidden_scaled.clamp(-FP8_MAX, FP8_MAX).to(self.fp8_dtype)
+        
+        return hidden_fp8, scale
+
+
+def setup_fp8_hidden_manager(
+    model: torch.nn.Module,
+    hidden_size: int,
+    max_tokens: int = 4096,
+    device: torch.device = None,
+) -> None:
+    """
+    Setup FP8 hidden state manager on a model.
+    
+    This should be called after model loading to prepare for FP8 hidden state storage.
+    
+    Args:
+        model: The model to attach the manager to
+        hidden_size: Hidden dimension size
+        max_tokens: Maximum number of tokens to support
+        device: Device to allocate buffers on
+    """
+    config = get_ternary_config(model)
+    if config is None or not config.use_fp8:
+        return
+    
+    manager = FP8HiddenStateManager(
+        hidden_size=hidden_size,
+        max_tokens=max_tokens,
+        scale_granularity=config.fp8_hidden_scale_granularity,
+        device=device,
+    )
+    manager.allocate_buffers(device)
+    
+    model._fp8_hidden_manager = manager
+    logger.info(
+        f"[FP8 Hidden] Manager attached: hidden_size={hidden_size}, "
+        f"max_tokens={max_tokens}, granularity={config.fp8_hidden_scale_granularity}"
+    )
+
+
+def get_fp8_hidden_manager(model: torch.nn.Module) -> FP8HiddenStateManager:
+    """Get the FP8 hidden state manager from a model, if attached."""
+    return getattr(model, "_fp8_hidden_manager", None)
 
 
