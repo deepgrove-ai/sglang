@@ -22,7 +22,8 @@ def main() -> int:
     parser.add_argument("--port", type=int, default=int(os.environ.get("SGLANG_PORT", "30080")))
     parser.add_argument("-c", "--concurrency", type=int, default=4, help="Number of concurrent requests")
     parser.add_argument("-r", "--requests", type=int, default=20, help="Total number of requests to send")
-    parser.add_argument("--out-dir", default=os.environ.get("SGLANG_PROFILE_OUT_DIR", "/tmp/long_profile"))
+    # Default to /mnt/data for much larger space (override with env/flag as needed).
+    parser.add_argument("--out-dir", default=os.environ.get("SGLANG_PROFILE_OUT_DIR", "/mnt/data/long_profile"))
     parser.add_argument("--prompt", default="Write a very long story about optimization.")
     parser.add_argument("--max-new-tokens", type=int, default=512)
     parser.add_argument("--temperature", type=float, default=0.0)

@@ -23,6 +23,75 @@ logger = logging.getLogger(__name__)
 
 _TERNARY_CACHE_VERSION = "v1"
 
+# FP8 sticky quantization (BF16 -> FP8 + per-token scale) should be cheap.
+# The naive PyTorch implementation (abs/amax/div/clamp/cast) launches many kernels
+# and can dominate runtime. Use a fused Triton kernel when available.
+_FP8_STICKY_TRITON_QUANT_AVAILABLE = False
+_FP8_STICKY_SGL_KERNEL_QUANT_AVAILABLE = False
+_sgl_per_token_quant_fp8 = None
+try:
+    # Prefer the CUDA extension quantizer when available (fastest and capture-safe
+    # as long as outputs are preallocated).
+    from sgl_kernel import sgl_per_token_quant_fp8 as _sgl_per_token_quant_fp8  # type: ignore
+
+    _FP8_STICKY_SGL_KERNEL_QUANT_AVAILABLE = True
+except Exception:
+    _FP8_STICKY_SGL_KERNEL_QUANT_AVAILABLE = False
+
+try:
+    import triton  # type: ignore
+    import triton.language as tl  # type: ignore
+
+    _FP8_STICKY_TRITON_QUANT_AVAILABLE = True
+
+    @triton.jit
+    def _bf16_to_fp8_per_token_kernel(
+        x_ptr,
+        y_ptr,
+        s_ptr,
+        stride_xm: tl.constexpr,
+        stride_xk: tl.constexpr,
+        stride_ym: tl.constexpr,
+        stride_yk: tl.constexpr,
+        K: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+    ):
+        pid_m = tl.program_id(0)
+
+        # Pass 1: absmax over K
+        absmax = tl.zeros((), dtype=tl.float32)
+        for k0 in tl.static_range(0, K, BLOCK_K):
+            offs = k0 + tl.arange(0, BLOCK_K)
+            x = tl.load(
+                x_ptr + pid_m * stride_xm + offs * stride_xk,
+                mask=offs < K,
+                other=0.0,
+            ).to(tl.float32)
+            absmax = tl.maximum(absmax, tl.max(tl.abs(x), axis=0))
+
+        # FP8 E4M3 max value
+        fp8_max = 448.0
+        scale = tl.maximum(absmax / fp8_max, 1e-12)
+        tl.store(s_ptr + pid_m, scale)
+
+        # Pass 2: quantize + store FP8
+        for k0 in tl.static_range(0, K, BLOCK_K):
+            offs = k0 + tl.arange(0, BLOCK_K)
+            x = tl.load(
+                x_ptr + pid_m * stride_xm + offs * stride_xk,
+                mask=offs < K,
+                other=0.0,
+            ).to(tl.float32)
+            y = x / scale
+            y = tl.minimum(tl.maximum(y, -fp8_max), fp8_max)
+            tl.store(
+                y_ptr + pid_m * stride_ym + offs * stride_yk,
+                y.to(tl.float8e4nv),
+                mask=offs < K,
+            )
+except Exception:
+    _FP8_STICKY_TRITON_QUANT_AVAILABLE = False
+
 
 def _bool_env(name: str, default: bool = False) -> bool:
     v = os.environ.get(name)
@@ -413,11 +482,11 @@ def _try_load_moe_cache(
             BITNET_PACK_AVAILABLE,
         )
 
+        # MoE uses pack_i2s_weights from ternary.py, not BITNET_PACK_AVAILABLE
         use_v4 = (
-            BITNET_PACK_AVAILABLE
-            and BITNET_CUDA_AVAILABLE
+            BITNET_CUDA_AVAILABLE
             and BITNET_LIB is not None
-            and hasattr(BITNET_LIB, "ternary_moe_gemv_indexed_batched")
+            and hasattr(BITNET_LIB, "ternary_moe_megafused_gemv_indexed_shared_silu")
         )
     except Exception:
         use_v4 = False
@@ -479,12 +548,43 @@ def _try_load_moe_cache(
 
         layer._ternary_moe_v4_enabled = True
         
-        from sglang.srt.layers.quantization.ternary import _KERNEL_CAPS, _get_fp4_max_tokens
-        layer._use_full_fusion = (_KERNEL_CAPS is not None and _KERNEL_CAPS.get('has_megafused', False) 
-                                   and _KERNEL_CAPS.get('shared_silu', False) and _KERNEL_CAPS.get('has_any_combine', False))
+        # Setup ctypes pointers for decode fused path
+        import ctypes
+        _PTR = ctypes.c_void_p
+        _INT = ctypes.c_int
+        layer._ctypes_w13_packed = _PTR(layer._ternary_w13_packed.data_ptr())
+        layer._ctypes_w2_packed = _PTR(layer._ternary_w2_packed.data_ptr())
+        layer._ctypes_alpha_w13 = _PTR(layer._ternary_moe_alpha_w13.data_ptr())
+        layer._ctypes_alpha_w2 = _PTR(layer._ternary_moe_alpha_w2.data_ptr())
+        layer._ctypes_intermediate_buf = _PTR(layer._ternary_moe_intermediate_buf.data_ptr())
+        layer._ctypes_combined_buf = _PTR(layer._ternary_moe_combined_buf.data_ptr())
+        layer._ctypes_topk_weights_bf16 = _PTR(layer._ternary_moe_topk_weights_bf16.data_ptr()) if hasattr(layer, '_ternary_moe_topk_weights_bf16') else None
+        layer._ctypes_N_w13 = _INT(N_w13)
+        layer._ctypes_K_w13 = _INT(hidden_size)
+        layer._ctypes_N_w2 = _INT(hidden_size)
+        layer._ctypes_K_w2 = _INT(intermediate_size)
+        layer._ctypes_num_experts = _INT(num_experts)
         
-        # FP4 MoE init
-        FP4_MAX = _get_fp4_max_tokens()
+        # Pre-allocate topk weights buffer if not exists
+        if not hasattr(layer, '_ternary_moe_topk_weights_bf16'):
+            layer.register_buffer(
+                "_ternary_moe_topk_weights_bf16",
+                torch.empty(max_top_k, device=device, dtype=torch.bfloat16),
+                persistent=False,
+            )
+            layer._ctypes_topk_weights_bf16 = _PTR(layer._ternary_moe_topk_weights_bf16.data_ptr())
+        
+        from sglang.srt.layers.quantization.ternary import _KERNEL_CAPS
+        # Check for full fusion: need megafused shared+silu + combine kernel
+        layer._use_full_fusion = (
+            _KERNEL_CAPS is not None 
+            and _KERNEL_CAPS.get('moe_shared_silu', False) 
+            and (_KERNEL_CAPS.get('moe_combine_parallel', False) or _KERNEL_CAPS.get('moe_combine_bf16x2', False))
+        )
+        logger.info(f"[TERNARY MOE] V4 enabled, full_fusion={layer._use_full_fusion}")
+        
+        # FP4 MoE init (disabled in cleaned up version)
+        FP4_MAX = 0
         layer._fp4_moe_enabled = False
         if FP4_MAX > 0:
             try:
@@ -1083,3 +1183,393 @@ def get_fp8_hidden_manager(model: torch.nn.Module) -> FP8HiddenStateManager:
     return getattr(model, "_fp8_hidden_manager", None)
 
 
+# ============================================================================
+# FP8 STICKY HIDDEN STATE HELPERS
+# ============================================================================
+# These functions wrap decoder layer boundaries to keep hidden states in FP8
+# between layers, converting to BF16 only when needed for compute.
+
+def _get_fp8_sticky_mode() -> str:
+    """
+    Sticky FP8 hidden state mode.
+
+    Supported values:
+      - "0"/"false": disabled
+      - "1"/"true": force-enabled (will quantize at layer boundaries)
+      - "auto": enable only when it is net-beneficial (default)
+    """
+    v = os.environ.get("SGLANG_TERNARY_FP8_STICKY", "auto").strip().lower()
+    if v in ("0", "false", "off", "no"):
+        return "0"
+    if v in ("1", "true", "on", "yes"):
+        return "1"
+    return "auto"
+
+
+def _fp8_between_layers_is_effective() -> bool:
+    """
+    Returns True only when keeping hidden/residual in FP8 *between decoder layers*
+    avoids BF16 conversions inside the next layer.
+
+    For FP8 sticky to be beneficial, we need BOTH:
+    1. FP8 RMSNorm kernel - to consume FP8 hidden states at layer start
+    2. FP8 ternary kernels - to avoid dequant at every linear layer
+
+    Without both, FP8-between-layers adds conversion overhead without benefit.
+    """
+    # Check FP8 RMSNorm
+    fp8_rmsnorm_ok = False
+    try:
+        from sglang.srt.layers.fused_add_rmsnorm_fp8 import is_fp8_rmsnorm_available
+        fp8_rmsnorm_ok = is_fp8_rmsnorm_available()
+    except Exception:
+        pass
+    
+    if not fp8_rmsnorm_ok:
+        return False
+    
+    # Check FP8 ternary kernels
+    fp8_ternary_ok = False
+    try:
+        from sglang.srt.layers.quantization.ternary import BITNET_CUDA_FP8_MEGA_FUSED_AVAILABLE
+        fp8_ternary_ok = BITNET_CUDA_FP8_MEGA_FUSED_AVAILABLE
+    except Exception:
+        pass
+    
+    # For now, FP8 sticky is only effective if we have FP8 ternary kernels
+    # Without them, every linear layer does FP8→BF16→FP8 conversion
+    # TODO: When FP8 ternary kernels are available, this will return True
+    return fp8_ternary_ok
+
+
+_FP8_STICKY_MODE = _get_fp8_sticky_mode()
+_FP8_STICKY_ENABLED = _FP8_STICKY_MODE == "1" or (_FP8_STICKY_MODE == "auto" and _fp8_between_layers_is_effective())
+
+
+def maybe_dequant_fp8_hidden(
+    hidden_states: torch.Tensor,
+    output_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """
+    Dequantize FP8 hidden states to BF16 at layer entry if needed.
+    
+    If hidden_states is already BF16/FP16/FP32, returns it unchanged.
+    If hidden_states is FP8 with attached scale, dequantizes to output_dtype.
+    
+    This should be called at the START of a decoder layer forward().
+    """
+    if not _FP8_STICKY_ENABLED:
+        return hidden_states
+    
+    # Check if input is FP8
+    if hidden_states.dtype not in (torch.float8_e4m3fn, torch.float8_e5m2):
+        return hidden_states
+    
+    # Get attached scale
+    fp8_scale = getattr(hidden_states, '_fp8_scale', None)
+    
+    if fp8_scale is not None:
+        # Dequantize: hidden_bf16 = hidden_fp8 * scale
+        # Scale is per-token, shape [num_tokens] or [num_tokens, 1]
+        hidden_f32 = hidden_states.to(torch.float32)
+        
+        if fp8_scale.dim() == 1:
+            scale_expanded = fp8_scale.unsqueeze(-1)  # [num_tokens, 1]
+        else:
+            scale_expanded = fp8_scale
+        
+        hidden_dequant = hidden_f32 * scale_expanded
+        return hidden_dequant.to(output_dtype)
+    else:
+        # No scale attached, simple cast (lossy but better than crash)
+        logger.warning(
+            "[FP8 Sticky] FP8 hidden states without scale, falling back to simple cast"
+        )
+        return hidden_states.to(output_dtype)
+
+
+def maybe_quant_fp8_hidden(
+    hidden_states: torch.Tensor,
+    force_fp8: bool = False,
+    cache_owner: Optional[torch.nn.Module] = None,
+) -> torch.Tensor:
+    """
+    Quantize BF16 hidden states to FP8 at layer exit if FP8-first mode is active.
+    
+    If hidden_states is already FP8, returns it unchanged.
+    If FP8-first mode is disabled, returns hidden_states unchanged.
+    
+    This should be called at the END of a decoder layer forward().
+    
+    Args:
+        hidden_states: Output hidden states (typically BF16)
+        force_fp8: If True, always convert to FP8 (for explicit conversion points)
+    
+    Returns:
+        FP8 hidden states with _fp8_scale attached, or original if not converting
+    """
+    if not _FP8_STICKY_ENABLED and not force_fp8:
+        return hidden_states
+    
+    # Already FP8, return as-is
+    if hidden_states.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+        return hidden_states
+
+    # Fast path 1: sgl_kernel CUDA quant (fastest).
+    if _FP8_STICKY_SGL_KERNEL_QUANT_AVAILABLE and hidden_states.dtype == torch.bfloat16:
+        x2d = hidden_states.view(-1, hidden_states.shape[-1]).contiguous()
+        M, _K = x2d.shape
+
+        if cache_owner is not None:
+            # IMPORTANT: per-stream buffers.
+            # Under concurrency, multiple requests can execute on different CUDA streams.
+            # Reusing a single buffer on the shared module will cause races and corrupt
+            # FP8 hidden states / scales, which then manifests as garbage generations.
+            stream_id = int(torch.cuda.current_stream().cuda_stream)
+            stream_cache = getattr(cache_owner, "_fp8_sticky_stream_cache", None)
+            if stream_cache is None:
+                stream_cache = {}
+                setattr(cache_owner, "_fp8_sticky_stream_cache", stream_cache)
+            buf = stream_cache.get(stream_id)
+            if buf is None:
+                buf = {}
+                stream_cache[stream_id] = buf
+
+            y = buf.get("y")
+            s = buf.get("s")
+            if y is None or y.shape != x2d.shape or y.device != x2d.device:
+                y = torch.empty_like(x2d, dtype=torch.float8_e4m3fn)
+                buf["y"] = y
+            # sgl_kernel expects [M, 1]
+            if s is None or tuple(s.shape) != (M, 1) or s.device != x2d.device:
+                s = torch.empty((M, 1), device=x2d.device, dtype=torch.float32)
+                buf["s"] = s
+            if not getattr(cache_owner, "_fp8_sticky_quant_logged", False):
+                cache_owner._fp8_sticky_quant_logged = True
+                logger.info("[FP8 Sticky] Using sgl_kernel BF16->FP8 per-token quant")
+        else:
+            y = torch.empty_like(x2d, dtype=torch.float8_e4m3fn)
+            s = torch.empty((M, 1), device=x2d.device, dtype=torch.float32)
+
+        # Launch CUDA kernel
+        _sgl_per_token_quant_fp8(x2d, y, s)
+
+        out = y.view_as(hidden_states)
+        out._fp8_scale = s.view(-1)
+        return out
+
+    # Fast path 2: fused Triton kernel (compile once at import).
+    if _FP8_STICKY_TRITON_QUANT_AVAILABLE and hidden_states.dtype == torch.bfloat16:
+        x2d = hidden_states.view(-1, hidden_states.shape[-1]).contiguous()
+        M, K = x2d.shape
+
+        if cache_owner is not None:
+            # IMPORTANT: per-stream buffers (see sgl_kernel path above).
+            stream_id = int(torch.cuda.current_stream().cuda_stream)
+            stream_cache = getattr(cache_owner, "_fp8_sticky_stream_cache", None)
+            if stream_cache is None:
+                stream_cache = {}
+                setattr(cache_owner, "_fp8_sticky_stream_cache", stream_cache)
+            buf = stream_cache.get(stream_id)
+            if buf is None:
+                buf = {}
+                stream_cache[stream_id] = buf
+
+            y = buf.get("y")
+            s = buf.get("s_triton")
+            if y is None or y.shape != x2d.shape or y.device != x2d.device:
+                y = torch.empty_like(x2d, dtype=torch.float8_e4m3fn)
+                buf["y"] = y
+            if s is None or s.numel() != M or s.device != x2d.device:
+                s = torch.empty((M,), device=x2d.device, dtype=torch.float32)
+                buf["s_triton"] = s
+            if not getattr(cache_owner, "_fp8_sticky_quant_logged", False):
+                cache_owner._fp8_sticky_quant_logged = True
+                logger.info("[FP8 Sticky] Using Triton fused BF16->FP8 quant kernel")
+        else:
+            y = torch.empty_like(x2d, dtype=torch.float8_e4m3fn)
+            s = torch.empty((M,), device=x2d.device, dtype=torch.float32)
+
+        # Launch: use BLOCK_K=1024 so H=2048 takes 2 iterations.
+        grid = (M,)
+        _bf16_to_fp8_per_token_kernel[grid](
+            x2d, y, s,
+            x2d.stride(0), x2d.stride(1),
+            y.stride(0), y.stride(1),
+            K=K,
+            BLOCK_K=1024,
+            num_warps=8,
+        )
+
+        out = y.view_as(hidden_states)
+        out._fp8_scale = s
+        return out
+
+    # Fallback: naive PyTorch implementation (slow; should be avoided for performance).
+    if cache_owner is not None and not getattr(cache_owner, "_fp8_sticky_quant_fallback_logged", False):
+        cache_owner._fp8_sticky_quant_fallback_logged = True
+        logger.warning(
+            f"[FP8 Sticky] Falling back to PyTorch BF16->FP8 quant (slow). "
+            f"triton_ok={_FP8_STICKY_TRITON_QUANT_AVAILABLE} x_dtype={hidden_states.dtype}"
+        )
+
+    FP8_MAX = 448.0  # E4M3 max value
+    hidden_f32 = hidden_states.to(torch.float32)
+    abs_max = hidden_f32.abs().amax(dim=-1, keepdim=True)
+    scale = (abs_max / FP8_MAX).clamp(min=1e-12).squeeze(-1)  # [num_tokens]
+    hidden_scaled = hidden_f32 / scale.unsqueeze(-1)
+    hidden_fp8 = hidden_scaled.clamp(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn)
+    hidden_fp8._fp8_scale = scale
+    return hidden_fp8
+
+
+def wrap_decoder_layer_forward_fp8(
+    original_forward,
+    use_fp8_first: bool = False,
+    is_last_layer: bool = False,
+    cache_owner: Optional[torch.nn.Module] = None,
+):
+    """
+    Wrap a decoder layer's forward function to handle FP8 sticky hidden states.
+    
+    FP8 RMSNorm-aware wrapper:
+    - hidden_states can flow through as FP8 (RMSNorm handles FP8 input natively)
+    - residual must stay BF16 for numerical stability (dequant if FP8)
+    - At exit: quantize hidden_states to FP8 (but keep residual BF16)
+    - Last layer: output BF16 for final norm compatibility
+    
+    Usage:
+        layer.forward = wrap_decoder_layer_forward_fp8(layer.forward, use_fp8_first=True)
+    """
+    from functools import wraps
+    
+    # Check once at wrap time if FP8 RMSNorm is available
+    fp8_rmsnorm_available = _fp8_between_layers_is_effective()
+    
+    @wraps(original_forward)
+    def wrapped_forward(
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch,
+        residual: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Entry handling:
+        # - If FP8 RMSNorm is available: let hidden_states flow as FP8 (RMSNorm handles it)
+        # - Otherwise: dequant hidden_states to BF16 for compatibility
+        # - Always ensure residual is BF16 for numerical stability
+        
+        if not fp8_rmsnorm_available:
+            # No FP8 RMSNorm: dequant hidden_states to BF16
+            hidden_states = maybe_dequant_fp8_hidden(hidden_states)
+        # else: hidden_states can stay FP8, RMSNorm will handle it
+        
+        # Residual should always be BF16 for numerical stability
+        if residual is not None and residual.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+            residual = maybe_dequant_fp8_hidden(residual)
+        
+        # Run original forward
+        hidden_out, residual_out = original_forward(
+            positions, hidden_states, forward_batch, residual
+        )
+        
+        # Exit handling:
+        # - Quantize hidden_states to FP8 (except for last layer)
+        # - Keep residual as BF16 (don't quantize)
+        if use_fp8_first and _FP8_STICKY_ENABLED and not is_last_layer:
+            hidden_out = maybe_quant_fp8_hidden(hidden_out, cache_owner=cache_owner)
+            # NOTE: residual stays BF16 for numerical stability
+            # The FP8 RMSNorm kernel expects: FP8 hidden + BF16 residual
+        
+        return hidden_out, residual_out
+    
+    return wrapped_forward
+
+
+def setup_fp8_sticky_layers(model: torch.nn.Module) -> None:
+    """
+    Setup FP8 sticky hidden state handling for all decoder layers.
+    
+    This wraps each decoder layer's forward function to handle FP8 <-> BF16
+    conversion at layer boundaries.
+    
+    With FP8 RMSNorm:
+    - Hidden states flow as FP8 between layers (no dequant at entry)
+    - RMSNorm directly consumes FP8 hidden + BF16 residual
+    - Last layer outputs BF16 for final norm compatibility
+    
+    Without FP8 RMSNorm:
+    - FP8 sticky is disabled (would be pure overhead)
+    
+    Call this after model loading and ternary quantization is applied.
+    """
+    use_fp8_first = is_ternary_fp8_enabled(model)
+    
+    if not use_fp8_first:
+        logger.debug("[FP8 Sticky] FP8-first mode not enabled, skipping layer wrapping")
+        return
+    
+    # Re-check effectiveness (may have changed after model load)
+    fp8_rmsnorm_available = _fp8_between_layers_is_effective()
+    
+    if not _FP8_STICKY_ENABLED:
+        reason = "mode=disabled" if _FP8_STICKY_MODE == "0" else f"FP8 RMSNorm available={fp8_rmsnorm_available}"
+        logger.info(
+            f"[FP8 Sticky] FP8 sticky between layers is disabled ({reason}). "
+            f"Using BF16 hidden states between layers."
+        )
+        return
+    
+    # First, collect all decoder layers to identify the last one
+    decoder_layers = []
+    for name, module in model.named_modules():
+        class_name = module.__class__.__name__
+        if "DecoderLayer" in class_name:
+            if not hasattr(module, '_fp8_sticky_wrapped'):
+                decoder_layers.append((name, module))
+    
+    if not decoder_layers:
+        logger.debug("[FP8 Sticky] No decoder layers found")
+        return
+    
+    num_layers = len(decoder_layers)
+    wrapped_count = 0
+    
+    for idx, (name, module) in enumerate(decoder_layers):
+        is_last_layer = (idx == num_layers - 1)
+        
+        # Wrap forward
+        original_forward = module.forward
+        module.forward = wrap_decoder_layer_forward_fp8(
+            original_forward,
+            use_fp8_first=True,
+            is_last_layer=is_last_layer,
+            cache_owner=module,
+        )
+        module._fp8_sticky_wrapped = True
+        wrapped_count += 1
+
+    # Warm up Triton FP8-sticky quant kernel BEFORE CUDA graph capture starts.
+    # This avoids first-use JIT compilation during capture (which can be slow or unsafe).
+    if wrapped_count > 0 and _FP8_STICKY_TRITON_QUANT_AVAILABLE:
+        try:
+            first_module = decoder_layers[0][1]
+            hidden = getattr(first_module, "config", None)
+            hidden_size = getattr(getattr(model, "config", None), "hidden_size", None)
+            # Best-effort hidden size detection.
+            if hidden_size is None:
+                hidden_size = getattr(getattr(first_module, "self_attn", None), "hidden_size", None)
+            if hidden_size is None:
+                # Fallback: infer from RMSNorm weight
+                hidden_size = int(first_module.input_layernorm.weight.numel())
+            dummy = torch.zeros((1, int(hidden_size)), device=next(model.parameters()).device, dtype=torch.bfloat16)
+            maybe_quant_fp8_hidden(dummy, force_fp8=True, cache_owner=first_module)
+        except Exception:
+            pass
+    
+    if wrapped_count > 0:
+        logger.info(
+            f"[FP8 Sticky] Wrapped {wrapped_count} decoder layers for FP8 sticky hidden states\n"
+            f"  - FP8 RMSNorm: {'enabled' if fp8_rmsnorm_available else 'disabled (fallback to BF16)'}\n"
+            f"  - Hidden states: FP8 between layers (except last → BF16)\n"
+            f"  - Residual: BF16 throughout (numerical stability)"
+        )

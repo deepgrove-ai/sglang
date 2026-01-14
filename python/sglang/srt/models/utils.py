@@ -50,6 +50,8 @@ def create_fused_set_kv_buffer_arg(
     layer: RadixAttention,
     forward_batch: ForwardBatch,
 ):
+    if value.stride(-1) != 1:
+        value = value.contiguous()
     layer_id = layer.layer_id
     token_to_kv_pool = forward_batch.token_to_kv_pool
 

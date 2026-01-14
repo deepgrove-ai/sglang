@@ -15,7 +15,8 @@ from typing import List, Optional
 
 import requests
 
-PROFILER_DIR = os.getenv("SGLANG_TORCH_PROFILER_DIR", "/tmp")
+# Default to /mnt/data for much larger space (override with env/--output-dir as needed).
+PROFILER_DIR = os.getenv("SGLANG_TORCH_PROFILER_DIR", "/mnt/data/torch_profiles")
 
 
 def _run_profile(

@@ -379,6 +379,10 @@ class RotaryEmbedding(CustomOp):
             and (self.head_size in [64, 128, 256, 512])
             and self.dtype != torch.float32
         ):
+            if query.stride(-1) != 1:
+                query = query.contiguous()
+            if key.stride(-1) != 1:
+                key = key.contiguous()
             apply_rope_with_cos_sin_cache_inplace(
                 positions=positions,
                 query=query,

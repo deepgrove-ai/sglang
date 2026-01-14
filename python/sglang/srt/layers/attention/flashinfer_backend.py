@@ -27,6 +27,7 @@ from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import (
     get_int_env_var,
     is_flashinfer_available,
+    is_sm90_supported,
     is_sm100_supported,
     next_power_of_2,
 )
@@ -40,6 +41,25 @@ logger = logging.getLogger(__name__)
 if envs.SGLANG_ENABLE_TORCH_COMPILE.get():
     torch._logging.set_logs(dynamo=logging.ERROR)
     torch._dynamo.config.suppress_errors = True
+
+
+def _get_optional_bool_env(name: str) -> Optional[bool]:
+    """Parse a boolean env var.
+
+    Returns:
+        - True / False if explicitly set
+        - None if unset or invalid
+    """
+    v = os.environ.get(name)
+    if v is None:
+        return None
+    v = v.strip().lower()
+    if v in ("1", "true", "yes", "y", "on"):
+        return True
+    if v in ("0", "false", "no", "n", "off"):
+        return False
+    logger.warning(f"Invalid {name}={v!r}; expected true/false. Ignoring.")
+    return None
 
 
 if is_flashinfer_available():
@@ -186,6 +206,30 @@ class FlashInferAttnBackend(AttentionBackend):
                 "SGLANG_FLASHINFER_DECODE_SPLIT_TILE_SIZE", 2048
             )
 
+        # Extra FlashInfer tuning knobs (optional).
+        self.prefill_disable_split_kv = _get_optional_bool_env(
+            "SGLANG_FLASHINFER_PREFILL_DISABLE_SPLIT_KV"
+        )
+        self.decode_disable_split_kv = _get_optional_bool_env(
+            "SGLANG_FLASHINFER_DECODE_DISABLE_SPLIT_KV"
+        )
+        self.prefill_use_fp16_qk_reduction = _get_optional_bool_env(
+            "SGLANG_FLASHINFER_PREFILL_USE_FP16_QK_REDUCTION"
+        )
+        self.use_fast_decode_plan = _get_optional_bool_env(
+            "SGLANG_FLASHINFER_USE_FAST_DECODE_PLAN"
+        )
+        self.decode_disable_split_kv_below_bs = get_int_env_var(
+            "SGLANG_FLASHINFER_DECODE_DISABLE_SPLIT_KV_BELOW_BS", 0
+        )
+
+        # Optional override: disable split-KV when running decode under CUDA graphs.
+        disable_cuda_graph_kv_split_override = _get_optional_bool_env(
+            "SGLANG_FLASHINFER_DISABLE_CUDA_GRAPH_KV_SPLIT"
+        )
+        if disable_cuda_graph_kv_split_override is not None:
+            self.disable_cuda_graph_kv_split = disable_cuda_graph_kv_split_override
+
         if self.enable_deterministic:
             self.decode_use_tensor_cores = True
             if self.prefill_split_tile_size is None:
@@ -303,13 +347,29 @@ class FlashInferAttnBackend(AttentionBackend):
                 )
             )
 
+        # Optional: use FlashInfer fast_decode_plan even without CUDA graphs.
+        # This reduces begin_forward overhead and enables a CPU indptr override fast path.
+        if self.use_fast_decode_plan:
+            for i in range(self.num_wrappers):
+                self.decode_wrappers[i].begin_forward = partial(
+                    fast_decode_plan, self.decode_wrappers[i]
+                )
+
+        # FP8 attention: use FP8 Q when KV cache is FP8 for full FP8 attention pipeline
+        # This reduces dtype conversion overhead significantly
+        # NOTE: Currently disabled for flashinfer backend - requires trtllm-gen backend with HND layout
+        # The trtllm-gen backend is 2-2.5x faster but requires HND KV layout
+        # Set BEFORE creating indices updaters (they access this attribute)
+        self.kv_cache_dtype = model_runner.kv_cache_dtype
+        self.use_fp8_q = False  # Disabled in base backend; trtllm_mha enables it
+
         # Create indices updater
         if not skip_prefill:
             self.indices_updater_prefill = FlashInferIndicesUpdaterPrefill(
                 model_runner, self
             )  # for verify
         self.indices_updater_decode = FlashInferIndicesUpdaterDecode(model_runner, self)
-
+        
         # Other metadata
         self.forward_metadata: Union[PrefillMetadata, DecodeMetadata] = None
 
@@ -450,7 +510,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 encoder_lens=forward_batch.encoder_lens,
                 spec_info=forward_batch.spec_info,
                 fixed_split_size=self.decode_split_tile_size,
-                disable_split_kv=False,
+                disable_split_kv=self.decode_disable_split_kv,
             )
             self.forward_metadata = DecodeMetadata(self.decode_wrappers)
         elif forward_batch.forward_mode.is_draft_extend():
@@ -595,8 +655,12 @@ class FlashInferAttnBackend(AttentionBackend):
                 decode_wrappers=decode_wrappers,
                 encoder_lens=encoder_lens,
                 spec_info=spec_info,
-                fixed_split_size=None,
-                disable_split_kv=self.disable_cuda_graph_kv_split,
+                fixed_split_size=self.decode_split_tile_size,
+                disable_split_kv=(
+                    self.decode_disable_split_kv
+                    if self.decode_disable_split_kv is not None
+                    else self.disable_cuda_graph_kv_split
+                ),
             )
             self.decode_cuda_graph_metadata[bs] = decode_wrappers
             self.forward_metadata = DecodeMetadata(decode_wrappers)
@@ -687,8 +751,12 @@ class FlashInferAttnBackend(AttentionBackend):
                 decode_wrappers=self.decode_cuda_graph_metadata[bs],
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=spec_info,
-                fixed_split_size=None,
-                disable_split_kv=self.disable_cuda_graph_kv_split,
+                fixed_split_size=self.decode_split_tile_size,
+                disable_split_kv=(
+                    self.decode_disable_split_kv
+                    if self.decode_disable_split_kv is not None
+                    else self.disable_cuda_graph_kv_split
+                ),
             )
         elif forward_mode.is_target_verify():
             self.indices_updater_prefill.update(
@@ -741,6 +809,12 @@ class FlashInferAttnBackend(AttentionBackend):
         logits_soft_cap = layer.logit_cap
 
         q = q.contiguous()
+        
+        # Convert Q to FP8 for full FP8 attention (FP8 Q × FP8 KV → FP8 output)
+        q_input = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+        if self.use_fp8_q and q_input.dtype != self.kv_cache_dtype:
+            q_input = q_input.to(self.kv_cache_dtype)
+        
         if not self.forward_metadata.use_ragged:
             if k is not None:
                 assert v is not None
@@ -750,7 +824,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     )
 
             o = prefill_wrapper_paged.forward(
-                q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                q_input,
                 forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
                 causal=not layer.is_cross_attention,
                 sm_scale=layer.scaling,
@@ -787,26 +861,38 @@ class FlashInferAttnBackend(AttentionBackend):
                 # NOTE: FlashInfer currently has limitations with head_dim = 32 or other dimensions
                 # The FlashInfer head_dim limitation itself is tracked here:
                 # https://github.com/flashinfer-ai/flashinfer/issues/1048
+                # For ragged attention, also convert K, V to FP8 if using FP8 Q
+                k_input = k.view(-1, layer.tp_k_head_num, layer.head_dim)
+                v_input = v.view(-1, layer.tp_v_head_num, layer.head_dim)
+                if self.use_fp8_q and k_input.dtype != self.kv_cache_dtype:
+                    k_input = k_input.to(self.kv_cache_dtype)
+                    v_input = v_input.to(self.kv_cache_dtype)
                 o = self.prefill_wrapper_ragged.forward(
-                    q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                    k.view(-1, layer.tp_k_head_num, layer.head_dim),
-                    v.view(-1, layer.tp_v_head_num, layer.head_dim),
+                    q_input,
+                    k_input,
+                    v_input,
                     causal=causal,
                     sm_scale=layer.scaling,
                     logits_soft_cap=logits_soft_cap,
                 )
 
             else:
+                # For ragged attention, also convert K, V to FP8 if using FP8 Q
+                k_input = k.view(-1, layer.tp_k_head_num, layer.head_dim)
+                v_input = v.view(-1, layer.tp_v_head_num, layer.head_dim)
+                if self.use_fp8_q and k_input.dtype != self.kv_cache_dtype:
+                    k_input = k_input.to(self.kv_cache_dtype)
+                    v_input = v_input.to(self.kv_cache_dtype)
                 o1, s1 = self.prefill_wrapper_ragged.forward_return_lse(
-                    q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                    k.view(-1, layer.tp_k_head_num, layer.head_dim),
-                    v.view(-1, layer.tp_v_head_num, layer.head_dim),
+                    q_input,
+                    k_input,
+                    v_input,
                     causal=True,
                     sm_scale=layer.scaling,
                     logits_soft_cap=logits_soft_cap,
                 )
                 o2, s2 = prefill_wrapper_paged.forward_return_lse(
-                    q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                    q_input,
                     forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
                     causal=False,
                     sm_scale=layer.scaling,
@@ -847,9 +933,14 @@ class FlashInferAttnBackend(AttentionBackend):
                     layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                 )
 
+        # Convert Q to FP8 for full FP8 attention (FP8 Q × FP8 KV → FP8 output)
+        q_input = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+        if self.use_fp8_q and q_input.dtype != self.kv_cache_dtype:
+            q_input = q_input.to(self.kv_cache_dtype)
+
         # Call the wrapped function
         o = decode_wrapper.forward(
-            q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+            q_input,
             forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
             sm_scale=layer.scaling,
             logits_soft_cap=layer.logit_cap,
@@ -875,6 +966,7 @@ class FlashInferAttnBackend(AttentionBackend):
 class FlashInferIndicesUpdaterDecode:
     def __init__(self, model_runner: ModelRunner, attn_backend: FlashInferAttnBackend):
         # Parse Constants
+        self.max_bs = model_runner.req_to_token_pool.size
         self.num_qo_heads = (
             model_runner.model_config.num_attention_heads // get_attention_tp_size()
         )
@@ -883,7 +975,11 @@ class FlashInferIndicesUpdaterDecode:
         )
         self.head_dim = model_runner.model_config.head_dim
         self.data_type = model_runner.kv_cache_dtype
-        self.q_data_type = model_runner.dtype
+        # FP8 attention: use FP8 Q when KV cache is FP8 for better performance
+        # This enables full FP8 attention (FP8 Q × FP8 KV → FP8 output)
+        # NOTE: FP8 Q only works with FA3 backend (SM90+ Hopper/Blackwell)
+        self.use_fp8_q = attn_backend.use_fp8_q  # Get from parent backend
+        self.q_data_type = model_runner.kv_cache_dtype if self.use_fp8_q else model_runner.dtype
         self.sliding_window_size = model_runner.sliding_window_size
         self.attn_backend = attn_backend
 
@@ -1076,12 +1172,30 @@ class FlashInferIndicesUpdaterDecode:
             )
 
         global global_override_indptr_cpu
-        locally_override = False
-        if seq_lens_cpu is not None and global_override_indptr_cpu is None:
-            locally_override = True
-            global_override_indptr_cpu = torch.empty_like(kv_indptr, device="cpu")
+        override_indptr_cpu = None
+        if seq_lens_cpu is not None:
+            needed = bs + 1
+            if global_override_indptr_cpu is None or global_override_indptr_cpu.numel() < needed:
+                # Use pinned host memory to reduce CPU<->GPU sync overhead.
+                alloc_n = max(needed, self.max_bs + 1)
+                global_override_indptr_cpu = torch.empty(
+                    (alloc_n,),
+                    dtype=torch.int32,
+                    device="cpu",
+                    pin_memory=True,
+                )
             global_override_indptr_cpu[0] = 0
-            global_override_indptr_cpu[1 : bs + 1] = torch.cumsum(seq_lens_cpu, dim=0)
+            seq_lens_cpu_i32 = (
+                seq_lens_cpu
+                if seq_lens_cpu.dtype == torch.int32
+                else seq_lens_cpu.to(torch.int32)
+            )
+            torch.cumsum(
+                seq_lens_cpu_i32,
+                dim=0,
+                out=global_override_indptr_cpu[1:needed],
+            )
+            override_indptr_cpu = global_override_indptr_cpu[:needed]
 
         # Check if this specific wrapper's begin_forward has been replaced with fast_decode_plan
         # by checking if it's a partial function with fast_decode_plan as the func
@@ -1089,6 +1203,16 @@ class FlashInferIndicesUpdaterDecode:
             hasattr(wrapper.begin_forward, "func")
             and wrapper.begin_forward.func == fast_decode_plan
         )
+
+        effective_disable_split_kv = disable_split_kv
+        if (
+            effective_disable_split_kv is None
+            and self.attn_backend.decode_disable_split_kv_below_bs > 0
+            and bs <= self.attn_backend.decode_disable_split_kv_below_bs
+        ):
+            effective_disable_split_kv = True
+        if effective_disable_split_kv is None:
+            effective_disable_split_kv = False
 
         if wrapper_uses_fast_decode_plan:
             # When begin_forward is replaced with fast_decode_plan, pass global_override_indptr_cpu
@@ -1104,10 +1228,8 @@ class FlashInferIndicesUpdaterDecode:
                 q_data_type=self.q_data_type,
                 non_blocking=True,
                 fixed_split_size=fixed_split_size,
-                disable_split_kv=(
-                    disable_split_kv if disable_split_kv is not None else False
-                ),
-                global_override_indptr_cpu=global_override_indptr_cpu,
+                disable_split_kv=effective_disable_split_kv,
+                global_override_indptr_cpu=override_indptr_cpu,
             )
         else:
             # When using original begin_forward, don't pass global_override_indptr_cpu
@@ -1123,13 +1245,8 @@ class FlashInferIndicesUpdaterDecode:
                 q_data_type=self.q_data_type,
                 non_blocking=True,
                 fixed_split_size=fixed_split_size,
-                disable_split_kv=(
-                    disable_split_kv if disable_split_kv is not None else False
-                ),
+                disable_split_kv=effective_disable_split_kv,
             )
-
-        if locally_override:
-            global_override_indptr_cpu = None
 
 
 class FlashInferIndicesUpdaterPrefill:
@@ -1143,7 +1260,10 @@ class FlashInferIndicesUpdaterPrefill:
         )
         self.head_dim = model_runner.model_config.head_dim
         self.data_type = model_runner.kv_cache_dtype
-        self.q_data_type = model_runner.dtype
+        # FP8 attention: use FP8 Q when KV cache is FP8 for better performance
+        # NOTE: FP8 Q only works with FA3 backend (SM90+ Hopper/Blackwell)
+        self.use_fp8_q = attn_backend.use_fp8_q  # Get from parent backend
+        self.q_data_type = model_runner.kv_cache_dtype if self.use_fp8_q else model_runner.dtype
         self.sliding_window_size = model_runner.sliding_window_size
         self.attn_backend = attn_backend
 
@@ -1399,6 +1519,13 @@ class FlashInferIndicesUpdaterPrefill:
             token_pos_in_items_len = 0
             max_item_len_ptr = None
 
+        prefill_disable_split_kv = self.attn_backend.prefill_disable_split_kv
+        if prefill_disable_split_kv is None:
+            prefill_disable_split_kv = False
+        prefill_use_fp16_qk_reduction = self.attn_backend.prefill_use_fp16_qk_reduction
+        if prefill_use_fp16_qk_reduction is None:
+            prefill_use_fp16_qk_reduction = False
+
         wrapper_paged.begin_forward(
             qo_indptr,
             kv_indptr,
@@ -1412,7 +1539,9 @@ class FlashInferIndicesUpdaterPrefill:
             kv_data_type=self.data_type,
             custom_mask=use_custom_mask,
             non_blocking=True,
+            use_fp16_qk_reduction=prefill_use_fp16_qk_reduction,
             fixed_split_size=fixed_split_size,
+            disable_split_kv=prefill_disable_split_kv,
             prefix_len_ptr=prefix_len_ptr,
             token_pos_in_items_ptr=token_pos_in_items_ptr,
             token_pos_in_items_len=token_pos_in_items_len,

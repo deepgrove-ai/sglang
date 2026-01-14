@@ -59,6 +59,43 @@ if _is_npu:
     import torch_npu
 
 
+# ============================================================================
+# FP8 KV-cache write fast path (avoid index_put + extra copies)
+# ============================================================================
+
+@triton.jit
+def _scatter_bf16_to_fp8_kv_kernel(
+    src_ptr,  # [M, K] bf16
+    dst_ptr,  # [KV_SIZE, K] fp8 (view over underlying uint8 storage)
+    loc_ptr,  # [M] int32 indices into KV_SIZE
+    inv_scale,  # scalar multiply applied before cast (float32)
+    stride_sm: tl.constexpr,
+    stride_sk: tl.constexpr,
+    stride_dm: tl.constexpr,
+    stride_dk: tl.constexpr,
+    K: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_k = tl.program_id(1)
+
+    # loc_ptr may be int32 or int64; cast to int32 for addressing
+    dst_row = tl.load(loc_ptr + pid_m).to(tl.int32)
+    offs = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
+    x = tl.load(src_ptr + pid_m * stride_sm + offs * stride_sk, mask=offs < K, other=0.0).to(
+        tl.float32
+    )
+    inv_scale_f = inv_scale.to(tl.float32)
+    x = x * inv_scale_f
+    # Clamp to FP8 E4M3 range
+    x = tl.minimum(tl.maximum(x, -448.0), 448.0)
+    tl.store(
+        dst_ptr + dst_row * stride_dm + offs * stride_dk,
+        x.to(tl.float8e4nv),
+        mask=offs < K,
+    )
+
+
 def get_tensor_size_bytes(t: torch.Tensor):
     return np.prod(t.shape) * t.dtype.itemsize
 
@@ -739,13 +776,106 @@ class MHATokenToKVPool(KVCache):
         v_scale: Optional[float] = None,
         layer_id_override: Optional[int] = None,
     ):
+        """
+        Write K/V tensors to the KV cache buffer.
+        
+        FP8 KV Cache Handling:
+        - If cache_k/cache_v are already in self.dtype (e.g., FP8), no conversion needed
+        - If cache_k/cache_v are BF16 and self.dtype is FP8:
+          - Divide by scale (in-place) and convert to FP8
+          - Scales should match FlashInfer's expected format (per-tensor float)
+        - FlashInfer's forward_decode/forward_prefill use k_scale_float/v_scale_float
+          for dequantization during attention computation
+        """
         from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 
         if layer_id_override is not None:
             layer_id = layer_id_override
         else:
             layer_id = layer.layer_id
+
+        # Fast path for FP8 KV cache:
+        # Avoid `tensor[index] = value` (index_put) and avoid intermediate `to(fp8)` copies
+        # by fusing BF16->FP8 quantize + scatter into the KV buffers.
+        #
+        # IMPORTANT: This path has caused hard-to-debug corruption under concurrency
+        # (garbage tokens after a concurrency benchmark). Keep it OPT-IN until we
+        # have stronger validation for loc ranges and stream-safety.
+        enable_fp8_kv_scatter = get_bool_env_var("SGLANG_ENABLE_FP8_KV_SCATTER")
+        if (
+            enable_fp8_kv_scatter
+            and self.dtype == torch.float8_e4m3fn
+            and self.store_dtype == torch.uint8
+            and cache_k is not None
+            and cache_v is not None
+            and cache_k.dtype == torch.bfloat16
+            and cache_v.dtype == torch.bfloat16
+            and loc is not None
+            and loc.dtype in (torch.int32, torch.int64)
+            and loc.is_contiguous()
+        ):
+            if not getattr(self, "_fp8_kv_fastpath_logged", False):
+                self._fp8_kv_fastpath_logged = True
+                logger.info(
+                    f"[FP8 KV WRITE] fast-path enabled (avoid index_put). "
+                    f"loc_dtype={loc.dtype} cache_k_dtype={cache_k.dtype} kv_dtype={self.dtype} store_dtype={self.store_dtype}"
+                )
+            # View underlying uint8 storage as FP8 for raw pointer writes.
+            out_k = self._get_key_buffer(layer_id)   # float8 view
+            out_v = self._get_value_buffer(layer_id) # float8 view
+
+            # Flatten last dims to [M, K] to make strides simple/contiguous.
+            k2d = cache_k.reshape(cache_k.shape[0], -1).contiguous()
+            v2d = cache_v.reshape(cache_v.shape[0], -1).contiguous()
+            out_k2d = out_k.reshape(out_k.shape[0], -1)
+            out_v2d = out_v.reshape(out_v.shape[0], -1)
+
+            inv_k = 1.0
+            inv_v = 1.0
+            if k_scale is not None:
+                inv_k = 1.0 / float(k_scale)
+            if v_scale is not None:
+                inv_v = 1.0 / float(v_scale)
+
+            M = k2d.shape[0]
+            K = k2d.shape[1]
+            # Use large blocks; hidden sizes are ~128*head_dim so K is multiple of 128.
+            BLOCK_K = 1024
+            grid = (M, triton.cdiv(K, BLOCK_K))
+
+            _scatter_bf16_to_fp8_kv_kernel[grid](
+                k2d,
+                out_k2d,
+                loc,
+                inv_scale=inv_k,
+                stride_sm=k2d.stride(0),
+                stride_sk=k2d.stride(1),
+                stride_dm=out_k2d.stride(0),
+                stride_dk=out_k2d.stride(1),
+                K=K,
+                BLOCK_K=BLOCK_K,
+                num_warps=8,
+            )
+            _scatter_bf16_to_fp8_kv_kernel[grid](
+                v2d,
+                out_v2d,
+                loc,
+                inv_scale=inv_v,
+                stride_sm=v2d.stride(0),
+                stride_sk=v2d.stride(1),
+                stride_dm=out_v2d.stride(0),
+                stride_dk=out_v2d.stride(1),
+                K=K,
+                BLOCK_K=BLOCK_K,
+                num_warps=8,
+            )
+            return
+
+        # Baseline path:
+        # FP8-first optimization: if K/V already in target dtype, skip conversion
         if cache_k.dtype != self.dtype:
+            # NOTE: the old path mutates cache_k/cache_v in-place via div_.
+            # Keep behavior for non-FP8 cache to avoid extra allocations.
             if k_scale is not None:
                 cache_k.div_(k_scale)
             if v_scale is not None:

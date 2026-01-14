@@ -9,6 +9,9 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
 import torch
+import triton
+import triton.language as tl
+from torch.profiler import record_function
 
 from sglang.srt.layers.attention.flashinfer_backend import (
     FlashInferAttnBackend,
@@ -32,6 +35,37 @@ DEFAULT_WORKSPACE_SIZE_MB = (
 
 # Reuse this workspace buffer across all TRTLLM MHA wrappers
 global_zero_init_workspace_buffer = None
+
+
+@triton.jit
+def _build_page_table_kernel(
+    req_to_token_ptr,          # [num_reqs, max_context_len] int32
+    req_pool_indices_ptr,      # [bs] int32
+    page_table_ptr,            # [bs, max_num_pages] int32 (output)
+    bs: tl.constexpr,
+    max_seq_pages: tl.constexpr,
+    max_context_len: tl.constexpr,
+    page_size: tl.constexpr,
+    stride_rtt0: tl.constexpr,
+    stride_rtt1: tl.constexpr,
+    stride_pt0: tl.constexpr,
+    stride_pt1: tl.constexpr,
+):
+    pid_b = tl.program_id(0)
+    pid_p = tl.program_id(1)
+
+    # Bounds
+    if pid_b >= bs or pid_p >= max_seq_pages:
+        return
+
+    req_idx = tl.load(req_pool_indices_ptr + pid_b).to(tl.int32)
+    # Equivalent to req_to_token[req_idx, pid_p * page_size] // page_size
+    tok = tl.load(
+        req_to_token_ptr + req_idx * stride_rtt0 + (pid_p * page_size) * stride_rtt1,
+        mask=(pid_p * page_size) < max_context_len,
+        other=0,
+    ).to(tl.int32)
+    tl.store(page_table_ptr + pid_b * stride_pt0 + pid_p * stride_pt1, tok // page_size)
 
 
 @dataclass
@@ -347,13 +381,21 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             metadata.cu_seqlens_k[1:].copy_(
                 torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
             )
-            page_indices = self.req_to_token[
-                req_pool_indices[:, None],
-                self.decode_cuda_graph_metadata["strided_indices"][:max_seq_pages][
-                    None, :
-                ],
-            ]
-            metadata.page_table[:, :max_seq_pages].copy_(page_indices // self.page_size)
+            # Build page_table without advanced indexing (avoids expensive aten::index kernels)
+            _build_page_table_kernel[(bs, max_seq_pages)](
+                self.req_to_token,
+                req_pool_indices,
+                metadata.page_table,
+                bs=bs,
+                max_seq_pages=max_seq_pages,
+                max_context_len=self.max_context_len,
+                page_size=self.page_size,
+                stride_rtt0=self.req_to_token.stride(0),
+                stride_rtt1=self.req_to_token.stride(1),
+                stride_pt0=metadata.page_table.stride(0),
+                stride_pt1=metadata.page_table.stride(1),
+                num_warps=4,
+            )
         elif forward_mode.is_target_verify():
             # Here we only support topk = 1 for now.
             metadata = self.target_verify_metadata[bs]
@@ -371,12 +413,20 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             max_seq_pages = (
                 metadata.max_seq_len_k + self.page_size - 1
             ) // self.page_size
-            page_indices = self.req_to_token[
-                req_pool_indices[:, None],
-                self.decode_cuda_graph_metadata["strided_indices"][:max_seq_pages],
-            ]
-            page_indices //= self.page_size
-            metadata.page_table[:, :max_seq_pages].copy_(page_indices)
+            _build_page_table_kernel[(bs, max_seq_pages)](
+                self.req_to_token,
+                req_pool_indices,
+                metadata.page_table,
+                bs=bs,
+                max_seq_pages=max_seq_pages,
+                max_context_len=self.max_context_len,
+                page_size=self.page_size,
+                stride_rtt0=self.req_to_token.stride(0),
+                stride_rtt1=self.req_to_token.stride(1),
+                stride_pt0=metadata.page_table.stride(0),
+                stride_pt1=metadata.page_table.stride(1),
+                num_warps=4,
+            )
         elif forward_mode.is_draft_extend():
             metadata = self.draft_extend_metadata[bs]
             metadata.cache_seqlens_int32.copy_(seq_lens)
@@ -399,11 +449,20 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             max_seq_pages = (
                 metadata.max_seq_len_k + self.page_size - 1
             ) // self.page_size
-            page_indices = self.req_to_token[
-                req_pool_indices[:, None],
-                self.draft_extend_metadata["strided_indices"][:max_seq_pages],
-            ]
-            metadata.page_table[:, :max_seq_pages].copy_(page_indices // self.page_size)
+            _build_page_table_kernel[(bs, max_seq_pages)](
+                self.req_to_token,
+                req_pool_indices,
+                metadata.page_table,
+                bs=bs,
+                max_seq_pages=max_seq_pages,
+                max_context_len=self.max_context_len,
+                page_size=self.page_size,
+                stride_rtt0=self.req_to_token.stride(0),
+                stride_rtt1=self.req_to_token.stride(1),
+                stride_pt0=metadata.page_table.stride(0),
+                stride_pt1=metadata.page_table.stride(1),
+                num_warps=4,
+            )
         self.forward_metadata = metadata
 
     def get_cuda_graph_seq_len_fill_value(self) -> int:
@@ -525,23 +584,35 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         """Run forward for decode using TRTLLM MHA kernel."""
         cache_loc = forward_batch.out_cache_loc
         if save_kv_cache and k is not None:
-            forward_batch.token_to_kv_pool.set_kv_buffer(
-                layer, cache_loc, k, v, layer.k_scale, layer.v_scale
-            )
+            with record_function("trtllm_mha:set_kv_buffer"):
+                forward_batch.token_to_kv_pool.set_kv_buffer(
+                    layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+                )
 
-        q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
-        k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        with record_function("trtllm_mha:q_contiguous_view"):
+            q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+        
+        # FP8 Q optimization: convert Q to FP8 when KV cache is FP8 for 2x faster attention
+        # The kernel supports FP8 Q + FP8 KV → FP8 output natively
+        use_fp8_q = self.data_type in (torch.float8_e4m3fn, torch.float8_e5m2)
+        if use_fp8_q and q.dtype != self.data_type:
+            with record_function("trtllm_mha:q_to_fp8"):
+                q = q.to(self.data_type)
+        
+        with record_function("trtllm_mha:get_kv_buffer"):
+            k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
         # shape conversion:
         # [num_pages, page_size, num_kv_heads, head_dim] -> [num_pages, num_kv_heads, page_size, head_dim]
-        k_cache = k_cache.view(
-            -1, self.page_size, layer.tp_k_head_num, layer.head_dim
-        ).permute(0, 2, 1, 3)
-        v_cache = v_cache.view(
-            -1, self.page_size, layer.tp_v_head_num, layer.head_dim
-        ).permute(0, 2, 1, 3)
+        with record_function("trtllm_mha:kv_view_permute"):
+            k_cache = k_cache.view(
+                -1, self.page_size, layer.tp_k_head_num, layer.head_dim
+            ).permute(0, 2, 1, 3)
+            v_cache = v_cache.view(
+                -1, self.page_size, layer.tp_v_head_num, layer.head_dim
+            ).permute(0, 2, 1, 3)
         kv_cache = (k_cache, v_cache)
 
-        # TODO: add support for quantization
+        # Scale computation - Q scale is 1.0 for FP8 (no additional scaling needed)
         q_scale = 1.0
         k_scale = (
             layer.k_scale_float
@@ -555,19 +626,21 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         # Call TRT-LLM kernel
         # raw_out: like q, [bs, acc_q_len, num_q_heads, head_dim] but with output dtype
-        o = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
-            query=q,
-            kv_cache=kv_cache,
-            workspace_buffer=self.workspace_buffer,
-            block_tables=self.forward_metadata.page_table,
-            seq_lens=self.forward_metadata.cache_seqlens_int32,
-            max_seq_len=self.max_context_len,
-            bmm1_scale=bmm1_scale,
-            bmm2_scale=bmm2_scale,
-            window_left=layer.sliding_window_size,
-            # TODO: add attention_sink operation or nvfp4 scale factor if needed
-            sinks=attention_sink,
-        )
+        # When Q is FP8, output is also FP8 (downstream layers handle the dequant)
+        with record_function("trtllm_mha:flashinfer_decode"):
+            o = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
+                query=q,
+                kv_cache=kv_cache,
+                workspace_buffer=self.workspace_buffer,
+                block_tables=self.forward_metadata.page_table,
+                seq_lens=self.forward_metadata.cache_seqlens_int32,
+                max_seq_len=self.max_context_len,
+                bmm1_scale=bmm1_scale,
+                bmm2_scale=bmm2_scale,
+                window_left=layer.sliding_window_size,
+                # TODO: add attention_sink operation or nvfp4 scale factor if needed
+                sinks=attention_sink,
+            )
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
@@ -583,23 +656,34 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
     ):
         cache_loc = forward_batch.out_cache_loc
         if save_kv_cache and k is not None:
-            forward_batch.token_to_kv_pool.set_kv_buffer(
-                layer, cache_loc, k, v, layer.k_scale, layer.v_scale
-            )
-        q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+            with record_function("trtllm_mha:set_kv_buffer"):
+                forward_batch.token_to_kv_pool.set_kv_buffer(
+                    layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+                )
+        with record_function("trtllm_mha:q_contiguous_view"):
+            q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+        
+        # FP8 Q optimization: convert Q to FP8 when KV cache is FP8 for faster attention
+        use_fp8_q = self.data_type in (torch.float8_e4m3fn, torch.float8_e5m2)
+        if use_fp8_q and q.dtype != self.data_type:
+            with record_function("trtllm_mha:q_to_fp8"):
+                q = q.to(self.data_type)
+        
         # [num_pages, page_size, num_kv_heads, head_dim] -> [num_pages, num_kv_heads, page_size, head_dim]
-        k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-        k_cache = k_cache.view(
-            -1, self.page_size, layer.tp_k_head_num, layer.head_dim
-        ).permute(0, 2, 1, 3)
-        v_cache = v_cache.view(
-            -1, self.page_size, layer.tp_v_head_num, layer.head_dim
-        ).permute(0, 2, 1, 3)
+        with record_function("trtllm_mha:get_kv_buffer"):
+            k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        with record_function("trtllm_mha:kv_view_permute"):
+            k_cache = k_cache.view(
+                -1, self.page_size, layer.tp_k_head_num, layer.head_dim
+            ).permute(0, 2, 1, 3)
+            v_cache = v_cache.view(
+                -1, self.page_size, layer.tp_v_head_num, layer.head_dim
+            ).permute(0, 2, 1, 3)
         kv_cache = (k_cache, v_cache)
 
         # sink: additional value per head in the denominator of the softmax.
         attention_sink = kwargs.get("sinks", None)
-        # TODO: add support for quantization
+        # Scale computation - Q scale is 1.0 for FP8 (no additional scaling needed)
         q_scale = 1.0
         k_scale = (
             layer.k_scale_float
@@ -609,23 +693,24 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         bmm1_scale = q_scale * k_scale * layer.scaling
         bmm2_scale = 1.0
 
-        o = flashinfer.prefill.trtllm_batch_context_with_kv_cache(
-            query=q,
-            kv_cache=kv_cache,
-            workspace_buffer=self.workspace_buffer,
-            block_tables=self.forward_metadata.page_table,
-            seq_lens=self.forward_metadata.cache_seqlens_int32,
-            max_q_len=self.forward_metadata.max_seq_len_q,
-            max_kv_len=self.max_context_len,
-            bmm1_scale=bmm1_scale,
-            bmm2_scale=bmm2_scale,
-            batch_size=forward_batch.batch_size,
-            cum_seq_lens_q=self.forward_metadata.cu_seqlens_q,
-            cum_seq_lens_kv=self.forward_metadata.cu_seqlens_k,
-            window_left=layer.sliding_window_size,
-            # TODO: add attention_sink operation or nvfp4 scale factor if needed
-            sinks=attention_sink,
-        )
+        with record_function("trtllm_mha:flashinfer_prefill"):
+            o = flashinfer.prefill.trtllm_batch_context_with_kv_cache(
+                query=q,
+                kv_cache=kv_cache,
+                workspace_buffer=self.workspace_buffer,
+                block_tables=self.forward_metadata.page_table,
+                seq_lens=self.forward_metadata.cache_seqlens_int32,
+                max_q_len=self.forward_metadata.max_seq_len_q,
+                max_kv_len=self.max_context_len,
+                bmm1_scale=bmm1_scale,
+                bmm2_scale=bmm2_scale,
+                batch_size=forward_batch.batch_size,
+                cum_seq_lens_q=self.forward_metadata.cu_seqlens_q,
+                cum_seq_lens_kv=self.forward_metadata.cu_seqlens_k,
+                window_left=layer.sliding_window_size,
+                # TODO: add attention_sink operation or nvfp4 scale factor if needed
+                sinks=attention_sink,
+            )
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 

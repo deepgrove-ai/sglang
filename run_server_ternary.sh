@@ -151,6 +151,8 @@ case "$QUANT_MODE" in
         # Ternary + I2S mode (default)
         # The ternary quantization defaults to i2s mode, so we just need to specify --quantization ternary
         # Enable FlashInfer by default as it is generally faster for decode on H100
+        export SGLANG_TERNARY_USE_I2S_CUTLASS="${SGLANG_TERNARY_USE_I2S_CUTLASS:-1}"
+        export SGLANG_I2S_CUTLASS_LIB="${SGLANG_I2S_CUTLASS_LIB:-$SCRIPT_DIR/libternary_cutlass_sm100.so}"
         QUANT_FLAG="--quantization ternary --attention-backend flashinfer"
         QUANT_DESC="Ternary + I2_S (8x memory reduction, FP16 inference)"
         ;;
@@ -208,33 +210,52 @@ case "$QUANT_MODE" in
         # FP8 attention benefits from tensor cores and larger workspace
         export SGLANG_FLASHINFER_USE_TENSOR_CORE=true
         export SGLANG_FLASHINFER_WORKSPACE_SIZE=$((1024*1024*1024))  # 1GB
+        # Split-KV tuning knobs (now effective even without deterministic inference)
+        export SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE="${SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE:-8192}"
+        export SGLANG_FLASHINFER_DECODE_SPLIT_TILE_SIZE="${SGLANG_FLASHINFER_DECODE_SPLIT_TILE_SIZE:-4096}"
+        # Reduce FlashInfer decode begin_forward overhead
+        export SGLANG_FLASHINFER_USE_FAST_DECODE_PLAN="${SGLANG_FLASHINFER_USE_FAST_DECODE_PLAN:-true}"
+        # Heuristic: for small decode batches, split-KV overhead can dominate
+        export SGLANG_FLASHINFER_DECODE_DISABLE_SPLIT_KV_BELOW_BS="${SGLANG_FLASHINFER_DECODE_DISABLE_SPLIT_KV_BELOW_BS:-8}"
         
         QUANT_FLAG="--quantization ternary --kv-cache-dtype fp8_e4m3"
         QUANT_DESC="Ternary + I2_S + FP8 KV cache + Tuned FlashInfer"
         echo "Note: FP8 mode enabled:"
         echo "  - FP8 KV cache: enabled (fp8_e4m3)"
         echo "  - FlashInfer: Tensor cores + 1GB workspace"
+        echo "  - FlashInfer: split tiles prefill=$SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE decode=$SGLANG_FLASHINFER_DECODE_SPLIT_TILE_SIZE"
+        echo "  - FlashInfer: fast_decode_plan=$SGLANG_FLASHINFER_USE_FAST_DECODE_PLAN"
+        echo "  - FlashInfer: disable_split_kv_below_bs=$SGLANG_FLASHINFER_DECODE_DISABLE_SPLIT_KV_BELOW_BS"
         echo "  - FP8 bridge: $SGLANG_TERNARY_FP8_BRIDGE (0=DP4A, 1=FP8 GEMM)"
         ;;
     
     i2s-fp8-full)
-        # EXPERIMENTAL: Full FP8 pipeline with bridge enabled
-        # This is for testing the FP8 bridge before custom kernels are available
-        # WARNING: Bridge only runs for PREFILL (M >= MIN_M threshold)
+        # EXPERIMENTAL: Full FP8 pipeline with trtllm_mha attention (2x faster on Blackwell)
         export SGLANG_TERNARY_USE_FP8=1
         export SGLANG_TERNARY_FP8_GRANULARITY="${SGLANG_TERNARY_FP8_GRANULARITY:-per_token_group_128}"
         export SGLANG_TERNARY_FP8_BRIDGE=1
         export SGLANG_TERNARY_FP8_BRIDGE_MIN_M="${SGLANG_TERNARY_FP8_BRIDGE_MIN_M:-64}"
         
-        # FlashInfer tuning for FP8 attention (CRITICAL for performance)
-        export SGLANG_FLASHINFER_USE_TENSOR_CORE=true
-        export SGLANG_FLASHINFER_WORKSPACE_SIZE=$((1024*1024*1024))  # 1GB
+        # FP8 sticky hidden state: keep hidden states in FP8 between layers
+        # (last layer outputs BF16 for final norm compatibility)
+        export SGLANG_TERNARY_FP8_STICKY="${SGLANG_TERNARY_FP8_STICKY:-true}"
+        
+        # Use trtllm_mha attention backend for 2x faster FP8 attention on Blackwell
+        # This backend uses trtllm-gen kernels with FP8 Q + FP8 KV cache
+        ATTENTION_BACKEND="${ATTENTION_BACKEND:-trtllm_mha}"
+        
+        # Decode-only RMSNorm+QKV fusion currently forces BF16 path in qwen3_moe.py.
+        # That defeats FP8-first (it prevents FP8 RMSNorm + FP8 ternary linears).
+        # Keep it OFF by default for FP8-full unless explicitly enabled.
+        export TERNARY_FUSE_RMSNORM_QKV="${TERNARY_FUSE_RMSNORM_QKV:-0}"
         
         QUANT_FLAG="--quantization ternary --kv-cache-dtype fp8_e4m3"
-        QUANT_DESC="Ternary + I2_S + FP8 Full Pipeline (EXPERIMENTAL)"
-        echo "Note: FP8-full mode enabled (EXPERIMENTAL):"
+        QUANT_DESC="Ternary + I2_S + FP8 Full Pipeline (trtllm_mha)"
+        echo "Note: FP8-full mode enabled with trtllm_mha attention:"
         echo "  - FP8 KV cache: enabled (fp8_e4m3)"
-        echo "  - FlashInfer: Tensor cores + 1GB workspace"
+        echo "  - FP8 sticky hidden: $SGLANG_TERNARY_FP8_STICKY (last layer outputs BF16)"
+        echo "  - Attention backend: trtllm_mha (2x faster FP8 Q + FP8 KV on Blackwell)"
+        echo "  - RMSNorm+QKV fusion: $TERNARY_FUSE_RMSNORM_QKV (0=FP8-first, 1=force BF16 fused kernel)"
         echo "  - FP8 bridge: ENABLED for PREFILL ONLY (M >= $SGLANG_TERNARY_FP8_BRIDGE_MIN_M)"
         ;;
 esac
@@ -256,7 +277,7 @@ case "$MODEL_PRESET" in
         ;;
 esac
 SERVER_PORT=30080
-DEFAULT_REQUEST_GPU_MEMORY="0.95"
+DEFAULT_REQUEST_GPU_MEMORY="0.85"
 REQUEST_GPU_MEMORY="${REQUEST_GPU_MEMORY:-$DEFAULT_REQUEST_GPU_MEMORY}"
 # Optional performance knobs (defaults keep SGLang auto-tuning behavior).
 # For batch=1 decode-latency experiments, good starting point:
@@ -270,11 +291,14 @@ CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-1024}"
 # Enabled by default for lower latency (set to "" to disable)
 # SPECULATIVE_ALGORITHM="${SPECULATIVE_ALGORITHM:-NGRAM}"
 # SPECULATIVE_NUM_DRAFT="${SPECULATIVE_NUM_DRAFT:-4}"
-CUDA_GRAPH_MAX_BS="${CUDA_GRAPH_MAX_BS:-}"
+CUDA_GRAPH_MAX_BS="${CUDA_GRAPH_MAX_BS:-128}"
 CUDA_GRAPH_BS="${CUDA_GRAPH_BS:1}"
 DISABLE_CUDA_GRAPH="${DISABLE_CUDA_GRAPH:-0}"  # Test: disable CUDA graphs entirely
 # MoE runner backend: auto, deep_gemm, triton, flashinfer_cutlass, flashinfer_mxfp4, cutlass
 MOE_RUNNER_BACKEND="${MOE_RUNNER_BACKEND:-}"
+# Attention backend: flashinfer, trtllm_mha (2x faster with FP8 on Blackwell)
+# Default to flashinfer; i2s-fp8-full mode sets trtllm_mha
+ATTENTION_BACKEND="${ATTENTION_BACKEND:-flashinfer}"
 DISABLE_RADIX_CACHE="${DISABLE_RADIX_CACHE:-0}"
 DISABLE_OVERLAP="${DISABLE_OVERLAP:-0}"  # maps to --disable-overlap-schedule
 MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-}"
@@ -328,6 +352,7 @@ echo "Disable overlap schedule: $DISABLE_OVERLAP"
 echo "Max running requests: $MAX_RUNNING_REQUESTS"
 echo "torch.compile max batch size: ${TORCH_COMPILE_MAX_BS:-disabled}"
 echo "torch.compile CustomOp mode: ${SGLANG_TORCH_COMPILE_CUSTOM_OP_MODE:-default(native)}"
+echo "Attention backend: $ATTENTION_BACKEND"
 echo "========================================"
 
 # Check if server is already running on the port
@@ -347,7 +372,7 @@ if [[ "${USE_DATA_PARALLEL:-0}" == "1" ]]; then
         --dp ${DP_SIZE:-2} \
         --mem-fraction-static $REQUEST_GPU_MEMORY \
         --trust-remote-code \
-        --attention-backend flashinfer"
+        --attention-backend $ATTENTION_BACKEND"
 else
     # Standard mode: single process with optional tensor parallelism
     CMD="python -m sglang.launch_server \
@@ -358,7 +383,7 @@ else
         --mem-fraction-static $REQUEST_GPU_MEMORY \
         --enable-p2p-check \
         --trust-remote-code \
-        --attention-backend flashinfer"
+        --attention-backend $ATTENTION_BACKEND"
 fi
 
 # Optional knobs (mostly useful for batch=1 decode latency experiments)
@@ -400,6 +425,8 @@ fi
 if [[ -n "$MOE_RUNNER_BACKEND" ]]; then
     CMD="$CMD --moe-runner-backend $MOE_RUNNER_BACKEND"
 fi
+
+# Note: attention backend is set in the base command using $ATTENTION_BACKEND
 
 # torch.compile optimization (reduces Python overhead significantly for batch-1)
 if [[ -n "$TORCH_COMPILE_MAX_BS" ]]; then

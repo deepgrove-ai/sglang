@@ -600,7 +600,10 @@ class DefaultModelLoader(BaseModelLoader):
 
         # Apply ternary quantization (runtime hook approach)
         if model_config.quantization == "ternary":
-            from sglang.srt.model_loader.ternary_hook import apply_ternary_quantization
+            from sglang.srt.model_loader.ternary_hook import (
+                apply_ternary_quantization,
+                setup_fp8_sticky_layers,
+            )
             model = apply_ternary_quantization(
                 model,
                 threshold_scale=0.7,
@@ -608,6 +611,8 @@ class DefaultModelLoader(BaseModelLoader):
                 model_id=getattr(model_config, "model_path", None),
                 revision=getattr(model_config, "revision", None),
             )
+            # Setup FP8 sticky hidden states for decoder layers (if FP8-first enabled)
+            setup_fp8_sticky_layers(model)
 
         return model.eval()
 
@@ -743,7 +748,10 @@ class DummyModelLoader(BaseModelLoader):
 
             # Apply ternary quantization (runtime hook approach)
             if model_config.quantization == "ternary":
-                from sglang.srt.model_loader.ternary_hook import apply_ternary_quantization
+                from sglang.srt.model_loader.ternary_hook import (
+                    apply_ternary_quantization,
+                    setup_fp8_sticky_layers,
+                )
                 model = apply_ternary_quantization(
                     model,
                     threshold_scale=0.7,
@@ -751,6 +759,8 @@ class DummyModelLoader(BaseModelLoader):
                     model_id=getattr(model_config, "model_path", None),
                     revision=getattr(model_config, "revision", None),
                 )
+                # Setup FP8 sticky hidden states for decoder layers (if FP8-first enabled)
+                setup_fp8_sticky_layers(model)
 
             post_load_weights(model, model_config)
 

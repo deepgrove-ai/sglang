@@ -113,6 +113,11 @@ _TERNARY_FUSE_RMSNORM_QKV_ALLOW_CAPTURE = (
     os.environ.get("TERNARY_FUSE_RMSNORM_QKV_ALLOW_CAPTURE", "1") == "1"
 )
 
+# FP8-first mode: prefer FP8 fused kernels when available
+# Currently: bitlinear_rmsnorm_bf16xint2_v4_megafused is the BF16 stepping stone
+# Future: bitlinear_rmsnorm_fp8xint2_v4_megafused will enable direct FP8-out
+_TERNARY_FUSE_RMSNORM_QKV_FP8 = os.environ.get("TERNARY_FUSE_RMSNORM_QKV_FP8", "0") == "1"
+
 # Supported (N, K) pairs for bitlinear_rmsnorm_bf16xint2_v4_megafused in libternary_bitnet.so
 _TERNARY_RMSNORM_QKV_SUPPORTED_NK = {
     (5120, 2048),
