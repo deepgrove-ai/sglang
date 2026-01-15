@@ -42,7 +42,7 @@ from sglang.srt.utils import set_weight_attrs
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_PREFILL_SKIP_M = int(os.environ.get("TERNARY_PREFILL_SKIP_M", "8"))
+DEFAULT_PREFILL_SKIP_M = int(os.environ.get("TERNARY_PREFILL_SKIP_M", "1"))
 
 SUPPORTED_V4_NK_SHAPES = {
     # Attention projection shapes
@@ -209,6 +209,18 @@ def _load_i2s_cutlass_library():
         fn = I2S_CUTLASS_LIB.i2s_fused_mixed_sm100_v8_workspace_size_for_ptrs
         fn.argtypes = [_PTR, _PTR, _PTR, _INT, _INT, _INT]
         fn.restype = _SIZE_T
+    if hasattr(I2S_CUTLASS_LIB, "i2s_fused_mixed_sm100_v8_workspace_size_for_ptrs_streamk"):
+        fn = I2S_CUTLASS_LIB.i2s_fused_mixed_sm100_v8_workspace_size_for_ptrs_streamk
+        fn.argtypes = [_PTR, _PTR, _PTR, _INT, _INT, _INT, _INT]
+        fn.restype = _SIZE_T
+    if hasattr(I2S_CUTLASS_LIB, "i2s_fused_mixed_sm100_v8_workspace_size"):
+        fn = I2S_CUTLASS_LIB.i2s_fused_mixed_sm100_v8_workspace_size
+        fn.argtypes = [_INT, _INT, _INT]
+        fn.restype = _SIZE_T
+    if hasattr(I2S_CUTLASS_LIB, "i2s_fused_mixed_sm100_v8_workspace_size_streamk"):
+        fn = I2S_CUTLASS_LIB.i2s_fused_mixed_sm100_v8_workspace_size_streamk
+        fn.argtypes = [_INT, _INT, _INT, _INT]
+        fn.restype = _SIZE_T
 
     if hasattr(I2S_CUTLASS_LIB, "i2s_fused_mixed_sm100_v8_run_streamk"):
         fn = I2S_CUTLASS_LIB.i2s_fused_mixed_sm100_v8_run_streamk
@@ -290,14 +302,16 @@ def _is_sm100() -> bool:
     return major >= 10
 
 
-def _get_i2s_cutlass_splits(N: int) -> int:
+def _get_i2s_cutlass_splits(N: int, M: Optional[int] = None) -> int:
     env = os.environ.get("SGLANG_TERNARY_I2S_SPLITS", "").strip()
     if env:
         try:
             return max(1, int(env))
         except ValueError:
             pass
-    return 3 if N >= 4096 else 4
+    if M is not None and M <= 16:
+        return 1
+    return 4
 
 
 def quantize_alpha_int8(alpha: torch.Tensor) -> Tuple[torch.Tensor, float]:
@@ -597,6 +611,26 @@ class TernaryLinearMethod(LinearMethodBase):
         # Handle FP8 input
         x_is_fp8 = x.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
         x_fp8_scale = getattr(x, '_fp8_scale', None)
+
+        def _log_i2s_ineligible(reason: str) -> None:
+            if not _env_flag("SGLANG_TERNARY_I2S_DEBUG", "0"):
+                return
+            cache = getattr(layer, "_ternary_i2s_ineligible_logged", None)
+            if cache is None:
+                cache = set()
+                setattr(layer, "_ternary_i2s_ineligible_logged", cache)
+            if reason in cache:
+                return
+            cache.add(reason)
+            logger.info(
+                "[TERNARY I2S CUTLASS] ineligible: %s (M=%d N=%d K=%d weight_dtype=%s x_dtype=%s)",
+                reason,
+                M,
+                N,
+                K,
+                str(weight.dtype),
+                str(x.dtype),
+            )
         
         # Convert to BF16 for compute
         if x_is_fp8:
@@ -651,6 +685,11 @@ class TernaryLinearMethod(LinearMethodBase):
             result = self._apply_i2s_cutlass(layer, x_bf16_2d, bias_bf16, M, N, K, stream)
             if result is not None:
                 return result.view(*x_shape[:-1], N)
+        else:
+            if weight.dtype != torch.uint8:
+                _log_i2s_ineligible("weight_not_uint8")
+            if x_is_fp8:
+                _log_i2s_ineligible("fp8_input")
         
         # FP16 fallback
         weight_fp16 = _get_fp16_fallback_weight(layer, torch.bfloat16, x.device)
@@ -761,16 +800,61 @@ class TernaryLinearMethod(LinearMethodBase):
 
     def _apply_i2s_cutlass(self, layer, x_bf16_2d, bias_bf16, M, N, K, stream):
         """SM100 CUTLASS fused i2s kernel (FP16 A, FP32 output)."""
+        def _log_skip(reason: str) -> None:
+            cache = getattr(layer, "_ternary_i2s_cutlass_skip_logged", None)
+            if cache is None:
+                cache = set()
+                setattr(layer, "_ternary_i2s_cutlass_skip_logged", cache)
+            if reason in cache:
+                return
+            cache.add(reason)
+            logger.info(
+                "[TERNARY I2S CUTLASS] skip: %s (M=%d N=%d K=%d dtype=%s fp8=%s)",
+                reason,
+                M,
+                N,
+                K,
+                str(x_bf16_2d.dtype),
+                "true" if x_bf16_2d.dtype in (torch.float8_e4m3fn, torch.float8_e5m2) else "false",
+            )
+
         if not I2S_CUTLASS_AVAILABLE or I2S_CUTLASS_LIB is None:
+            _log_skip("lib_not_loaded")
             return None
         if not _is_sm100():
+            _log_skip("not_sm100")
             return None
         if M <= DEFAULT_PREFILL_SKIP_M:
+            _log_skip("M_too_small")
             return None
         if (N % 64) != 0 or (K % 4) != 0 or (K % 16) != 0 or K > 8192:
+            _log_skip("shape_unsupported")
             return None
         if not _env_flag("SGLANG_TERNARY_USE_I2S_CUTLASS", "1"):
+            _log_skip("disabled_by_env")
             return None
+
+        if not x_bf16_2d.is_cuda:
+            _log_skip("x_not_cuda")
+            return None
+        if not layer.weight.is_cuda:
+            _log_skip("weight_not_cuda")
+            return None
+        if layer.weight.device != x_bf16_2d.device:
+            _log_skip("weight_device_mismatch")
+            return None
+        alpha = getattr(layer, "ternary_alpha", None)
+        if alpha is None:
+            _log_skip("alpha_missing")
+            return None
+        if not alpha.is_cuda:
+            _log_skip("alpha_not_cuda")
+            return None
+        if alpha.device != x_bf16_2d.device:
+            _log_skip("alpha_device_mismatch")
+            return None
+        if not alpha.is_contiguous():
+            alpha = alpha.contiguous()
 
         # Convert input to FP16 and pad M to 16 for CUTLASS TMA stride constraints.
         x_fp16 = x_bf16_2d.to(torch.float16)
@@ -803,16 +887,65 @@ class TernaryLinearMethod(LinearMethodBase):
         # Column-major output buffer (N, M_run) to match kernel layout.
         out_cm = torch.empty((N, M_run), device=x_fp16.device, dtype=torch.float32)
 
-        ws_bytes = int(
-            I2S_CUTLASS_LIB.i2s_fused_mixed_sm100_v8_workspace_size_for_ptrs(
-                _PTR(x_fp16.data_ptr()),
-                _PTR(layer.weight.data_ptr()),
-                _PTR(out_cm.data_ptr()),
-                _INT(M_run),
-                _INT(N),
-                _INT(K),
+        splits = _get_i2s_cutlass_splits(N, M_run)
+        ws_bytes = 0
+        if hasattr(I2S_CUTLASS_LIB, "i2s_fused_mixed_sm100_v8_workspace_size_for_ptrs_streamk"):
+            ws_bytes = int(
+                I2S_CUTLASS_LIB.i2s_fused_mixed_sm100_v8_workspace_size_for_ptrs_streamk(
+                    _PTR(x_fp16.data_ptr()),
+                    _PTR(layer.weight.data_ptr()),
+                    _PTR(out_cm.data_ptr()),
+                    _INT(M_run),
+                    _INT(N),
+                    _INT(K),
+                    _INT(splits),
+                )
             )
-        )
+        else:
+            ws_bytes = int(
+                I2S_CUTLASS_LIB.i2s_fused_mixed_sm100_v8_workspace_size_for_ptrs(
+                    _PTR(x_fp16.data_ptr()),
+                    _PTR(layer.weight.data_ptr()),
+                    _PTR(out_cm.data_ptr()),
+                    _INT(M_run),
+                    _INT(N),
+                    _INT(K),
+                )
+            )
+        if ws_bytes == 0:
+            if hasattr(I2S_CUTLASS_LIB, "i2s_fused_mixed_sm100_v8_workspace_size_streamk"):
+                ws_bytes = int(
+                    I2S_CUTLASS_LIB.i2s_fused_mixed_sm100_v8_workspace_size_streamk(
+                        _INT(M_run),
+                        _INT(N),
+                        _INT(K),
+                        _INT(splits),
+                    )
+                )
+            elif hasattr(I2S_CUTLASS_LIB, "i2s_fused_mixed_sm100_v8_workspace_size"):
+                ws_bytes = int(
+                    I2S_CUTLASS_LIB.i2s_fused_mixed_sm100_v8_workspace_size(
+                        _INT(M_run),
+                        _INT(N),
+                        _INT(K),
+                    )
+                )
+        if _env_flag("SGLANG_TERNARY_I2S_DEBUG", "0"):
+            cache = getattr(layer, "_ternary_i2s_ws_logged", None)
+            if cache is None:
+                cache = set()
+                setattr(layer, "_ternary_i2s_ws_logged", cache)
+            key = (M_run, N, K, splits)
+            if key not in cache:
+                cache.add(key)
+                logger.info(
+                    "[TERNARY I2S CUTLASS] workspace=%d (M_run=%d N=%d K=%d splits=%d)",
+                    ws_bytes,
+                    M_run,
+                    N,
+                    K,
+                    splits,
+                )
         workspace_ptr = _PTR(0)
         if ws_bytes > 0:
             cache = getattr(layer, "_ternary_i2s_cutlass_cache", None)
@@ -834,12 +967,11 @@ class TernaryLinearMethod(LinearMethodBase):
                 buf["workspace"] = ws_buf
             workspace_ptr = _PTR(ws_buf.data_ptr())
 
-        splits = _get_i2s_cutlass_splits(N)
         if I2S_CUTLASS_HAS_ALPHA_PTR and hasattr(I2S_CUTLASS_LIB, "i2s_fused_mixed_sm100_v8_run_streamk_alpha"):
             rc = I2S_CUTLASS_LIB.i2s_fused_mixed_sm100_v8_run_streamk_alpha(
                 _PTR(x_fp16.data_ptr()),
                 _PTR(layer.weight.data_ptr()),
-                _PTR(layer.ternary_alpha.data_ptr()),
+                _PTR(alpha.data_ptr()),
                 _PTR(out_cm.data_ptr()),
                 _INT(M_run),
                 _INT(N),
@@ -851,9 +983,10 @@ class TernaryLinearMethod(LinearMethodBase):
             )
         else:
             if not hasattr(I2S_CUTLASS_LIB, "i2s_fused_mixed_sm100_set_alpha_const"):
+                _log_skip("alpha_const_unavailable")
                 return None
             rc = I2S_CUTLASS_LIB.i2s_fused_mixed_sm100_set_alpha_const(
-                _PTR(layer.ternary_alpha.data_ptr()),
+                _PTR(alpha.data_ptr()),
                 _INT(K),
                 _PTR(stream),
             )
@@ -872,10 +1005,50 @@ class TernaryLinearMethod(LinearMethodBase):
                 )
 
         if rc != 0:
+            _log_skip(f"kernel_rc_{rc}")
             return None
 
         if bias_bf16 is not None:
             out_cm.add_(bias_bf16.to(torch.float32).view(-1, 1))
+
+        capture_active = torch.cuda.is_current_stream_capturing()
+        if _env_flag("SGLANG_TERNARY_I2S_SYNC", "0") and not capture_active:
+            torch.cuda.current_stream().synchronize()
+        if _env_flag("SGLANG_TERNARY_I2S_VALIDATE", "0") and not capture_active:
+            if not torch.isfinite(out_cm).all():
+                if _env_flag("SGLANG_TERNARY_I2S_DEBUG", "0"):
+                    if not getattr(layer, "_ternary_i2s_nonfinite_logged", False):
+                        layer._ternary_i2s_nonfinite_logged = True
+                        x_finite = torch.isfinite(x_fp16).all().item()
+                        alpha_finite = torch.isfinite(alpha).all().item()
+                        half_max = float(torch.finfo(torch.float16).max)
+                        x_max = x_bf16_2d.abs().max().float().item()
+                        alpha_max = alpha.abs().max().float().item()
+                        x_over = (x_bf16_2d.abs() > half_max).sum().item()
+                        alpha_over = (alpha.abs() > half_max).sum().item()
+                        logger.warning(
+                            "[TERNARY I2S CUTLASS] non_finite: x_finite=%s alpha_finite=%s "
+                            "x_max=%.4e alpha_max=%.4e x_over_half=%d alpha_over_half=%d",
+                            x_finite,
+                            alpha_finite,
+                            x_max,
+                            alpha_max,
+                            x_over,
+                            alpha_over,
+                        )
+                _log_skip("output_non_finite")
+                return None
+        if _env_flag("SGLANG_TERNARY_I2S_DEBUG", "0"):
+            if not getattr(layer, "_ternary_i2s_cutlass_hit_logged", False):
+                layer._ternary_i2s_cutlass_hit_logged = True
+                logger.info(
+                    "[TERNARY I2S CUTLASS] hit (M=%d N=%d K=%d splits=%d ws=%d)",
+                    M,
+                    N,
+                    K,
+                    splits,
+                    ws_bytes,
+                )
 
         out = out_cm.t().contiguous()
         if M_run != M:
@@ -1110,8 +1283,16 @@ class TernaryFusedMoEMethod(FusedMoEMethodBase, nn.Module):
 
     def _apply_decode_fused(self, layer, hidden_states, topk_ids, topk_weights):
         """Fully fused decode path for M=1."""
-        stream = _PTR(torch.cuda.current_stream().cuda_stream)
-        stream_id = int(stream.value) if hasattr(stream, "value") else int(stream)
+        stream_raw = torch.cuda.current_stream().cuda_stream
+        if stream_raw is None:
+            stream = _PTR(0)
+            stream_id = 0
+        else:
+            stream = _PTR(stream_raw)
+            try:
+                stream_id = int(stream_raw)
+            except TypeError:
+                stream_id = int(stream.value) if hasattr(stream, "value") and stream.value is not None else 0
         top_k = topk_ids.shape[1]
 
         # Per-stream scratch buffers to avoid cross-request corruption
@@ -1217,8 +1398,16 @@ class TernaryFusedMoEMethod(FusedMoEMethodBase, nn.Module):
 
     def _apply_decode_fused_fp8(self, layer, hidden_states, topk_ids, topk_weights):
         """FP8 decode path for M=1."""
-        stream = _PTR(torch.cuda.current_stream().cuda_stream)
-        stream_id = int(stream.value) if hasattr(stream, "value") else int(stream)
+        stream_raw = torch.cuda.current_stream().cuda_stream
+        if stream_raw is None:
+            stream = _PTR(0)
+            stream_id = 0
+        else:
+            stream = _PTR(stream_raw)
+            try:
+                stream_id = int(stream_raw)
+            except TypeError:
+                stream_id = int(stream.value) if hasattr(stream, "value") and stream.value is not None else 0
         top_k = topk_ids.shape[1]
 
         # Per-stream scratch buffers to avoid cross-request corruption

@@ -88,6 +88,16 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # INFO: Shows quantized layers and important events (default)
 export SGLANG_TERNARY_LOG_LEVEL="${SGLANG_TERNARY_LOG_LEVEL:-INFO}"
 
+# Resolve the CUTLASS i2s library path (prefer repo-local build if present).
+if [[ "$QUANT_MODE" == i2s* ]]; then
+    ALT_LIB="$SCRIPT_DIR/../ternarykernels/mangrove-turbo/libternary_cutlass_sm100.so"
+    I2S_CUTLASS_LIB_DEFAULT="$SCRIPT_DIR/libternary_cutlass_sm100.so"
+    if [[ -f "$ALT_LIB" ]]; then
+        I2S_CUTLASS_LIB_DEFAULT="$ALT_LIB"
+    fi
+    export SGLANG_I2S_CUTLASS_LIB="${SGLANG_I2S_CUTLASS_LIB:-$I2S_CUTLASS_LIB_DEFAULT}"
+fi
+
 # Startup ternary cache (speeds restarts massively; first run populates cache)
 # - Enable/disable:
 export SGLANG_TERNARY_CACHE="${SGLANG_TERNARY_CACHE:-1}"
@@ -152,7 +162,6 @@ case "$QUANT_MODE" in
         # The ternary quantization defaults to i2s mode, so we just need to specify --quantization ternary
         # Enable FlashInfer by default as it is generally faster for decode on H100
         export SGLANG_TERNARY_USE_I2S_CUTLASS="${SGLANG_TERNARY_USE_I2S_CUTLASS:-1}"
-        export SGLANG_I2S_CUTLASS_LIB="${SGLANG_I2S_CUTLASS_LIB:-$SCRIPT_DIR/libternary_cutlass_sm100.so}"
         QUANT_FLAG="--quantization ternary --attention-backend flashinfer"
         QUANT_DESC="Ternary + I2_S (8x memory reduction, FP16 inference)"
         ;;
@@ -326,6 +335,7 @@ else
 fi
 echo "GPU memory allocation: $REQUEST_GPU_MEMORY"
 echo "Ternary log level: $SGLANG_TERNARY_LOG_LEVEL"
+echo "I2S CUTLASS lib: ${SGLANG_I2S_CUTLASS_LIB:-unset}"
 echo "Fuse RMSNorm+QKV (decode,tp=1): $TERNARY_FUSE_RMSNORM_QKV"
 echo "Fuse RMSNorm+QKV allow during CUDA graph capture: $TERNARY_FUSE_RMSNORM_QKV_ALLOW_CAPTURE"
 echo "MoE decode-only (ternary MoE only on decode): $TERNARY_MOE_DECODE_ONLY"
