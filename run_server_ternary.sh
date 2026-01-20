@@ -30,7 +30,7 @@ while [[ $# -gt 0 ]]; do
             MODEL_PRESET="$2"
             shift 2
             ;;
-        fp16|i2s|i2s-tuned|i2s-tuned-dp2|i2s-kvfp8|i2s-fp8|i2s-fp8-full)
+    fp16|i2s|i2s-tuned|i2s-tuned-dp2|i2s-kvfp8|i2s-fp8|i2s-fp8-full|ternary)
             QUANT_MODE="$1"
             shift
             ;;
@@ -40,6 +40,7 @@ while [[ $# -gt 0 ]]; do
             echo "Modes:"
             echo "  fp16:           Pure FP16/BF16 (no quantization, baseline)"
             echo "  i2s:            Ternary + I2_S (8x memory reduction, FP16 inference)"
+            echo "  ternary:        Ternary-only (no FP16 fallback; i2s/BitNet only)"
             echo "  i2s-tuned:      Ternary + I2_S + Optimized FlashInfer (RECOMMENDED)"
             echo "  i2s-tuned-dp2:  i2s-tuned + Data Parallel on 2 GPUs (2x throughput)"
             echo "  i2s-kvfp8:      Ternary + I2_S + FP8 KV Cache (memory optimized, ~30% slower)"
@@ -89,7 +90,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export SGLANG_TERNARY_LOG_LEVEL="${SGLANG_TERNARY_LOG_LEVEL:-INFO}"
 
 # Resolve the CUTLASS i2s library path (prefer repo-local build if present).
-if [[ "$QUANT_MODE" == i2s* ]]; then
+if [[ "$QUANT_MODE" == i2s* || "$QUANT_MODE" == "ternary" ]]; then
     ALT_LIB="$SCRIPT_DIR/../ternarykernels/mangrove-turbo/libternary_cutlass_sm100.so"
     I2S_CUTLASS_LIB_DEFAULT="$SCRIPT_DIR/libternary_cutlass_sm100.so"
     if [[ -f "$ALT_LIB" ]]; then
@@ -164,6 +165,18 @@ case "$QUANT_MODE" in
         export SGLANG_TERNARY_USE_I2S_CUTLASS="${SGLANG_TERNARY_USE_I2S_CUTLASS:-1}"
         QUANT_FLAG="--quantization ternary --attention-backend flashinfer"
         QUANT_DESC="Ternary + I2_S (8x memory reduction, FP16 inference)"
+        ;;
+    
+    ternary)
+        # Ternary-only mode: allow int2/i2s kernels but forbid FP16 fallback.
+        export SGLANG_TERNARY_I2S_ONLY=1
+        export SGLANG_TERNARY_MOE_TRITON="${SGLANG_TERNARY_MOE_TRITON:-1}"
+        export SGLANG_TERNARY_USE_I2S_CUTLASS="${SGLANG_TERNARY_USE_I2S_CUTLASS:-1}"
+        export SGLANG_TERNARY_DROP_FP16_WEIGHTS="${SGLANG_TERNARY_DROP_FP16_WEIGHTS:-1}"
+        export SGLANG_TERNARY_USE_FP8=0
+        export SGLANG_TERNARY_FP8_BRIDGE=0
+        QUANT_FLAG="--quantization ternary --attention-backend flashinfer"
+        QUANT_DESC="Ternary-only (no FP16 fallback; i2s/BitNet only)"
         ;;
     
     i2s-tuned)
@@ -341,10 +354,17 @@ echo "Fuse RMSNorm+QKV allow during CUDA graph capture: $TERNARY_FUSE_RMSNORM_QK
 echo "MoE decode-only (ternary MoE only on decode): $TERNARY_MOE_DECODE_ONLY"
 echo "Batched MoE max tokens: $TERNARY_BATCHED_MOE_MAX_TOKENS (0=disabled)"
 echo "Batched MoE debug logging: $TERNARY_BATCHED_MOE_DEBUG"
+echo "Batched ternary MoE (Triton): ${SGLANG_TERNARY_MOE_TRITON:-0}"
+if [[ "${SGLANG_TERNARY_I2S_ONLY:-0}" == "1" && "${SGLANG_TERNARY_DROP_FP16_WEIGHTS:-0}" == "1" && "${SGLANG_TERNARY_MOE_TRITON:-0}" != "1" ]]; then
+    echo "WARNING: Ternary-only + drop-FP16 is enabled but SGLANG_TERNARY_MOE_TRITON=0."
+    echo "         M>1 MoE will fall back to FP16 and fail during CUDA graph capture."
+fi
 echo "Quantize LM head (TERNARY_QUANTIZE_LM_HEAD): $TERNARY_QUANTIZE_LM_HEAD"
 echo "SGLANG_PROFILE_OPLEVEL (1 disables cuda graphs/overlap/compile): $SGLANG_PROFILE_OPLEVEL"
 echo "TORCH_COMPILE_DISABLE: ${TORCH_COMPILE_DISABLE:-0}  TORCHINDUCTOR_DISABLE: ${TORCHINDUCTOR_DISABLE:-0}"
 echo "Pinned output copy: $SGLANG_ENABLE_PINNED_OUTPUT_COPY (max_bytes=$SGLANG_PINNED_OUTPUT_COPY_MAX_BYTES)"
+echo "Ternary-only (no FP16 fallback): ${SGLANG_TERNARY_I2S_ONLY:-0}"
+echo "Drop FP16 ternary weights: ${SGLANG_TERNARY_DROP_FP16_WEIGHTS:-0}"
 if [[ "$TERNARY_ENABLE_PROFILING" == "1" ]]; then
     echo "Ternary profiling: ENABLED (output: $TERNARY_PROFILE_OUTPUT)"
 else

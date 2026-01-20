@@ -295,6 +295,62 @@ def _env_flag(name: str, default: str = "0") -> bool:
     return os.environ.get(name, default).strip().lower() in ("1", "true", "yes", "on")
 
 
+_TERNARY_GATE_SKIP_LOG: set[str] = set()
+_TERNARY_MOE_VALIDATE_COUNT = 0
+_TERNARY_MOE_VALIDATE_DONE: set[str] = set()
+
+
+def _record_gate_skip(prefix: str, reason: str) -> None:
+    if not _env_flag("SGLANG_TERNARY_LIST_GATING_LAYERS", "0"):
+        return
+    name = prefix if prefix else "<unknown>"
+    _TERNARY_GATE_SKIP_LOG.add(f"{name}\t{reason}")
+
+
+def write_gate_skip_report(path: str) -> None:
+    if not _TERNARY_GATE_SKIP_LOG:
+        return
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        for line in sorted(_TERNARY_GATE_SKIP_LOG):
+            f.write(line + "\n")
+
+
+def _should_validate_moe(layer: nn.Module) -> bool:
+    if not _env_flag("SGLANG_TERNARY_MOE_VALIDATE", "0"):
+        return False
+    if _is_dynamo_compiling():
+        return False
+    if torch.cuda.is_current_stream_capturing():
+        return False
+    max_layers = int(os.environ.get("SGLANG_TERNARY_MOE_VALIDATE_MAX_LAYERS", "1"))
+    global _TERNARY_MOE_VALIDATE_COUNT
+    if _TERNARY_MOE_VALIDATE_COUNT >= max_layers:
+        return False
+    prefix = getattr(layer, "_ternary_prefix", "") or f"layer_{id(layer)}"
+    if prefix in _TERNARY_MOE_VALIDATE_DONE:
+        return False
+    only_prefix = os.environ.get("SGLANG_TERNARY_MOE_VALIDATE_PREFIX")
+    if only_prefix and only_prefix not in prefix:
+        return False
+    _TERNARY_MOE_VALIDATE_DONE.add(prefix)
+    _TERNARY_MOE_VALIDATE_COUNT += 1
+    return True
+
+
+def _force_ternary_only() -> bool:
+    return _env_flag("SGLANG_TERNARY_I2S_ONLY", "0") or _env_flag(
+        "SGLANG_TERNARY_DROP_FP16_WEIGHTS", "0"
+    )
+
+
+def _drop_fp16_weights() -> bool:
+    env = os.environ.get("SGLANG_TERNARY_DROP_FP16_WEIGHTS")
+    if env is None:
+        return _env_flag("SGLANG_TERNARY_I2S_ONLY", "0")
+    return env.strip().lower() in ("1", "true", "yes", "on")
+
+
 def _is_sm100() -> bool:
     if not torch.cuda.is_available():
         return False
@@ -302,16 +358,35 @@ def _is_sm100() -> bool:
     return major >= 10
 
 
-def _get_i2s_cutlass_splits(N: int, M: Optional[int] = None) -> int:
+def _get_i2s_cutlass_splits(N: int, M: Optional[int] = None, K: Optional[int] = None) -> int:
     env = os.environ.get("SGLANG_TERNARY_I2S_SPLITS", "").strip()
     if env:
         try:
             return max(1, int(env))
         except ValueError:
             pass
-    if M is not None and M <= 16:
+    if M is None or K is None:
+        return 1 if (M is not None and M <= 16) else 4
+    if M <= 16:
         return 1
-    return 4
+    # Heuristic based on SM count and tile size.
+    tile_m = 64
+    tile_k = 32
+    tile_n = 32 if N <= 1024 else 64
+    tiles_m = (M + tile_m - 1) // tile_m
+    tiles_n = (N + tile_n - 1) // tile_n
+    total_tiles = tiles_m * tiles_n
+    if not torch.cuda.is_available():
+        return 4
+    num_sms = torch.cuda.get_device_properties(0).multi_processor_count
+    target_tiles = max(1, num_sms * 3)
+    if total_tiles >= target_tiles:
+        return 1
+    splits = (target_tiles + total_tiles - 1) // total_tiles
+    # Prefer powers of two for reduction tree.
+    splits = 1 << (splits - 1).bit_length()
+    max_splits = max(1, (K + tile_k - 1) // tile_k)
+    return max(1, min(splits, max_splits))
 
 
 def quantize_alpha_int8(alpha: torch.Tensor) -> Tuple[torch.Tensor, float]:
@@ -392,6 +467,21 @@ def replace_parameter(layer: nn.Module, name: str, new_param: torch.Tensor) -> N
     layer.register_parameter(name, Parameter(new_param, requires_grad=False))
 
 
+def _drop_moe_fp16_weights(layer: nn.Module) -> None:
+    if not _drop_fp16_weights():
+        return
+    dropped = False
+    for name in ("w13_weight", "w2_weight"):
+        weight = getattr(layer, name, None)
+        if not isinstance(weight, torch.Tensor):
+            continue
+        empty = torch.empty(0, device=weight.device, dtype=weight.dtype)
+        replace_parameter(layer, name, empty)
+        dropped = True
+    if dropped:
+        layer._ternary_moe_fp16_dropped = True
+
+
 # ============================================================================
 # TernaryConfig
 # ============================================================================
@@ -468,8 +558,10 @@ class TernaryConfig(QuantizationConfig):
         if "lm_head" in pref and os.environ.get("TERNARY_QUANTIZE_LM_HEAD", "0") != "1":
             return None
 
-        # Skip MoE gates but allow MLP gate_proj
-        if "gate" in pref and "gate_proj" not in pref:
+        # Keep router/gating layers in FP16/BF16 for stability.
+        parts = pref.split(".")
+        if any(p in ("router", "gate", "shared_expert_gate") for p in parts):
+            _record_gate_skip(prefix, "router_or_gate")
             return None
 
         layer_class_name = type(layer).__name__
@@ -540,9 +632,10 @@ class TernaryLinearMethod(LinearMethodBase):
             weight_packed = pack_i2s_weights(weight_ternary_sign.float())
             replace_parameter(layer, "weight", weight_packed)
 
-            # Pack for BitNet kernel if available
+            # Pack for BitNet kernel if available (still ternary/int2)
+            use_bitnet_kernel = self.quant_config.use_bitnet_kernel
             bitnet_packed = False
-            if BITNET_PACK_AVAILABLE:
+            if use_bitnet_kernel and BITNET_PACK_AVAILABLE:
                 try:
                     weight_bitnet = convert_weight_int8_to_int2(weight_ternary_sign).contiguous()
                     if device.type == "cuda":
@@ -579,6 +672,12 @@ class TernaryLinearMethod(LinearMethodBase):
         layer._ternary_weight_shape = (N, K)
         layer._ternary_K = K
         layer._ternary_N = N
+        if _drop_fp16_weights():
+            if hasattr(layer, "_ternary_weight_fp16"):
+                layer._buffers.pop("_ternary_weight_fp16", None)
+                delattr(layer, "_ternary_weight_fp16")
+            if hasattr(layer, "_ternary_weight_fp16_cache"):
+                delattr(layer, "_ternary_weight_fp16_cache")
                 
     @_dynamo_disable
     @torch.no_grad()
@@ -598,8 +697,10 @@ class TernaryLinearMethod(LinearMethodBase):
         
         # Check kernel eligibility
         bitnet_enabled = getattr(layer, '_ternary_bitnet_enabled', False)
+        force_ternary_only = _force_ternary_only()
         can_use_kernel = (
             not _is_dynamo_compiling()
+            and self.quant_config.use_bitnet_kernel
             and bitnet_enabled
             and BITNET_CUDA_AVAILABLE
             and BITNET_LIB is not None
@@ -690,6 +791,11 @@ class TernaryLinearMethod(LinearMethodBase):
                 _log_i2s_ineligible("weight_not_uint8")
             if x_is_fp8:
                 _log_i2s_ineligible("fp8_input")
+        if force_ternary_only:
+            raise RuntimeError(
+                "Ternary-only mode enabled but no ternary kernel ran. "
+                "Enable SGLANG_TERNARY_I2S_DEBUG=1 for skip reason."
+            )
         
         # FP16 fallback
         weight_fp16 = _get_fp16_fallback_weight(layer, torch.bfloat16, x.device)
@@ -824,7 +930,7 @@ class TernaryLinearMethod(LinearMethodBase):
         if not _is_sm100():
             _log_skip("not_sm100")
             return None
-        if M <= DEFAULT_PREFILL_SKIP_M:
+        if M <= DEFAULT_PREFILL_SKIP_M and not _force_ternary_only():
             _log_skip("M_too_small")
             return None
         if (N % 64) != 0 or (K % 4) != 0 or (K % 16) != 0 or K > 8192:
@@ -887,10 +993,10 @@ class TernaryLinearMethod(LinearMethodBase):
         # Column-major output buffer (N, M_run) to match kernel layout.
         out_cm = torch.empty((N, M_run), device=x_fp16.device, dtype=torch.float32)
 
-        splits = _get_i2s_cutlass_splits(N, M_run)
-        ws_bytes = 0
+        splits = _get_i2s_cutlass_splits(N, M_run, K)
+        ws_bytes_ptr = 0
         if hasattr(I2S_CUTLASS_LIB, "i2s_fused_mixed_sm100_v8_workspace_size_for_ptrs_streamk"):
-            ws_bytes = int(
+            ws_bytes_ptr = int(
                 I2S_CUTLASS_LIB.i2s_fused_mixed_sm100_v8_workspace_size_for_ptrs_streamk(
                     _PTR(x_fp16.data_ptr()),
                     _PTR(layer.weight.data_ptr()),
@@ -902,7 +1008,7 @@ class TernaryLinearMethod(LinearMethodBase):
                 )
             )
         else:
-            ws_bytes = int(
+            ws_bytes_ptr = int(
                 I2S_CUTLASS_LIB.i2s_fused_mixed_sm100_v8_workspace_size_for_ptrs(
                     _PTR(x_fp16.data_ptr()),
                     _PTR(layer.weight.data_ptr()),
@@ -912,24 +1018,25 @@ class TernaryLinearMethod(LinearMethodBase):
                     _INT(K),
                 )
             )
-        if ws_bytes == 0:
-            if hasattr(I2S_CUTLASS_LIB, "i2s_fused_mixed_sm100_v8_workspace_size_streamk"):
-                ws_bytes = int(
-                    I2S_CUTLASS_LIB.i2s_fused_mixed_sm100_v8_workspace_size_streamk(
-                        _INT(M_run),
-                        _INT(N),
-                        _INT(K),
-                        _INT(splits),
-                    )
+        ws_bytes_shape = 0
+        if hasattr(I2S_CUTLASS_LIB, "i2s_fused_mixed_sm100_v8_workspace_size_streamk"):
+            ws_bytes_shape = int(
+                I2S_CUTLASS_LIB.i2s_fused_mixed_sm100_v8_workspace_size_streamk(
+                    _INT(M_run),
+                    _INT(N),
+                    _INT(K),
+                    _INT(splits),
                 )
-            elif hasattr(I2S_CUTLASS_LIB, "i2s_fused_mixed_sm100_v8_workspace_size"):
-                ws_bytes = int(
-                    I2S_CUTLASS_LIB.i2s_fused_mixed_sm100_v8_workspace_size(
-                        _INT(M_run),
-                        _INT(N),
-                        _INT(K),
-                    )
+            )
+        elif hasattr(I2S_CUTLASS_LIB, "i2s_fused_mixed_sm100_v8_workspace_size"):
+            ws_bytes_shape = int(
+                I2S_CUTLASS_LIB.i2s_fused_mixed_sm100_v8_workspace_size(
+                    _INT(M_run),
+                    _INT(N),
+                    _INT(K),
                 )
+            )
+        ws_bytes = max(ws_bytes_ptr, ws_bytes_shape)
         if _env_flag("SGLANG_TERNARY_I2S_DEBUG", "0"):
             cache = getattr(layer, "_ternary_i2s_ws_logged", None)
             if cache is None:
@@ -967,33 +1074,14 @@ class TernaryLinearMethod(LinearMethodBase):
                 buf["workspace"] = ws_buf
             workspace_ptr = _PTR(ws_buf.data_ptr())
 
-        if I2S_CUTLASS_HAS_ALPHA_PTR and hasattr(I2S_CUTLASS_LIB, "i2s_fused_mixed_sm100_v8_run_streamk_alpha"):
-            rc = I2S_CUTLASS_LIB.i2s_fused_mixed_sm100_v8_run_streamk_alpha(
-                _PTR(x_fp16.data_ptr()),
-                _PTR(layer.weight.data_ptr()),
-                _PTR(alpha.data_ptr()),
-                _PTR(out_cm.data_ptr()),
-                _INT(M_run),
-                _INT(N),
-                _INT(K),
-                _INT(splits),
-                workspace_ptr,
-                _SIZE_T(ws_bytes),
-                _PTR(stream),
-            )
-        else:
-            if not hasattr(I2S_CUTLASS_LIB, "i2s_fused_mixed_sm100_set_alpha_const"):
-                _log_skip("alpha_const_unavailable")
-                return None
-            rc = I2S_CUTLASS_LIB.i2s_fused_mixed_sm100_set_alpha_const(
-                _PTR(alpha.data_ptr()),
-                _INT(K),
-                _PTR(stream),
-            )
-            if rc == 0:
-                rc = I2S_CUTLASS_LIB.i2s_fused_mixed_sm100_v8_run_streamk(
+        def _run_i2s(workspace_ptr, ws_bytes) -> int:
+            if I2S_CUTLASS_HAS_ALPHA_PTR and hasattr(
+                I2S_CUTLASS_LIB, "i2s_fused_mixed_sm100_v8_run_streamk_alpha"
+            ):
+                return I2S_CUTLASS_LIB.i2s_fused_mixed_sm100_v8_run_streamk_alpha(
                     _PTR(x_fp16.data_ptr()),
                     _PTR(layer.weight.data_ptr()),
+                    _PTR(alpha.data_ptr()),
                     _PTR(out_cm.data_ptr()),
                     _INT(M_run),
                     _INT(N),
@@ -1003,6 +1091,67 @@ class TernaryLinearMethod(LinearMethodBase):
                     _SIZE_T(ws_bytes),
                     _PTR(stream),
                 )
+            if not hasattr(I2S_CUTLASS_LIB, "i2s_fused_mixed_sm100_set_alpha_const"):
+                _log_skip("alpha_const_unavailable")
+                return -1
+            rc_inner = I2S_CUTLASS_LIB.i2s_fused_mixed_sm100_set_alpha_const(
+                _PTR(alpha.data_ptr()),
+                _INT(K),
+                _PTR(stream),
+            )
+            if rc_inner != 0:
+                return rc_inner
+            return I2S_CUTLASS_LIB.i2s_fused_mixed_sm100_v8_run_streamk(
+                _PTR(x_fp16.data_ptr()),
+                _PTR(layer.weight.data_ptr()),
+                _PTR(out_cm.data_ptr()),
+                _INT(M_run),
+                _INT(N),
+                _INT(K),
+                _INT(splits),
+                workspace_ptr,
+                _SIZE_T(ws_bytes),
+                _PTR(stream),
+            )
+
+        rc = _run_i2s(workspace_ptr, ws_bytes)
+        if rc == 11:
+            # Retry with a growing workspace size to handle under-reported requirements.
+            max_mb = int(os.environ.get("SGLANG_TERNARY_I2S_WS_GROW_MAX_MB", "256"))
+            max_bytes = max_mb * 1024 * 1024
+            grow_bytes = max(ws_bytes, 1 << 20)  # start with at least 1MB
+            while rc == 11 and grow_bytes <= max_bytes:
+                if _env_flag("SGLANG_TERNARY_I2S_DEBUG", "0"):
+                    logger.info(
+                        "[TERNARY I2S CUTLASS] retry rc=11: ws=%d -> %d (M=%d N=%d K=%d splits=%d)",
+                        ws_bytes,
+                        grow_bytes,
+                        M_run,
+                        N,
+                        K,
+                        splits,
+                    )
+                ws_bytes = grow_bytes
+                cache = getattr(layer, "_ternary_i2s_cutlass_cache", None)
+                if cache is None:
+                    cache = {}
+                    setattr(layer, "_ternary_i2s_cutlass_cache", cache)
+                stream_id = int(stream)
+                buf = cache.get(stream_id)
+                if buf is None:
+                    buf = {}
+                    cache[stream_id] = buf
+                ws_buf = buf.get("workspace")
+                if (
+                    ws_buf is None
+                    or ws_buf.numel() < ws_bytes
+                    or ws_buf.device != x_fp16.device
+                ):
+                    ws_buf = torch.empty(ws_bytes, device=x_fp16.device, dtype=torch.uint8)
+                    buf["workspace"] = ws_buf
+                workspace_ptr = _PTR(ws_buf.data_ptr())
+                rc = _run_i2s(workspace_ptr, ws_bytes)
+                grow_bytes *= 2
 
         if rc != 0:
             _log_skip(f"kernel_rc_{rc}")
@@ -1197,6 +1346,7 @@ class TernaryFusedMoEMethod(FusedMoEMethodBase, nn.Module):
             layer._use_full_fusion = False
         
         layer._ternary_moe_enabled = True
+        _drop_moe_fp16_weights(layer)
         
     @_dynamo_disable
     def apply(self, layer: torch.nn.Module, dispatch_output):
@@ -1208,9 +1358,15 @@ class TernaryFusedMoEMethod(FusedMoEMethodBase, nn.Module):
         hidden_states = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
         moe_runner_config = getattr(layer, '_ternary_moe_runner_config', None) or MoeRunnerConfig()
+        force_ternary_only = _force_ternary_only() or getattr(layer, "_ternary_moe_fp16_dropped", False)
         
         # Check format
         if not hasattr(topk_output, 'topk_weights') or not hasattr(topk_output, 'topk_ids'):
+            if force_ternary_only:
+                raise RuntimeError(
+                    "Ternary-only mode enabled but MoE fallback requires FP16 weights "
+                    "(missing topk info)."
+                )
             return StandardCombineInput(hidden_states=fused_moe(
                 hidden_states=hidden_states,
                 w1=layer.w13_weight, w2=layer.w2_weight,
@@ -1258,8 +1414,27 @@ class TernaryFusedMoEMethod(FusedMoEMethodBase, nn.Module):
                         layer._decode_fused_fail_logged = True
                         logger.warning(f"[TERNARY MoE] _apply_decode_fused returned None, using fallback")
         
-        # M>1 batched CUDA kernels - DISABLED due to correctness issues
-        # Always use fused_moe fallback for M>1
+        # M>1 batched ternary path (Triton) when available
+        if num_tokens > 1:
+            use_batched_ternary = _env_flag(
+                "SGLANG_TERNARY_MOE_TRITON",
+                "1" if force_ternary_only else "0",
+            )
+            if use_batched_ternary:
+                result = self._apply_batched_triton(
+                    layer,
+                    hidden_states,
+                    topk_ids,
+                    topk_weights,
+                    moe_runner_config,
+                )
+                if result is not None:
+                    return StandardCombineInput(hidden_states=result)
+                if force_ternary_only:
+                    raise RuntimeError(
+                        "Ternary-only mode enabled but batched ternary MoE path failed. "
+                        "Set SGLANG_TERNARY_MOE_TRITON=0 to allow FP16 fallback."
+                    )
         
         # Log first M>1 call for debugging
         if num_tokens > 1 and not getattr(layer, '_moe_batched_fallback_logged', False):
@@ -1274,12 +1449,238 @@ class TernaryFusedMoEMethod(FusedMoEMethodBase, nn.Module):
             # Use .clone() to ensure we don't have any aliasing issues
             hidden_states_for_moe = hidden_states.to(torch.bfloat16).clone()
         
+        if force_ternary_only:
+            raise RuntimeError(
+                "Ternary-only mode enabled but MoE fallback requires FP16 weights "
+                "(M>1 ternary kernels are disabled). "
+                "Set SGLANG_TERNARY_MOE_TRITON=1 to enable the batched ternary MoE path "
+                "or disable SGLANG_TERNARY_I2S_ONLY/SGLANG_TERNARY_DROP_FP16_WEIGHTS to allow FP16 fallback."
+            )
         return StandardCombineInput(hidden_states=fused_moe(
             hidden_states=hidden_states_for_moe,
             w1=layer.w13_weight, w2=layer.w2_weight,
             topk_output=topk_output,
             moe_runner_config=moe_runner_config,
         ))
+
+    def _apply_batched_triton(
+        self,
+        layer: torch.nn.Module,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        moe_runner_config,
+    ) -> Optional[torch.Tensor]:
+        try:
+            from sglang.srt.layers.moe.fused_moe_triton.fused_moe_ternary_kernel import (
+                invoke_fused_moe_ternary_kernel,
+                get_default_ternary_moe_config,
+            )
+            from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
+                moe_sum_reduce_torch_compile,
+                moe_sum_reduce_triton,
+            )
+            from sglang.srt.layers.moe.fused_moe_triton.moe_align_block_size import (
+                moe_align_block_size,
+            )
+        except Exception as e:
+            logger.debug(f"[TERNARY MoE] Triton ternary kernel unavailable: {e}")
+            return None
+
+        if moe_runner_config.activation != "silu":
+            logger.warning(
+                "[TERNARY MoE] Triton batched path only supports SiLU activation."
+            )
+            return None
+        if moe_runner_config.apply_router_weight_on_input:
+            logger.warning(
+                "[TERNARY MoE] apply_router_weight_on_input not supported in batched ternary path."
+            )
+            return None
+
+        if not getattr(layer, "_ternary_moe_v4_enabled", False):
+            return None
+        if not (
+            hasattr(layer, "_ternary_w13_packed")
+            and hasattr(layer, "_ternary_w2_packed")
+            and hasattr(layer, "_ternary_moe_alpha_w13")
+            and hasattr(layer, "_ternary_moe_alpha_w2")
+        ):
+            return None
+
+        if hidden_states.dtype != torch.bfloat16:
+            hidden_states = hidden_states.to(torch.bfloat16)
+
+        M = hidden_states.shape[0]
+        top_k = int(topk_ids.shape[1])
+        num_experts = int(getattr(layer, "_ternary_moe_num_experts"))
+        hidden_size = int(getattr(layer, "_ternary_moe_hidden_size"))
+        intermediate_size = int(getattr(layer, "_ternary_moe_intermediate_size"))
+        N_w13 = 2 * intermediate_size
+        gate_cfg = get_default_ternary_moe_config("gate_up", m=M)
+        down_cfg = get_default_ternary_moe_config("down", m=M * top_k)
+
+        gate_sorted_ids, gate_expert_ids, gate_num_post = moe_align_block_size(
+            topk_ids, gate_cfg["BLOCK_SIZE_M"], num_experts
+        )
+        down_sorted_ids, down_expert_ids, down_num_post = moe_align_block_size(
+            topk_ids, down_cfg["BLOCK_SIZE_M"], num_experts
+        )
+
+        stream_raw = torch.cuda.current_stream().cuda_stream
+        if stream_raw is None:
+            stream_id = 0
+        else:
+            try:
+                stream_id = int(stream_raw)
+            except TypeError:
+                stream_id = int(stream_raw.value) if hasattr(stream_raw, "value") and stream_raw.value is not None else 0
+
+        cache = getattr(layer, "_ternary_moe_batched_cache", None)
+        if cache is None:
+            cache = {}
+            setattr(layer, "_ternary_moe_batched_cache", cache)
+        key = (stream_id, M, top_k)
+        buf = cache.get(key)
+        if buf is None:
+            buf = {
+                "gateup_out": torch.empty((M, top_k, N_w13), device=hidden_states.device, dtype=torch.bfloat16),
+                "intermediate": torch.empty((M * top_k, intermediate_size), device=hidden_states.device, dtype=torch.bfloat16),
+                "down_out": torch.empty((M, top_k, hidden_size), device=hidden_states.device, dtype=torch.bfloat16),
+                "out": torch.empty((M, hidden_size), device=hidden_states.device, dtype=torch.bfloat16),
+            }
+            cache[key] = buf
+
+        gateup_out = buf["gateup_out"]
+        intermediate = buf["intermediate"]
+        down_out = buf["down_out"]
+        out = buf["out"]
+
+        invoke_fused_moe_ternary_kernel(
+            hidden_states,
+            layer._ternary_w13_packed,
+            layer._ternary_moe_alpha_w13,
+            gateup_out,
+            topk_weights,
+            topk_ids,
+            gate_sorted_ids,
+            gate_expert_ids,
+            gate_num_post,
+            False,
+            top_k,
+            config=gate_cfg,
+        )
+
+        try:
+            from sgl_kernel import silu_and_mul  # type: ignore
+            silu_and_mul(gateup_out.view(-1, N_w13), intermediate)
+        except Exception:
+            gate, up = gateup_out.view(-1, N_w13).chunk(2, dim=-1)
+            intermediate.copy_(torch.nn.functional.silu(gate) * up)
+
+        # Second GEMM: treat top_k as 1 so sorted_token_ids index directly into [M*topk, K]
+        invoke_fused_moe_ternary_kernel(
+            intermediate,
+            layer._ternary_w2_packed,
+            layer._ternary_moe_alpha_w2,
+            down_out,
+            topk_weights,
+            topk_ids,
+            down_sorted_ids,
+            down_expert_ids,
+            down_num_post,
+            True,
+            1,
+            config=down_cfg,
+        )
+
+        if _should_validate_moe(layer):
+            max_tokens = int(os.environ.get("SGLANG_TERNARY_MOE_VALIDATE_MAX_TOKENS", "1"))
+            max_topk = int(os.environ.get("SGLANG_TERNARY_MOE_VALIDATE_MAX_TOPK", "1"))
+            tokens_to_check = min(M, max_tokens)
+            topk_to_check = min(top_k, max_topk)
+            if tokens_to_check > 0 and topk_to_check > 0:
+                with torch.no_grad():
+                    w13_cache: Dict[int, torch.Tensor] = {}
+                    w2_cache: Dict[int, torch.Tensor] = {}
+                    gate_abs_max = 0.0
+                    gate_rel_max = 0.0
+                    down_abs_max = 0.0
+                    down_rel_max = 0.0
+                    for t in range(tokens_to_check):
+                        x_t = hidden_states[t:t + 1]
+                        for j in range(topk_to_check):
+                            e = int(topk_ids[t, j])
+                            w13 = w13_cache.get(e)
+                            if w13 is None:
+                                w13 = unpack_i2s_weights(
+                                    layer._ternary_w13_packed[e],
+                                    hidden_size,
+                                    layer._ternary_moe_alpha_w13[e],
+                                    torch.bfloat16,
+                                )
+                                w13_cache[e] = w13
+                            gate_ref = (x_t @ w13.t()).squeeze(0).float()
+                            gate_act = gateup_out[t, j].float()
+                            gate_diff = (gate_act - gate_ref).abs()
+                            gate_abs_max = max(gate_abs_max, gate_diff.max().item())
+                            gate_rel_max = max(
+                                gate_rel_max,
+                                (gate_diff / (gate_ref.abs() + 1e-6)).max().item(),
+                            )
+
+                            gate = gateup_out[t, j, :intermediate_size].float()
+                            up = gateup_out[t, j, intermediate_size:].float()
+                            inter_ref = (F.silu(gate) * up).to(torch.bfloat16)
+                            w2 = w2_cache.get(e)
+                            if w2 is None:
+                                w2 = unpack_i2s_weights(
+                                    layer._ternary_w2_packed[e],
+                                    intermediate_size,
+                                    layer._ternary_moe_alpha_w2[e],
+                                    torch.bfloat16,
+                                )
+                                w2_cache[e] = w2
+                            down_ref = (inter_ref @ w2.t()).float()
+                            down_ref = down_ref * topk_weights[t, j].float()
+                            down_act = down_out[t, j].float()
+                            down_diff = (down_act - down_ref).abs()
+                            down_abs_max = max(down_abs_max, down_diff.max().item())
+                            down_rel_max = max(
+                                down_rel_max,
+                                (down_diff / (down_ref.abs() + 1e-6)).max().item(),
+                            )
+                    prefix = getattr(layer, "_ternary_prefix", "<unknown>")
+                    logger.warning(
+                        "[TERNARY MoE VALIDATE] %s tokens=%d topk=%d "
+                        "gate_abs=%.4e gate_rel=%.4e down_abs=%.4e down_rel=%.4e",
+                        prefix,
+                        tokens_to_check,
+                        topk_to_check,
+                        gate_abs_max,
+                        gate_rel_max,
+                        down_abs_max,
+                        down_rel_max,
+                    )
+
+        routed_scaling_factor = moe_runner_config.routed_scaling_factor
+        if routed_scaling_factor is None:
+            routed_scaling_factor = 1.0
+
+        if moe_runner_config.no_combine:
+            return down_out.view(M, top_k, hidden_size)
+
+        if top_k == 1 and routed_scaling_factor == 1.0:
+            out.copy_(down_out.squeeze(1))
+        elif top_k == 2 and routed_scaling_factor == 1.0:
+            out.copy_(down_out[:, 0] + down_out[:, 1])
+        else:
+            if M <= 32:
+                moe_sum_reduce_torch_compile(down_out, out, routed_scaling_factor)
+            else:
+                moe_sum_reduce_triton(down_out, out, routed_scaling_factor)
+
+        return out
 
     def _apply_decode_fused(self, layer, hidden_states, topk_ids, topk_weights):
         """Fully fused decode path for M=1."""

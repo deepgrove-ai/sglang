@@ -18,6 +18,8 @@ Scale layout: [num_experts, K] as float32 (per-expert, per-K scale)
 
 from __future__ import annotations
 
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -73,6 +75,7 @@ def fused_moe_ternary_kernel(
     top_k: tl.constexpr,
     compute_type: tl.constexpr,
     even_Ks: tl.constexpr,
+    FP32_ALPHA: tl.constexpr,
 ):
     """
     Fused MoE kernel with ternary weight support.
@@ -80,7 +83,7 @@ def fused_moe_ternary_kernel(
     Key differences from standard fused_moe_kernel:
     1. Weights are packed (4 values per byte)
     2. Unpacking happens in-kernel
-    3. Per-expert scale is applied after accumulation
+    3. Per-expert, per-K scale is applied in-kernel to dequantize weights
     """
     # Map program ID to output block
     pid = tl.program_id(axis=0)
@@ -117,20 +120,14 @@ def fused_moe_ternary_kernel(
 
     # Initialize pointers
     offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)) % N
-    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    token_idx = offs_token // top_k
+    base_a = a_ptr + token_idx[:, None] * stride_am
+    alpha_base = alpha_ptr + off_experts * stride_alphae
     
-    # Activation pointer: [M, K]
-    a_ptrs = a_ptr + (
-        offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak
-    )
-    
-    # Weight pointer: [E, N, K//4] - note K//4 for packed weights
-    # We'll load BLOCK_SIZE_K bytes which unpacks to BLOCK_SIZE_K*4 values
-    K_packed = K // 4
-    b_ptrs = (
+    # Precompute base pointers (A rows and B expert slice) to save inner-loop math.
+    b_base = (
         b_ptr
         + off_experts * stride_be
-        + (offs_k[:, None] // 4) * stride_bk  # K dimension is packed
         + offs_bn[None, :] * stride_bn
     )
 
@@ -153,61 +150,51 @@ def fused_moe_ternary_kernel(
         if even_Ks:
             # No K-masking needed (K % BLOCK_SIZE_K == 0)
             b_bytes = tl.load(
-                b_ptr
-                + off_experts * stride_be
-                + ((k_start // 4 + offs_k_packed)[:, None]) * stride_bk
-                + offs_bn[None, :] * stride_bn,
+                b_base + ((k_start // 4 + offs_k_packed)[:, None]) * stride_bk,
             )
 
             for lane in tl.static_range(0, 4):
                 k_idx = k_base + lane
-                alpha_lane = tl.load(
-                    alpha_ptr
-                    + off_experts * stride_alphae
-                    + k_idx.to(tl.int64) * stride_alphak
-                ).to(compute_type)
+                alpha_lane = tl.load(alpha_base + k_idx.to(tl.int64) * stride_alphak)
                 a_lane = tl.load(
-                    a_ptr
-                    + (offs_token[:, None] // top_k) * stride_am
-                    + k_idx[None, :] * stride_ak,
+                    base_a + k_idx[None, :] * stride_ak,
                     mask=token_mask[:, None],
                     other=0.0,
                 )
-                a_lane = a_lane * alpha_lane[None, :]
                 b_lane = ((b_bytes >> (lane * 2)) & 0x3).to(tl.int8) - 1
-                accumulator += tl.dot(a_lane, b_lane.to(compute_type))
+                if FP32_ALPHA:
+                    b_lane = (b_lane.to(tl.float32) * alpha_lane[:, None].to(tl.float32)).to(compute_type)
+                else:
+                    b_lane = b_lane.to(compute_type) * alpha_lane[:, None].to(compute_type)
+                accumulator += tl.dot(a_lane, b_lane)
         else:
             # Masked tail
             k_mask_packed = k_base < K
             b_bytes = tl.load(
-                b_ptr
-                + off_experts * stride_be
-                + ((k_start // 4 + offs_k_packed)[:, None]) * stride_bk
-                + offs_bn[None, :] * stride_bn,
+                b_base + ((k_start // 4 + offs_k_packed)[:, None]) * stride_bk,
                 mask=k_mask_packed[:, None],
-                other=1,  # encode 0 weight (01 -> 0) for masked bytes
+                other=0x55,  # encode 0 weight (01 -> 0) for all 2-bit lanes
             )
 
             for lane in tl.static_range(0, 4):
                 k_idx = k_base + lane
                 k_mask = k_idx < K
                 alpha_lane = tl.load(
-                    alpha_ptr
-                    + off_experts * stride_alphae
-                    + k_idx.to(tl.int64) * stride_alphak,
+                    alpha_base + k_idx.to(tl.int64) * stride_alphak,
                     mask=k_mask,
                     other=0.0,
-                ).to(compute_type)
+                )
                 a_lane = tl.load(
-                    a_ptr
-                    + (offs_token[:, None] // top_k) * stride_am
-                    + k_idx[None, :] * stride_ak,
+                    base_a + k_idx[None, :] * stride_ak,
                     mask=token_mask[:, None] & k_mask[None, :],
                     other=0.0,
                 )
-                a_lane = a_lane * alpha_lane[None, :]
                 b_lane = ((b_bytes >> (lane * 2)) & 0x3).to(tl.int8) - 1
-                accumulator += tl.dot(a_lane, b_lane.to(compute_type))
+                if FP32_ALPHA:
+                    b_lane = (b_lane.to(tl.float32) * alpha_lane[:, None].to(tl.float32)).to(compute_type)
+                else:
+                    b_lane = b_lane.to(compute_type) * alpha_lane[:, None].to(compute_type)
+                accumulator += tl.dot(a_lane, b_lane)
 
     # Apply routing weight if needed
     if MUL_ROUTED_WEIGHT:
@@ -311,6 +298,8 @@ DEFAULT_TERNARY_MOE_CONFIG = {
     # Reasonable fallbacks if the caller doesn't set them.
     "num_warps": 4,
     "num_stages": 4,
+    # Compute alpha scaling in FP32 for correctness by default.
+    "FP32_ALPHA": 1,
 }
 
 
@@ -392,6 +381,8 @@ def get_default_ternary_moe_config(kind: str, m: int) -> dict:
       - bucket 8  -> m > 4
     """
     base = dict(DEFAULT_TERNARY_MOE_CONFIG)
+    fp32_alpha_env = os.environ.get("SGLANG_TERNARY_MOE_FP32_ALPHA", "1").strip().lower()
+    base["FP32_ALPHA"] = 1 if fp32_alpha_env in ("1", "true", "yes", "on") else 0
     bucket = _bucket_m_for_config(int(m))
     cfg = _QWEN3_MOE_TERNARY_CONFIG_MAP.get(kind, {}).get(bucket)
     if cfg is None:
@@ -504,7 +495,7 @@ def fused_moe_ternary_int8_kernel(
                 + offs_bn[:, None] * stride_bn
                 + ((k_start // 4 + offs_k_packed)[None, :]) * stride_bk,
                 mask=k_mask_packed[None, :],
-                other=1,  # encode 0 weight (01 -> 0) for masked bytes
+                other=0x55,  # encode 0 weight (01 -> 0) for all 2-bit lanes
             )
 
             for lane in tl.static_range(0, 4):

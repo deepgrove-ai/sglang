@@ -14,6 +14,7 @@ import logging
 import os
 import re
 import tempfile
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
@@ -98,6 +99,206 @@ def _bool_env(name: str, default: bool = False) -> bool:
     if v is None:
         return default
     return v.strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+def _drop_fp16_weights() -> bool:
+    v = os.environ.get("SGLANG_TERNARY_DROP_FP16_WEIGHTS")
+    if v is None:
+        return _bool_env("SGLANG_TERNARY_I2S_ONLY", default=False)
+    return v.strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+def _format_bytes(num_bytes: int) -> str:
+    units = ["B", "KiB", "MiB", "GiB", "TiB"]
+    value = float(num_bytes)
+    for unit in units:
+        if value < 1024.0 or unit == units[-1]:
+            return f"{value:.2f} {unit}"
+        value /= 1024.0
+    return f"{value:.2f} TiB"
+
+
+def _group_name(param_name: str) -> str:
+    parts = param_name.split(".")
+    if len(parts) >= 3 and parts[0] == "model" and parts[1] == "layers":
+        return ".".join(parts[:3])
+    if len(parts) >= 2:
+        return ".".join(parts[:2])
+    return param_name
+
+
+def _log_memory_report(model: torch.nn.Module) -> None:
+    from collections import defaultdict
+
+    totals_by_dtype = defaultdict(int)
+    totals_by_group = defaultdict(int)
+    totals_by_group_dtype = defaultdict(lambda: defaultdict(int))
+    totals_by_kind = defaultdict(int)  # params vs buffers
+
+    def _accumulate(named_tensors, kind: str) -> None:
+        for name, tensor in named_tensors:
+            if tensor is None:
+                continue
+            num_bytes = tensor.numel() * tensor.element_size()
+            dtype_key = str(tensor.dtype)
+            group = _group_name(name)
+            totals_by_dtype[dtype_key] += num_bytes
+            totals_by_group[group] += num_bytes
+            totals_by_group_dtype[group][dtype_key] += num_bytes
+            totals_by_kind[kind] += num_bytes
+
+    _accumulate(model.named_parameters(recurse=True), "params")
+    _accumulate(model.named_buffers(recurse=True), "buffers")
+
+    lines = []
+    lines.append(f"TERNARY MEMORY REPORT {datetime.now().isoformat()}")
+    lines.append(f"Total params:  {_format_bytes(totals_by_kind['params'])}")
+    lines.append(f"Total buffers: {_format_bytes(totals_by_kind['buffers'])}")
+    lines.append("")
+    lines.append("By dtype:")
+    for dtype_key, num_bytes in sorted(totals_by_dtype.items(), key=lambda x: x[1], reverse=True):
+        lines.append(f"  {dtype_key}: {_format_bytes(num_bytes)}")
+    lines.append("")
+    lines.append("Top groups by memory (up to 40):")
+    top_groups = sorted(totals_by_group.items(), key=lambda x: x[1], reverse=True)[:40]
+    for group, num_bytes in top_groups:
+        by_dtype = totals_by_group_dtype[group]
+        dtype_parts = ", ".join(
+            f"{k}={_format_bytes(v)}" for k, v in sorted(by_dtype.items(), key=lambda x: x[1], reverse=True)
+        )
+        lines.append(f"  {group} total={_format_bytes(num_bytes)} ({dtype_parts})")
+
+    report_path = os.environ.get(
+        "SGLANG_TERNARY_MEMORY_REPORT_FILE",
+        "/root/raghav/ternary_memory_report.txt",
+    )
+    report_dir = os.path.dirname(report_path) or "."
+    os.makedirs(report_dir, exist_ok=True)
+    with open(report_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    logger.info("[TERNARY MEM] report written to %s", report_path)
+
+
+def _write_layer_type_report(model: torch.nn.Module, output_file: str) -> None:
+    """Writes a breakdown of module types with counts and memory by dtype."""
+    from collections import defaultdict
+
+    type_counts = defaultdict(int)
+    type_param_bytes = defaultdict(int)
+    type_buffer_bytes = defaultdict(int)
+    type_dtype_bytes = defaultdict(lambda: defaultdict(int))
+
+    for _name, module in model.named_modules():
+        cls_name = type(module).__name__
+        type_counts[cls_name] += 1
+
+        for _param_name, param in module.named_parameters(recurse=False):
+            if param is None:
+                continue
+            mem_bytes = param.numel() * param.element_size()
+            type_param_bytes[cls_name] += mem_bytes
+            type_dtype_bytes[cls_name][str(param.dtype)] += mem_bytes
+
+        for _buf_name, buf in module.named_buffers(recurse=False):
+            if buf is None:
+                continue
+            mem_bytes = buf.numel() * buf.element_size()
+            type_buffer_bytes[cls_name] += mem_bytes
+            type_dtype_bytes[cls_name][str(buf.dtype)] += mem_bytes
+
+    total_types = len(type_counts)
+    total_modules = sum(type_counts.values())
+
+    lines = []
+    lines.append("=" * 80)
+    lines.append("Ternary Layer Type Report")
+    lines.append("=" * 80)
+    lines.append(f"Total module instances: {total_modules}")
+    lines.append(f"Unique module types:     {total_types}")
+    lines.append("")
+    lines.append("Top module types by memory (params + buffers):")
+    lines.append("-" * 80)
+
+    def _total_bytes(t: str) -> int:
+        return type_param_bytes[t] + type_buffer_bytes[t]
+
+    for cls_name in sorted(type_counts, key=_total_bytes, reverse=True):
+        total_bytes = _total_bytes(cls_name)
+        if total_bytes == 0 and type_counts[cls_name] == 0:
+            continue
+        lines.append(
+            f"{cls_name:<36} count={type_counts[cls_name]:>6} "
+            f"params={_format_bytes(type_param_bytes[cls_name]):>10} "
+            f"buffers={_format_bytes(type_buffer_bytes[cls_name]):>10} "
+            f"total={_format_bytes(total_bytes):>10}"
+        )
+        dtype_parts = ", ".join(
+            f"{k}={_format_bytes(v)}"
+            for k, v in sorted(type_dtype_bytes[cls_name].items(), key=lambda x: x[1], reverse=True)
+        )
+        if dtype_parts:
+            lines.append(f"  dtypes: {dtype_parts}")
+
+    report_dir = os.path.dirname(output_file) or "."
+    os.makedirs(report_dir, exist_ok=True)
+    with open(output_file, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+def _write_layer_quant_report(model: torch.nn.Module, output_file: str) -> None:
+    """Writes per-layer quantization decisions and dtypes."""
+    try:
+        from sglang.srt.layers.linear import LinearBase
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+    except Exception:
+        LinearBase = ()
+        FusedMoE = ()
+
+    def _lm_head_enabled() -> bool:
+        return os.environ.get("TERNARY_QUANTIZE_LM_HEAD", "0") == "1"
+
+    lines = []
+    lines.append("=" * 80)
+    lines.append("Ternary Layer Quantization Report")
+    lines.append("=" * 80)
+    lines.append("prefix\tmodule\tquant_method\tweight_dtypes\treason")
+
+    for prefix, module in model.named_modules():
+        if not isinstance(module, (LinearBase, FusedMoE)):
+            continue
+
+        pref = (prefix or "").lower()
+        reason = ""
+        if "embed" in pref:
+            reason = "skip_embed"
+        elif "lm_head" in pref and not _lm_head_enabled():
+            reason = "skip_lm_head"
+        else:
+            parts = pref.split(".")
+            if any(p in ("router", "gate", "shared_expert_gate") for p in parts):
+                reason = "skip_router_gate"
+
+        qm = getattr(module, "quant_method", None)
+        qm_name = type(qm).__name__ if qm is not None else "None"
+
+        dtypes = []
+        for name in ("weight", "w13_weight", "w2_weight"):
+            t = getattr(module, name, None)
+            if isinstance(t, torch.Tensor):
+                dtypes.append(f"{name}:{str(t.dtype)}")
+        for name in ("_ternary_w13_packed", "_ternary_w2_packed"):
+            t = getattr(module, name, None)
+            if isinstance(t, torch.Tensor):
+                dtypes.append(f"{name}:{str(t.dtype)}")
+
+        lines.append(
+            f"{prefix}\t{type(module).__name__}\t{qm_name}\t{','.join(dtypes)}\t{reason}"
+        )
+
+    report_dir = os.path.dirname(output_file) or "."
+    os.makedirs(report_dir, exist_ok=True)
+    with open(output_file, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
 
 
 def _safe_fs_name(name: str) -> str:
@@ -258,12 +459,13 @@ def _try_load_linear_cache(
     device = weight_orig.device
     original_dtype = weight_orig.dtype
 
-    # Preserve original FP16/BF16 weight for fallback path (matches runtime quant behavior).
-    weight_fp16 = weight_orig.to(
-        torch.bfloat16 if original_dtype == torch.bfloat16 else torch.float16
-    )
-    layer.register_buffer("_ternary_weight_fp16", weight_fp16, persistent=False)
-    setattr(layer, "_ternary_weight_fp16_cache", {})
+    if not _drop_fp16_weights():
+        # Preserve original FP16/BF16 weight for fallback path (matches runtime quant behavior).
+        weight_fp16 = weight_orig.to(
+            torch.bfloat16 if original_dtype == torch.bfloat16 else torch.float16
+        )
+        layer.register_buffer("_ternary_weight_fp16", weight_fp16, persistent=False)
+        setattr(layer, "_ternary_weight_fp16_cache", {})
 
     # Install packed weight + alpha
     replace_parameter(layer, "weight", weight_packed.contiguous().to(device, non_blocking=True))
@@ -332,6 +534,12 @@ def _try_load_linear_cache(
     layer._ternary_weight_shape = (N, K)
     layer._ternary_K = K
     layer._ternary_N = N
+    if _drop_fp16_weights():
+        if hasattr(layer, "_ternary_weight_fp16"):
+            layer._buffers.pop("_ternary_weight_fp16", None)
+            delattr(layer, "_ternary_weight_fp16")
+        if hasattr(layer, "_ternary_weight_fp16_cache"):
+            delattr(layer, "_ternary_weight_fp16_cache")
     return True
 
 
@@ -612,6 +820,11 @@ def _try_load_moe_cache(
         layer._fp4_moe_enabled = False
 
     layer._ternary_moe_enabled = True
+    try:
+        from sglang.srt.layers.quantization.ternary import _drop_moe_fp16_weights
+        _drop_moe_fp16_weights(layer)
+    except Exception:
+        pass
     return True
 
 
@@ -761,6 +974,9 @@ def apply_ternary_quantization(
     # - If the model was built without quant_config, this hook will attach
     #   TernaryLinearMethod and perform quantization exactly once.
     for prefix, m in model.named_modules():
+        # Stash prefix for optional debug/validation logging.
+        if prefix:
+            setattr(m, "_ternary_prefix", prefix)
         if isinstance(m, LinearBase):
             existing_qm = getattr(m, "quant_method", None)
 
@@ -894,6 +1110,21 @@ def apply_ternary_quantization(
     # Store the ternary config on the model for later access (e.g., KV cache validation)
     model._ternary_config = cfg
     model._ternary_use_fp8 = use_fp8
+
+    if _bool_env("SGLANG_TERNARY_MEMORY_REPORT", default=False):
+        _log_memory_report(model)
+    if _bool_env("SGLANG_TERNARY_LAYER_REPORT", default=False):
+        report_file = os.environ.get(
+            "SGLANG_TERNARY_LAYER_REPORT_FILE",
+            os.path.expanduser("~/raghav/ternary_layer_report.txt"),
+        )
+        _write_layer_type_report(model, report_file)
+    if _bool_env("SGLANG_TERNARY_LAYER_QUANT_REPORT", default=False):
+        report_file = os.environ.get(
+            "SGLANG_TERNARY_LAYER_QUANT_REPORT_FILE",
+            os.path.expanduser("~/raghav/ternary_layer_quant_report.txt"),
+        )
+        _write_layer_quant_report(model, report_file)
     
     # Force garbage collection and clear CUDA cache after all quantization
     import gc
