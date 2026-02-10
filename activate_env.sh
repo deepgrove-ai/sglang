@@ -13,7 +13,32 @@ fi
 export PYTHONPATH="$SCRIPT_DIR/python:${PYTHONPATH:-}"
 
 # CUDA configuration
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
+if [[ -z "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        DETECTED_GPU_IDS="$(
+            nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null \
+                | tr '\n' ',' | sed 's/,$//'
+        )"
+        if [[ -n "$DETECTED_GPU_IDS" ]]; then
+            export CUDA_VISIBLE_DEVICES="$DETECTED_GPU_IDS"
+        else
+            export CUDA_VISIBLE_DEVICES="0"
+        fi
+    else
+        export CUDA_VISIBLE_DEVICES="0"
+    fi
+fi
+
+# Ensure nvcc is available for JIT paths (e.g., flashinfer kernel compilation).
+if ! command -v nvcc >/dev/null 2>&1; then
+    for CUDA_BIN in /usr/local/cuda/bin /usr/local/cuda-12/bin /usr/local/cuda-12.6/bin; do
+        if [ -x "$CUDA_BIN/nvcc" ]; then
+            export PATH="$CUDA_BIN:$PATH"
+            export CUDA_HOME="$(dirname "$CUDA_BIN")"
+            break
+        fi
+    done
+fi
 
 # Memory allocation configuration
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"

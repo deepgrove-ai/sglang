@@ -14,10 +14,30 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/activate_env.sh"
 
+if [[ -n "${SGLANG_PYTHON:-}" ]]; then
+    PYTHON_BIN="${SGLANG_PYTHON}"
+elif command -v python >/dev/null 2>&1; then
+    PYTHON_BIN="$(command -v python)"
+elif command -v python3 >/dev/null 2>&1; then
+    PYTHON_BIN="$(command -v python3)"
+else
+    echo "Error: no Python interpreter found (set SGLANG_PYTHON)"
+    exit 1
+fi
+
 # Default values
 QUANT_MODE="i2s"
 TP_SIZE=1
-MODEL_PRESET="qwen3-moe"  # Default model preset
+DP_SIZE_OVERRIDE=""
+SERVER_PORT_OVERRIDE=""
+DEFAULT_MANGROVE_MODEL_PATH="${MANGROVE_MODEL_PATH:-/scratch/mangrove}"
+if [[ -d "$DEFAULT_MANGROVE_MODEL_PATH" ]]; then
+    MODEL_PRESET="mangrove"
+else
+    MODEL_PRESET="qwen3-moe"
+fi
+MODEL_PATH_OVERRIDE=""
+MODEL_NAME_OVERRIDE=""
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -26,22 +46,39 @@ while [[ $# -gt 0 ]]; do
             TP_SIZE="$2"
             shift 2
             ;;
+        --dp)
+            DP_SIZE_OVERRIDE="$2"
+            shift 2
+            ;;
+        --port)
+            SERVER_PORT_OVERRIDE="$2"
+            shift 2
+            ;;
         --model)
             MODEL_PRESET="$2"
             shift 2
             ;;
-    fp16|i2s|i2s-tuned|i2s-tuned-dp2|i2s-kvfp8|i2s-fp8|i2s-fp8-full|ternary)
+        --model-path)
+            MODEL_PATH_OVERRIDE="$2"
+            shift 2
+            ;;
+        --served-model-name)
+            MODEL_NAME_OVERRIDE="$2"
+            shift 2
+            ;;
+    fp16|i2s|i2s-tuned|i2s-maxspeed|i2s-tuned-dp2|i2s-kvfp8|i2s-fp8|i2s-fp8-full|ternary)
             QUANT_MODE="$1"
             shift
             ;;
         -h|--help)
-            echo "Usage: $0 [MODE] [--tp N] [--model MODEL]"
+            echo "Usage: $0 [MODE] [--tp N] [--dp N] [--port P] [--model MODEL] [--model-path PATH] [--served-model-name NAME]"
             echo ""
             echo "Modes:"
             echo "  fp16:           Pure FP16/BF16 (no quantization, baseline)"
             echo "  i2s:            Ternary + I2_S (8x memory reduction, FP16 inference)"
             echo "  ternary:        Ternary-only (no FP16 fallback; i2s/BitNet only)"
             echo "  i2s-tuned:      Ternary + I2_S + Optimized FlashInfer (RECOMMENDED)"
+            echo "  i2s-maxspeed:   Ternary + I2_S + Speculative decode (maximize C=1 and mid-load TPS)"
             echo "  i2s-tuned-dp2:  i2s-tuned + Data Parallel on 2 GPUs (2x throughput)"
             echo "  i2s-kvfp8:      Ternary + I2_S + FP8 KV Cache (memory optimized, ~30% slower)"
             echo "  i2s-fp8:        Ternary + I2_S + FP8 policy (FP8 KV + FlashInfer tuning)"
@@ -52,17 +89,26 @@ while [[ $# -gt 0 ]]; do
             echo ""
             echo "Options:"
             echo "  --tp N       Tensor parallelism: shard model across N GPUs (default: 1)"
-            echo "  --model M    Model preset: qwen3-moe (default), klear-20b"
+            echo "  --dp N       Data parallel replicas across N GPUs (for max throughput)"
+            echo "  --port P     Server port (default: 30080)"
+            echo "  --model M    Model preset: qwen3-moe, klear-20b, mangrove"
+            echo "  --model-path PATH    Explicit model path (overrides --model preset)"
+            echo "  --served-model-name NAME  Explicit served model name"
             echo ""
             echo "Models:"
-            echo "  qwen3-moe:  Qwen3 MoE 30B A3B (RedMod/sft_dist_l_q)"
+            echo "  qwen3-moe:  Qwen3 MoE 30B A3B (/mnt/data/30ba3b)"
             echo "  klear-20b:  Klear 20B MoE (/home/ubuntu/raghav/20ba1b)"
+            echo "  mangrove:   Production model path ($DEFAULT_MANGROVE_MODEL_PATH)"
             echo ""
             echo "Examples:"
             echo "  $0 i2s --tp 2              # Run Qwen3 MoE with i2s mode on 2 GPUs (TP)"
             echo "  $0 i2s-tuned-dp2           # Run with DP=2 (2x throughput, recommended)"
+            echo "  $0 i2s-tuned --dp 4        # Run 4 data-parallel replicas"
+            echo "  $0 i2s-maxspeed            # High-speed ternary profile (speculative decode)"
             echo "  $0 fp16 --model klear-20b  # Run Klear 20B in fp16 mode"
             echo "  $0 i2s-tuned --model klear-20b  # Run Klear 20B with tuned i2s"
+            echo "  $0 i2s-tuned --model-path /scratch/mangrove"
+            echo "  $0 i2s-fp8 --model mangrove --served-model-name mangrove-prod-fp8"
             exit 0
             ;;
         *)
@@ -78,6 +124,14 @@ if ! [[ "$TP_SIZE" =~ ^[1-8]$ ]]; then
     echo "Error: Invalid tensor parallelism size '$TP_SIZE' (must be 1-8)"
     exit 1
 fi
+if [[ -n "$DP_SIZE_OVERRIDE" ]] && ! [[ "$DP_SIZE_OVERRIDE" =~ ^[1-8]$ ]]; then
+    echo "Error: Invalid data parallel size '$DP_SIZE_OVERRIDE' (must be 1-8)"
+    exit 1
+fi
+if [[ -n "$SERVER_PORT_OVERRIDE" ]] && ! [[ "$SERVER_PORT_OVERRIDE" =~ ^[0-9]+$ ]]; then
+    echo "Error: Invalid port '$SERVER_PORT_OVERRIDE'"
+    exit 1
+fi
 
 # Set Python path
 export PYTHONPATH="$SCRIPT_DIR:$SCRIPT_DIR/ternary_optimization/production:$PYTHONPATH"
@@ -89,15 +143,75 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # INFO: Shows quantized layers and important events (default)
 export SGLANG_TERNARY_LOG_LEVEL="${SGLANG_TERNARY_LOG_LEVEL:-INFO}"
 
-# Resolve the CUTLASS i2s library path (prefer repo-local build if present).
+# Resolve the CUTLASS i2s library path.
+# Preference order: explicit env > repo-local > monorepo third_party > in-tree > sibling.
 if [[ "$QUANT_MODE" == i2s* || "$QUANT_MODE" == "ternary" ]]; then
-    ALT_LIB="$SCRIPT_DIR/../ternarykernels/mangrove-turbo/libternary_cutlass_sm100.so"
-    I2S_CUTLASS_LIB_DEFAULT="$SCRIPT_DIR/libternary_cutlass_sm100.so"
-    if [[ -f "$ALT_LIB" ]]; then
-        I2S_CUTLASS_LIB_DEFAULT="$ALT_LIB"
+    resolve_i2s_cutlass_lib() {
+        local candidates=(
+            "$SCRIPT_DIR/libternary_cutlass_sm100.so"
+            "$SCRIPT_DIR/third_party/ternarykernels/mangrove-turbo/libternary_cutlass_sm100.so"
+            "$SCRIPT_DIR/ternarykernels/mangrove-turbo/libternary_cutlass_sm100.so"
+            "$SCRIPT_DIR/../ternarykernels/mangrove-turbo/libternary_cutlass_sm100.so"
+            "${TERNARY_ROOT:-}/mangrove-turbo/libternary_cutlass_sm100.so"
+            "/home/ubuntu/ternarykernels/mangrove-turbo/libternary_cutlass_sm100.so"
+        )
+        local lib_path
+        for lib_path in "${candidates[@]}"; do
+            if [[ -n "$lib_path" && -f "$lib_path" ]]; then
+                echo "$lib_path"
+                return 0
+            fi
+        done
+        return 1
+    }
+
+    I2S_CUTLASS_LIB_DEFAULT="$(resolve_i2s_cutlass_lib || true)"
+    if [[ -n "$I2S_CUTLASS_LIB_DEFAULT" ]]; then
+        export SGLANG_I2S_CUTLASS_LIB="${SGLANG_I2S_CUTLASS_LIB:-$I2S_CUTLASS_LIB_DEFAULT}"
     fi
-    export SGLANG_I2S_CUTLASS_LIB="${SGLANG_I2S_CUTLASS_LIB:-$I2S_CUTLASS_LIB_DEFAULT}"
 fi
+
+get_primary_gpu_compute_major() {
+    local cc
+    cc="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -n 1 | tr -d '\r' || true)"
+    if [[ "$cc" =~ ^([0-9]+)\.[0-9]+$ ]]; then
+        echo "${BASH_REMATCH[1]}"
+        return 0
+    fi
+    echo ""
+}
+
+check_dp_router_ready() {
+    local check_output
+    if ! check_output="$("$PYTHON_BIN" - <<'PY'
+import sys
+
+try:
+    import sglang_router  # noqa: F401
+except Exception as e:
+    print(f"missing_sglang_router:{e}")
+    raise SystemExit(2)
+
+try:
+    from sglang_router.router import Router  # noqa: F401
+except Exception as e:
+    print(f"missing_rust_router:{e}")
+    raise SystemExit(3)
+
+print("ok")
+PY
+)" ; then
+        echo "Error: data-parallel (--dp) launch requires sgl-router with Rust router support."
+        echo "Probe output: ${check_output}"
+        echo "How to fix:"
+        echo "  1) Install Rust toolchain (rustc/cargo)."
+        echo "  2) Build/install sgl-router with Rust extension (wheel build from sgl-router/)."
+        echo "  3) Re-run with --dp N."
+        echo "Fallback:"
+        echo "  - Run without --dp for single-instance benchmarks."
+        exit 1
+    fi
+}
 
 # Startup ternary cache (speeds restarts massively; first run populates cache)
 # - Enable/disable:
@@ -136,6 +250,12 @@ export SGLANG_PINNED_OUTPUT_COPY_MAX_BYTES="${SGLANG_PINNED_OUTPUT_COPY_MAX_BYTE
 export TERNARY_ENABLE_PROFILING="${TERNARY_ENABLE_PROFILING:-0}"
 export TERNARY_PROFILE_OUTPUT="${TERNARY_PROFILE_OUTPUT:-/tmp/ternary_profile.json}"
 
+# Optional kernel-path/fallback runtime stats for ternary debugging.
+# Enable with SGLANG_TERNARY_COLLECT_PATH_STATS=1.
+if [[ "${SGLANG_TERNARY_COLLECT_PATH_STATS:-0}" == "1" && -z "${SGLANG_TERNARY_FALLBACK_REPORT:-}" ]]; then
+    export SGLANG_TERNARY_FALLBACK_REPORT="$SCRIPT_DIR/logs/ternary_runtime_{pid}.json"
+fi
+
 # Op-level profiling mode (recommended when using /start_profile traces):
 # CUDA graphs collapse many ops into graph replays, hiding per-op costs.
 # Set SGLANG_PROFILE_OPLEVEL=1 to disable CUDA graphs + overlap + torch.compile for clearer traces.
@@ -169,6 +289,15 @@ case "$QUANT_MODE" in
     
     ternary)
         # Ternary-only mode: allow int2/i2s kernels but forbid FP16 fallback.
+        GPU_COMPUTE_MAJOR="$(get_primary_gpu_compute_major)"
+        if [[ "${SGLANG_TERNARY_ALLOW_STRICT_NON_SM100:-0}" != "1" ]]; then
+            if [[ -n "$GPU_COMPUTE_MAJOR" && "$GPU_COMPUTE_MAJOR" -lt 10 ]]; then
+                echo "Error: strict ternary-only mode is not currently supported on this GPU (compute capability ${GPU_COMPUTE_MAJOR}.x)."
+                echo "Reason: M>1 strict ternary kernels are unavailable here while FP16 fallback is disabled."
+                echo "Use 'i2s' or 'i2s-tuned' for production, or set SGLANG_TERNARY_ALLOW_STRICT_NON_SM100=1 to bypass this guard for debugging."
+                exit 1
+            fi
+        fi
         export SGLANG_TERNARY_I2S_ONLY=1
         export SGLANG_TERNARY_MOE_TRITON="${SGLANG_TERNARY_MOE_TRITON:-1}"
         export SGLANG_TERNARY_USE_I2S_CUTLASS="${SGLANG_TERNARY_USE_I2S_CUTLASS:-1}"
@@ -188,6 +317,24 @@ case "$QUANT_MODE" in
         QUANT_FLAG="--quantization ternary --attention-backend flashinfer"
         QUANT_DESC="Ternary + I2_S + Tuned FlashInfer (RECOMMENDED for H100)"
         echo "Note: FlashInfer optimizations enabled (Tensor Cores, 1GB workspace, 4K tiles)"
+        ;;
+
+    i2s-maxspeed)
+        # Ternary profile optimized for very high effective decode throughput.
+        # Uses:
+        # - tuned FlashInfer attention
+        # - full MoE quantization path (not decode-only)
+        # - NGRAM speculative decoding
+        export SGLANG_FLASHINFER_USE_TENSOR_CORE=true
+        export SGLANG_FLASHINFER_WORKSPACE_SIZE=$((1024*1024*1024))  # 1GB
+        export SGLANG_FLASHINFER_DECODE_SPLIT_TILE_SIZE=4096
+        export TERNARY_MOE_DECODE_ONLY="${TERNARY_MOE_DECODE_ONLY_MAXSPEED:-0}"
+        export SGLANG_TERNARY_MOE_TRITON="${SGLANG_TERNARY_MOE_TRITON:-1}"
+        SPECULATIVE_ALGORITHM="${SPECULATIVE_ALGORITHM:-NGRAM}"
+        SPECULATIVE_NUM_DRAFT="${SPECULATIVE_NUM_DRAFT:-4}"
+        QUANT_FLAG="--quantization ternary --attention-backend flashinfer"
+        QUANT_DESC="Ternary + I2_S + MaxSpeed profile (speculative decode + full MoE quant)"
+        echo "Note: MaxSpeed ternary profile enabled (NGRAM speculative decode, draft=$SPECULATIVE_NUM_DRAFT, MoE Triton=${SGLANG_TERNARY_MOE_TRITON})"
         ;;
     
     i2s-tuned-dp2)
@@ -282,23 +429,72 @@ case "$QUANT_MODE" in
         ;;
 esac
 
+# Allow explicit --dp override for any mode.
+if [[ -n "$DP_SIZE_OVERRIDE" ]]; then
+    if [[ "$DP_SIZE_OVERRIDE" -gt 1 ]]; then
+        USE_DATA_PARALLEL=1
+        DP_SIZE="$DP_SIZE_OVERRIDE"
+    else
+        USE_DATA_PARALLEL=0
+        DP_SIZE=1
+    fi
+fi
+
+if [[ "${USE_DATA_PARALLEL:-0}" == "1" && "${TP_SIZE:-1}" != "1" ]]; then
+    echo "Warning: --dp and --tp were both set. In this launcher, data-parallel mode ignores --tp and runs full-model replicas."
+fi
+
 # Model and server configuration
-case "$MODEL_PRESET" in
-    qwen3-moe)
-        MODEL_ID="/mnt/data/30ba3b"
-        MODEL_NAME="qwen3-moe-$QUANT_MODE"
-        ;;
-    klear-20b)
-        MODEL_ID="/home/ubuntu/raghav/20ba1b"
-        MODEL_NAME="klear-20b-$QUANT_MODE"
-        ;;
-    *)
-        echo "Error: Unknown model preset '$MODEL_PRESET'"
-        echo "Valid presets: qwen3-moe, klear-20b"
-        exit 1
-        ;;
-esac
+if [[ -n "$MODEL_PATH_OVERRIDE" ]]; then
+    MODEL_ID="$MODEL_PATH_OVERRIDE"
+    if [[ -n "$MODEL_NAME_OVERRIDE" ]]; then
+        MODEL_NAME="$MODEL_NAME_OVERRIDE"
+    else
+        MODEL_BASENAME="$(basename "$MODEL_ID")"
+        MODEL_BASENAME="${MODEL_BASENAME// /-}"
+        MODEL_NAME="${MODEL_BASENAME}-${QUANT_MODE}"
+    fi
+else
+    case "$MODEL_PRESET" in
+        qwen3-moe)
+            MODEL_ID="/mnt/data/30ba3b"
+            MODEL_NAME="qwen3-moe-$QUANT_MODE"
+            ;;
+        klear-20b)
+            MODEL_ID="/home/ubuntu/raghav/20ba1b"
+            MODEL_NAME="klear-20b-$QUANT_MODE"
+            ;;
+        mangrove)
+            MODEL_ID="$DEFAULT_MANGROVE_MODEL_PATH"
+            MODEL_NAME="mangrove-$QUANT_MODE"
+            ;;
+        *)
+            echo "Error: Unknown model preset '$MODEL_PRESET'"
+            echo "Valid presets: qwen3-moe, klear-20b, mangrove"
+            exit 1
+            ;;
+    esac
+    if [[ -n "$MODEL_NAME_OVERRIDE" ]]; then
+        MODEL_NAME="$MODEL_NAME_OVERRIDE"
+    fi
+fi
+
+if [[ ! -e "$MODEL_ID" ]]; then
+    echo "Error: Model path does not exist: $MODEL_ID"
+    exit 1
+fi
+if [[ -n "$MODEL_PATH_OVERRIDE" ]]; then
+    MODEL_PRESET_DISPLAY="custom (--model-path)"
+else
+    MODEL_PRESET_DISPLAY="$MODEL_PRESET"
+fi
+# Escape user-provided model id/name safely because command is executed via eval.
+MODEL_ID_ESCAPED="$(printf '%q' "$MODEL_ID")"
+MODEL_NAME_ESCAPED="$(printf '%q' "$MODEL_NAME")"
 SERVER_PORT=30080
+if [[ -n "$SERVER_PORT_OVERRIDE" ]]; then
+    SERVER_PORT="$SERVER_PORT_OVERRIDE"
+fi
 DEFAULT_REQUEST_GPU_MEMORY="0.85"
 REQUEST_GPU_MEMORY="${REQUEST_GPU_MEMORY:-$DEFAULT_REQUEST_GPU_MEMORY}"
 # Optional performance knobs (defaults keep SGLang auto-tuning behavior).
@@ -314,7 +510,7 @@ CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-1024}"
 # SPECULATIVE_ALGORITHM="${SPECULATIVE_ALGORITHM:-NGRAM}"
 # SPECULATIVE_NUM_DRAFT="${SPECULATIVE_NUM_DRAFT:-4}"
 CUDA_GRAPH_MAX_BS="${CUDA_GRAPH_MAX_BS:-128}"
-CUDA_GRAPH_BS="${CUDA_GRAPH_BS:1}"
+CUDA_GRAPH_BS="${CUDA_GRAPH_BS:-}"
 DISABLE_CUDA_GRAPH="${DISABLE_CUDA_GRAPH:-0}"  # Test: disable CUDA graphs entirely
 # MoE runner backend: auto, deep_gemm, triton, flashinfer_cutlass, flashinfer_mxfp4, cutlass
 MOE_RUNNER_BACKEND="${MOE_RUNNER_BACKEND:-}"
@@ -338,7 +534,7 @@ SGLANG_TORCH_COMPILE_CUSTOM_OP_MODE="${SGLANG_TORCH_COMPILE_CUSTOM_OP_MODE:-}"
 echo "========================================"
 echo "Starting SGLang server"
 echo "Mode: $QUANT_DESC"
-echo "Model preset: $MODEL_PRESET"
+echo "Model preset: $MODEL_PRESET_DISPLAY"
 echo "Model path: $MODEL_ID"
 echo "Port: $SERVER_PORT"
 if [[ "${USE_DATA_PARALLEL:-0}" == "1" ]]; then
@@ -370,6 +566,11 @@ if [[ "$TERNARY_ENABLE_PROFILING" == "1" ]]; then
 else
     echo "Ternary profiling: DISABLED"
 fi
+if [[ "${SGLANG_TERNARY_COLLECT_PATH_STATS:-0}" == "1" ]]; then
+    echo "Ternary path/fallback stats: ENABLED (report: ${SGLANG_TERNARY_FALLBACK_REPORT:-unset})"
+else
+    echo "Ternary path/fallback stats: DISABLED"
+fi
 echo "Chunked prefill size: ${CHUNKED_PREFILL_SIZE:-auto}"
 echo "Speculative algorithm: ${SPECULATIVE_ALGORITHM:-disabled}"
 echo "Speculative draft tokens: ${SPECULATIVE_NUM_DRAFT:-N/A}"
@@ -394,10 +595,11 @@ fi
 
 # Build the command
 if [[ "${USE_DATA_PARALLEL:-0}" == "1" ]]; then
+    check_dp_router_ready
     # Data Parallel mode: use router to load-balance across GPUs
-    CMD="python -m sglang_router.launch_server \
-        --model-path $MODEL_ID \
-        --served-model-name $MODEL_NAME \
+    CMD="$PYTHON_BIN -m sglang_router.launch_server \
+        --model-path $MODEL_ID_ESCAPED \
+        --served-model-name $MODEL_NAME_ESCAPED \
         --port $SERVER_PORT \
         --dp ${DP_SIZE:-2} \
         --mem-fraction-static $REQUEST_GPU_MEMORY \
@@ -405,9 +607,9 @@ if [[ "${USE_DATA_PARALLEL:-0}" == "1" ]]; then
         --attention-backend $ATTENTION_BACKEND"
 else
     # Standard mode: single process with optional tensor parallelism
-    CMD="python -m sglang.launch_server \
-        --model-path $MODEL_ID \
-        --served-model-name $MODEL_NAME \
+    CMD="$PYTHON_BIN -m sglang.launch_server \
+        --model-path $MODEL_ID_ESCAPED \
+        --served-model-name $MODEL_NAME_ESCAPED \
         --port $SERVER_PORT \
         --tp-size $TP_SIZE \
         --mem-fraction-static $REQUEST_GPU_MEMORY \

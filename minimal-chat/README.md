@@ -1,0 +1,33 @@
+# Minimal Chat UI
+
+Single-chat, no-sidebar interface with a lightweight gray theme.
+
+## Features
+
+- Word-by-word fade-in animation for assistant replies
+- Markdown rendering with fenced code blocks
+- Syntax highlighting and one-click code copy button
+- LaTeX math rendering (`$...$`, `$$...$$`, `\(...\)`, `\[...\]`)
+- OpenAI-compatible API calls for SGLang (`/v1/models`, `/v1/chat/completions`)
+
+## Run
+
+1. Start your SGLang server (default expected at `http://127.0.0.1:30000`).
+2. Serve this folder:
+
+```bash
+cd ~/sglang/minimal-chat
+python3 -m http.server 4173
+```
+
+3. Open:
+
+```text
+http://127.0.0.1:4173
+```
+
+Optional API override via query string:
+
+```text
+http://127.0.0.1:4173/?api=http://127.0.0.1:30000
+```

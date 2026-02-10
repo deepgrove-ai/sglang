@@ -8,9 +8,13 @@ Features:
 - Optimized CUDA kernels for decode and prefill
 """
 
+import atexit
 import ctypes
+import json
 import logging
 import os
+import signal
+from collections import Counter
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -89,6 +93,9 @@ def _load_bitnet_library():
     
     lib_paths = [
         os.path.join(os.path.dirname(__file__), '../../../../../libternary_bitnet.so'),
+        os.path.join(os.path.dirname(__file__), '../../../../../third_party/ternarykernels/mangrove-turbo/libternary_bitnet.so'),
+        os.path.join(os.path.dirname(__file__), '../../../../../ternarykernels/mangrove-turbo/libternary_bitnet.so'),
+        os.path.join(os.path.dirname(__file__), '../../../../../../ternarykernels/mangrove-turbo/libternary_bitnet.so'),
         './libternary_bitnet.so',
         '/usr/local/lib/libternary_bitnet.so',
     ]
@@ -179,7 +186,9 @@ def _load_i2s_cutlass_library():
         lib_paths.append(env_path)
     lib_paths.extend([
         os.path.join(os.path.dirname(__file__), '../../../../../libternary_cutlass_sm100.so'),
+        os.path.join(os.path.dirname(__file__), '../../../../../third_party/ternarykernels/mangrove-turbo/libternary_cutlass_sm100.so'),
         os.path.join(os.path.dirname(__file__), '../../../../../ternarykernels/mangrove-turbo/libternary_cutlass_sm100.so'),
+        os.path.join(os.path.dirname(__file__), '../../../../../../ternarykernels/mangrove-turbo/libternary_cutlass_sm100.so'),
         './libternary_cutlass_sm100.so',
         '/usr/local/lib/libternary_cutlass_sm100.so',
     ])
@@ -252,7 +261,60 @@ try:
     convert_weight_int8_to_int2 = _bitnet_pack_fn
     BITNET_PACK_AVAILABLE = True
 except Exception:
-    pass
+    # Fallback to ladder packer from ternarykernels when BitNet/gpu packer
+    # is not available in this monorepo setup.
+    try:
+        import sys
+
+        ternary_roots = [
+            os.path.join(os.path.dirname(__file__), '../../../../../third_party/ternarykernels/mangrove-turbo'),
+            os.path.join(os.path.dirname(__file__), '../../../../../ternarykernels/mangrove-turbo'),
+            os.path.join(os.path.dirname(__file__), '../../../../../../ternarykernels/mangrove-turbo'),
+        ]
+        env_ternary_root = os.environ.get("TERNARY_ROOT", "").strip()
+        if env_ternary_root:
+            ternary_roots.append(os.path.join(env_ternary_root, "mangrove-turbo"))
+
+        for root in ternary_roots:
+            src_dir = os.path.normpath(os.path.join(root, "src"))
+            if os.path.isdir(src_dir) and src_dir not in sys.path:
+                sys.path.append(src_dir)
+
+        from ladder_pack_gpu import pack_ladder_gpu as _ladder_pack_gpu  # type: ignore
+
+        def _ladder_pack_as_bitnet(weight_int8: torch.Tensor) -> torch.Tensor:
+            if weight_int8.dtype != torch.int8:
+                weight_int8 = weight_int8.to(torch.int8)
+            if not weight_int8.is_cuda:
+                raise RuntimeError("ladder_pack_gpu requires CUDA tensor input")
+            N, K = weight_int8.shape
+            if (N % 16) != 0 or (K % 32) != 0:
+                raise RuntimeError(
+                    f"ladder_pack_gpu shape unsupported for BitNet packing: N={N}, K={K}"
+                )
+
+            # Chunk packing to bound peak memory (important for large vocab/LM-head layers).
+            max_rows = int(os.environ.get("SGLANG_TERNARY_LADDER_PACK_MAX_ROWS", "4096"))
+            max_rows = max(16, (max_rows // 16) * 16)
+            if N <= max_rows:
+                return _ladder_pack_gpu(weight_int8).contiguous()
+
+            out = torch.empty((N, K // 4), device=weight_int8.device, dtype=torch.uint8)
+            for start in range(0, N, max_rows):
+                end = min(start + max_rows, N)
+                if (end - start) % 16 != 0:
+                    raise RuntimeError(
+                        f"ladder_pack_gpu chunk shape unsupported: rows={end-start}, K={K}"
+                    )
+                packed_chunk = _ladder_pack_gpu(weight_int8[start:end].contiguous())
+                out[start:end].copy_(packed_chunk)
+            return out.contiguous()
+
+        convert_weight_int8_to_int2 = _ladder_pack_as_bitnet
+        BITNET_PACK_AVAILABLE = True
+        logger.info("[TERNARY] Using ladder_pack_gpu fallback for BitNet weight packing")
+    except Exception:
+        pass
 
 
 # ============================================================================
@@ -298,6 +360,91 @@ def _env_flag(name: str, default: str = "0") -> bool:
 _TERNARY_GATE_SKIP_LOG: set[str] = set()
 _TERNARY_MOE_VALIDATE_COUNT = 0
 _TERNARY_MOE_VALIDATE_DONE: set[str] = set()
+_TERNARY_PATH_COUNTER: Counter[str] = Counter()
+_TERNARY_FALLBACK_COUNTER: Counter[str] = Counter()
+_TERNARY_STATS_EVENTS = 0
+
+
+def _collect_path_stats_enabled() -> bool:
+    if _env_flag("SGLANG_TERNARY_COLLECT_PATH_STATS", "0"):
+        return True
+    return bool(os.environ.get("SGLANG_TERNARY_FALLBACK_REPORT", "").strip())
+
+
+def _record_path_hit(name: str) -> None:
+    global _TERNARY_STATS_EVENTS
+    if not _collect_path_stats_enabled():
+        return
+    _TERNARY_PATH_COUNTER[name] += 1
+    _TERNARY_STATS_EVENTS += 1
+    _maybe_periodic_dump()
+
+
+def _record_fallback_hit(name: str) -> None:
+    global _TERNARY_STATS_EVENTS
+    if not _collect_path_stats_enabled():
+        return
+    _TERNARY_FALLBACK_COUNTER[name] += 1
+    _TERNARY_STATS_EVENTS += 1
+
+    _maybe_periodic_dump()
+
+
+def _maybe_periodic_dump() -> None:
+    path_tmpl = os.environ.get("SGLANG_TERNARY_FALLBACK_REPORT", "").strip()
+    if not path_tmpl:
+        return
+    interval = int(os.environ.get("SGLANG_TERNARY_FALLBACK_REPORT_EVERY", "5000"))
+    if interval <= 0:
+        return
+    if _TERNARY_STATS_EVENTS % interval != 0:
+        return
+    _dump_runtime_stats()
+
+
+def _dump_runtime_stats() -> None:
+    path_tmpl = os.environ.get("SGLANG_TERNARY_FALLBACK_REPORT", "").strip()
+    if not path_tmpl:
+        return
+    path = path_tmpl.replace("{pid}", str(os.getpid()))
+    out = {
+        "pid": os.getpid(),
+        "path_counts": dict(sorted(_TERNARY_PATH_COUNTER.items())),
+        "fallback_counts": dict(sorted(_TERNARY_FALLBACK_COUNTER.items())),
+    }
+    if _TERNARY_GATE_SKIP_LOG:
+        out["gate_skip_layers"] = sorted(_TERNARY_GATE_SKIP_LOG)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(out, f, indent=2)
+
+
+def _install_stats_signal_handlers() -> None:
+    def _make_handler(prev_handler):
+        def _handler(signum, frame):
+            try:
+                _dump_runtime_stats()
+            except Exception:
+                pass
+            if callable(prev_handler):
+                prev_handler(signum, frame)
+                return
+            if prev_handler == signal.SIG_IGN:
+                return
+            raise SystemExit(128 + int(signum))
+        return _handler
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            prev = signal.getsignal(sig)
+            signal.signal(sig, _make_handler(prev))
+        except Exception:
+            # Some runtimes may disallow signal registration in non-main threads.
+            continue
+
+
+atexit.register(_dump_runtime_stats)
+_install_stats_signal_handlers()
 
 
 def _record_gate_skip(prefix: str, reason: str) -> None:
@@ -698,16 +845,24 @@ class TernaryLinearMethod(LinearMethodBase):
         # Check kernel eligibility
         bitnet_enabled = getattr(layer, '_ternary_bitnet_enabled', False)
         force_ternary_only = _force_ternary_only()
-        can_use_kernel = (
-            not _is_dynamo_compiling()
-            and self.quant_config.use_bitnet_kernel
-            and bitnet_enabled
-            and BITNET_CUDA_AVAILABLE
-            and BITNET_LIB is not None
-            and weight.dtype == torch.uint8
-            and x.is_cuda
-            and (N, K) in SUPPORTED_V4_NK_SHAPES
-        )
+        eligibility = {
+            "not_dynamo_compiling": not _is_dynamo_compiling(),
+            "use_bitnet_kernel": self.quant_config.use_bitnet_kernel,
+            "bitnet_enabled": bitnet_enabled,
+            "bitnet_cuda_available": BITNET_CUDA_AVAILABLE,
+            "bitnet_lib_loaded": BITNET_LIB is not None,
+            "weight_uint8": weight.dtype == torch.uint8,
+            "x_cuda": x.is_cuda,
+            "shape_supported": (N, K) in SUPPORTED_V4_NK_SHAPES,
+        }
+        can_use_kernel = all(eligibility.values())
+        fallback_reasons: List[str] = []
+        if not can_use_kernel:
+            for k, v in eligibility.items():
+                if not v:
+                    reason = f"linear.bitnet_ineligible.{k}"
+                    fallback_reasons.append(reason)
+                    _record_fallback_hit(reason)
         
         # Handle FP8 input
         x_is_fp8 = x.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
@@ -750,6 +905,7 @@ class TernaryLinearMethod(LinearMethodBase):
             if M == 1 and x_is_fp8 and _KERNEL_CAPS.get('fp8_megafused'):
                 result = self._apply_fp8_megafused(layer, x, x_fp8_scale, N, K, stream)
                 if result is not None:
+                    _record_path_hit("linear.fp8_megafused_m1")
                     if not getattr(layer, "_ternary_fp8_megafused_logged", False):
                         layer._ternary_fp8_megafused_logged = True
                         logger.info(
@@ -763,6 +919,7 @@ class TernaryLinearMethod(LinearMethodBase):
             if M == 1 and _KERNEL_CAPS.get('megafused'):
                 result = self._apply_megafused(layer, x_bf16, N, K, stream)
                 if result is not None:
+                    _record_path_hit("linear.bf16_megafused_m1")
                     if not getattr(layer, "_ternary_bf16_megafused_logged", False):
                         layer._ternary_bf16_megafused_logged = True
                         logger.info(
@@ -776,28 +933,44 @@ class TernaryLinearMethod(LinearMethodBase):
             if M > 1 and _KERNEL_CAPS.get('batch_megafused'):
                 result = self._apply_batch_megafused(layer, x_bf16, M, N, K, stream)
                 if result is not None:
+                    _record_path_hit("linear.batch_megafused_m_gt_1")
                     if bias_bf16 is not None:
                         result = result + bias_bf16
                     return result.view(*x_shape[:-1], N)
+                fallback_reasons.append("linear.batch_megafused_failed_or_disabled")
+                _record_fallback_hit("linear.batch_megafused_failed_or_disabled")
 
         # CUTLASS fused i2s path (SM100, M>1 prefill)
         if weight.dtype == torch.uint8 and not x_is_fp8:
             x_bf16_2d = x_bf16.reshape(-1, K)
             result = self._apply_i2s_cutlass(layer, x_bf16_2d, bias_bf16, M, N, K, stream)
             if result is not None:
+                _record_path_hit("linear.i2s_cutlass")
                 return result.view(*x_shape[:-1], N)
+            skip_reason = getattr(layer, "_ternary_i2s_cutlass_last_skip", None)
+            if skip_reason:
+                reason = f"linear.i2s_cutlass_skip.{skip_reason}"
+                fallback_reasons.append(reason)
+                _record_fallback_hit(reason)
         else:
             if weight.dtype != torch.uint8:
                 _log_i2s_ineligible("weight_not_uint8")
+                _record_fallback_hit("linear.i2s_cutlass_ineligible.weight_not_uint8")
             if x_is_fp8:
                 _log_i2s_ineligible("fp8_input")
+                _record_fallback_hit("linear.i2s_cutlass_ineligible.fp8_input")
         if force_ternary_only:
+            _record_fallback_hit("linear.ternary_only_error.no_kernel_hit")
             raise RuntimeError(
                 "Ternary-only mode enabled but no ternary kernel ran. "
                 "Enable SGLANG_TERNARY_I2S_DEBUG=1 for skip reason."
             )
         
         # FP16 fallback
+        if not fallback_reasons:
+            fallback_reasons.append("linear.fp16_fallback.unknown")
+            _record_fallback_hit("linear.fp16_fallback.unknown")
+        _record_path_hit("linear.fp16_fallback")
         weight_fp16 = _get_fp16_fallback_weight(layer, torch.bfloat16, x.device)
         if weight_fp16 is None:
             if weight.dtype == torch.uint8:
@@ -907,6 +1080,7 @@ class TernaryLinearMethod(LinearMethodBase):
     def _apply_i2s_cutlass(self, layer, x_bf16_2d, bias_bf16, M, N, K, stream):
         """SM100 CUTLASS fused i2s kernel (FP16 A, FP32 output)."""
         def _log_skip(reason: str) -> None:
+            setattr(layer, "_ternary_i2s_cutlass_last_skip", reason)
             cache = getattr(layer, "_ternary_i2s_cutlass_skip_logged", None)
             if cache is None:
                 cache = set()
@@ -1198,6 +1372,7 @@ class TernaryLinearMethod(LinearMethodBase):
                     splits,
                     ws_bytes,
                 )
+        setattr(layer, "_ternary_i2s_cutlass_last_skip", "hit")
 
         out = out_cm.t().contiguous()
         if M_run != M:
@@ -1363,10 +1538,12 @@ class TernaryFusedMoEMethod(FusedMoEMethodBase, nn.Module):
         # Check format
         if not hasattr(topk_output, 'topk_weights') or not hasattr(topk_output, 'topk_ids'):
             if force_ternary_only:
+                _record_fallback_hit("moe.missing_topk.ternary_only_error")
                 raise RuntimeError(
                     "Ternary-only mode enabled but MoE fallback requires FP16 weights "
                     "(missing topk info)."
                 )
+            _record_path_hit("moe.fp16_fallback.missing_topk")
             return StandardCombineInput(hidden_states=fused_moe(
                 hidden_states=hidden_states,
                 w1=layer.w13_weight, w2=layer.w2_weight,
@@ -1403,13 +1580,17 @@ class TernaryFusedMoEMethod(FusedMoEMethodBase, nn.Module):
                 # FP8 decode path
                 result = self._apply_decode_fused_fp8(layer, hidden_states, topk_ids, topk_weights)
                 if result is not None:
+                    _record_path_hit("moe.decode_fused_fp8")
                     return StandardCombineInput(hidden_states=result)
+                _record_fallback_hit("moe.decode_fused_fp8_failed")
             elif hidden_states.dtype == torch.bfloat16:
                 # BF16 decode path
                 result = self._apply_decode_fused(layer, hidden_states, topk_ids, topk_weights)
                 if result is not None:
+                    _record_path_hit("moe.decode_fused_bf16")
                     return StandardCombineInput(hidden_states=result)
                 else:
+                    _record_fallback_hit("moe.decode_fused_bf16_failed")
                     if not getattr(layer, '_decode_fused_fail_logged', False):
                         layer._decode_fused_fail_logged = True
                         logger.warning(f"[TERNARY MoE] _apply_decode_fused returned None, using fallback")
@@ -1429,8 +1610,11 @@ class TernaryFusedMoEMethod(FusedMoEMethodBase, nn.Module):
                     moe_runner_config,
                 )
                 if result is not None:
+                    _record_path_hit("moe.batched_triton")
                     return StandardCombineInput(hidden_states=result)
+                _record_fallback_hit("moe.batched_triton_failed")
                 if force_ternary_only:
+                    _record_fallback_hit("moe.batched_triton_failed.ternary_only_error")
                     raise RuntimeError(
                         "Ternary-only mode enabled but batched ternary MoE path failed. "
                         "Set SGLANG_TERNARY_MOE_TRITON=0 to allow FP16 fallback."
@@ -1450,12 +1634,14 @@ class TernaryFusedMoEMethod(FusedMoEMethodBase, nn.Module):
             hidden_states_for_moe = hidden_states.to(torch.bfloat16).clone()
         
         if force_ternary_only:
+            _record_fallback_hit("moe.fp16_fallback_blocked.ternary_only_error")
             raise RuntimeError(
                 "Ternary-only mode enabled but MoE fallback requires FP16 weights "
                 "(M>1 ternary kernels are disabled). "
                 "Set SGLANG_TERNARY_MOE_TRITON=1 to enable the batched ternary MoE path "
                 "or disable SGLANG_TERNARY_I2S_ONLY/SGLANG_TERNARY_DROP_FP16_WEIGHTS to allow FP16 fallback."
             )
+        _record_path_hit("moe.fp16_fallback")
         return StandardCombineInput(hidden_states=fused_moe(
             hidden_states=hidden_states_for_moe,
             w1=layer.w13_weight, w2=layer.w2_weight,
@@ -1485,20 +1671,24 @@ class TernaryFusedMoEMethod(FusedMoEMethodBase, nn.Module):
             )
         except Exception as e:
             logger.debug(f"[TERNARY MoE] Triton ternary kernel unavailable: {e}")
+            _record_fallback_hit("moe.batched_triton.unavailable")
             return None
 
         if moe_runner_config.activation != "silu":
             logger.warning(
                 "[TERNARY MoE] Triton batched path only supports SiLU activation."
             )
+            _record_fallback_hit("moe.batched_triton.unsupported_activation")
             return None
         if moe_runner_config.apply_router_weight_on_input:
             logger.warning(
                 "[TERNARY MoE] apply_router_weight_on_input not supported in batched ternary path."
             )
+            _record_fallback_hit("moe.batched_triton.unsupported_router_weight_on_input")
             return None
 
         if not getattr(layer, "_ternary_moe_v4_enabled", False):
+            _record_fallback_hit("moe.batched_triton.v4_disabled")
             return None
         if not (
             hasattr(layer, "_ternary_w13_packed")
@@ -1506,6 +1696,17 @@ class TernaryFusedMoEMethod(FusedMoEMethodBase, nn.Module):
             and hasattr(layer, "_ternary_moe_alpha_w13")
             and hasattr(layer, "_ternary_moe_alpha_w2")
         ):
+            _record_fallback_hit("moe.batched_triton.weights_not_ready")
+            return None
+
+        # Some MoE module variants can reach this path without ternary metadata
+        # being initialized on the specific layer object. Fall back safely.
+        if not (
+            hasattr(layer, "_ternary_moe_num_experts")
+            and hasattr(layer, "_ternary_moe_hidden_size")
+            and hasattr(layer, "_ternary_moe_intermediate_size")
+        ):
+            _record_fallback_hit("moe.batched_triton.meta_not_ready")
             return None
 
         if hidden_states.dtype != torch.bfloat16:
@@ -1513,9 +1714,15 @@ class TernaryFusedMoEMethod(FusedMoEMethodBase, nn.Module):
 
         M = hidden_states.shape[0]
         top_k = int(topk_ids.shape[1])
-        num_experts = int(getattr(layer, "_ternary_moe_num_experts"))
-        hidden_size = int(getattr(layer, "_ternary_moe_hidden_size"))
-        intermediate_size = int(getattr(layer, "_ternary_moe_intermediate_size"))
+        try:
+            num_experts = int(getattr(layer, "_ternary_moe_num_experts"))
+            hidden_size = int(getattr(layer, "_ternary_moe_hidden_size"))
+            intermediate_size = int(getattr(layer, "_ternary_moe_intermediate_size"))
+            if num_experts <= 0 or hidden_size <= 0 or intermediate_size <= 0:
+                raise ValueError("non-positive ternary MoE metadata")
+        except Exception:
+            _record_fallback_hit("moe.batched_triton.meta_invalid")
+            return None
         N_w13 = 2 * intermediate_size
         gate_cfg = get_default_ternary_moe_config("gate_up", m=M)
         down_cfg = get_default_ternary_moe_config("down", m=M * top_k)

@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Minimal Chat</title>
+  <link rel="icon" href="data:," />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.10.0/styles/github.min.css" />
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <main class="app-shell is-home">
+    <section class="home-hero" aria-hidden="true">
+      <div class="home-brand">
+        <span class="home-fake-icon"></span>
+        <h1>RedMod Chat</h1>
+      </div>
+    </section>
+    <section id="chat-log" class="chat-log" aria-live="polite"></section>
+
+    <form id="composer" class="composer" autocomplete="off">
+      <div class="composer-meta">
+        <button id="reset-chat" class="btn btn-subtle btn-reset-inline" type="button">New chat</button>
+      </div>
+      <div class="composer-shell">
+        <textarea id="prompt-input" rows="1" placeholder="Ask anything..." required></textarea>
+        <button id="send-btn" class="btn btn-send" type="submit" aria-label="Send message">
+          <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+            <path d="M6 12L12 6L18 12M12 18V6" />
+          </svg>
+        </button>
+      </div>
+    </form>
+  </main>
+
+  <template id="typing-template">
+    <div class="thinking-widget" aria-hidden="true">
+      <div class="thinking-orb">
+        <span class="orb-halo"></span>
+        <span class="orb-pulse"></span>
+        <span class="orb-core"></span>
+      </div>
+      <div class="thinking-text" aria-label="Thinking">Thinking</div>
+    </div>
+  </template>
+
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.7/dist/purify.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.10.0/lib/highlight.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js"></script>
+  <script src="./app.js" defer></script>
+</body>
+</html>

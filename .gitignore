@@ -238,3 +238,23 @@ compile_commands.json
 Cargo.lock
 
 lmms-eval
+
+# Mangrove local workflow artifacts (keep repo clean while preserving local runs)
+.mangrove.env
+third_party/ternarykernels
+logs/
+optimization_runs/
+capacity_compare_*/
+dp_compare_*/
+kernel_sweep_i2s-tuned_*/
+ternary_tuning_*/
+ternary_vs_fp16_perf_*/
+dp4_fp16_validate_conc.json
+i2s_maxspeed_test_conc.json
+i2s_spec2_validate_conc.json
+i2s_spec4_conc.json
+i2s_spec4_m1.json
+i2s_spec4_moefull_conc.json
+i2s_spec4_moefull_ttft_kv.json
+i2s_spec4_validate_conc.json
+minimal-chat/Inception Chat.html
