@@ -12,7 +12,7 @@ Single-chat, no-sidebar interface with a lightweight gray theme.
 
 ## Run
 
-1. Start your SGLang server (default expected at `http://127.0.0.1:30000`).
+1. Start your SGLang server (default expected at `http://127.0.0.1:31080`).
 2. Serve this folder:
 
 ```bash
@@ -29,5 +29,11 @@ http://127.0.0.1:4173
 Optional API override via query string:
 
 ```text
-http://127.0.0.1:4173/?api=http://127.0.0.1:30000
+http://127.0.0.1:4173/?api=http://127.0.0.1:31080
+```
+
+Optional API + model override:
+
+```text
+http://127.0.0.1:4173/?api=http://127.0.0.1:31080&model=mangrove-i2s-tuned
 ```

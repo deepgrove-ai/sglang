@@ -1,4 +1,5 @@
-const DEFAULT_API_BASE = "http://127.0.0.1:30000";
+const DEFAULT_API_BASE = "http://127.0.0.1:31080";
+const DEFAULT_MODEL_ID = "mangrove-i2s-tuned";
 const SYSTEM_PROMPT =
   "You are a helpful assistant. Reply with concise Markdown. Use LaTeX for math when useful.";
 
@@ -11,10 +12,9 @@ const state = {
 
 const URL_PARAMS = new URLSearchParams(window.location.search);
 const apiBaseFromQuery = URL_PARAMS.get("api");
-const thinkMsFromQuery = Number.parseInt(URL_PARAMS.get("think_ms") || "", 10);
-const MIN_THINKING_MS =
-  Number.isFinite(thinkMsFromQuery) && thinkMsFromQuery >= 0 ? thinkMsFromQuery : 1000;
+const modelFromQuery = URL_PARAMS.get("model");
 const API_BASE = (apiBaseFromQuery || DEFAULT_API_BASE).replace(/\/+$/, "");
+const PREFERRED_MODEL_ID = (modelFromQuery || DEFAULT_MODEL_ID).trim();
 
 const appShell = document.querySelector(".app-shell");
 const chatLog = document.getElementById("chat-log");
@@ -103,7 +103,6 @@ async function handleSubmit(event) {
 
   const typingBubble = addTypingBubble();
   setBusy(true);
-  const typingStartedAt = performance.now();
 
   try {
     let assistantReply;
@@ -112,12 +111,6 @@ async function handleSubmit(event) {
       state.messages.push({ role: "assistant", content: assistantReply });
     } catch (error) {
       assistantReply = "I could not reach the chat endpoint.\n\n```text\n" + error.message + "\n```";
-    }
-
-    const elapsedMs = performance.now() - typingStartedAt;
-    const remainingMs = MIN_THINKING_MS - elapsedMs;
-    if (remainingMs > 0) {
-      await sleep(remainingMs);
     }
 
     paintAssistantBubble(typingBubble, assistantReply, true);
@@ -151,7 +144,9 @@ async function resolveModel() {
   }
 
   const payload = await response.json();
-  const modelId = payload?.data?.[0]?.id;
+  const models = Array.isArray(payload?.data) ? payload.data : [];
+  const preferredModel = models.find((item) => item?.id === PREFERRED_MODEL_ID);
+  const modelId = preferredModel?.id || models[0]?.id;
   if (!modelId) {
     throw new Error("No models returned by /v1/models.");
   }
@@ -364,12 +359,6 @@ function autoResizeInput() {
 
 function scrollToBottom() {
   chatLog.scrollTop = chatLog.scrollHeight;
-}
-
-function sleep(ms) {
-  return new Promise((resolve) => {
-    window.setTimeout(resolve, ms);
-  });
 }
 
 function trimText(text, maxLen) {
