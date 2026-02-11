@@ -1,5 +1,5 @@
-const DEFAULT_API_BASE = window.location.origin;
-const DEFAULT_MODEL_ID = "mangrove-alltern-overlap";
+const DEFAULT_API_BASE = "http://127.0.0.1:30080";
+const DEFAULT_MODEL_ID = "mangrove-alltern-overlap";  // auto-discovers from /v1/models
 const SYSTEM_PROMPT =
   "You are a helpful assistant. Reply with concise Markdown. Use LaTeX for math when useful.";
 
