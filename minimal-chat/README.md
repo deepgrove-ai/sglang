@@ -1,14 +1,16 @@
 # Minimal Chat UI
 
-Single-chat, no-sidebar interface with a lightweight gray theme.
+Single-chat, no-sidebar interface with a clean modern design.
 
 ## Features
 
+- **Streaming responses** — tokens appear in real-time via SSE
 - Word-by-word fade-in animation for assistant replies
 - Markdown rendering with fenced code blocks
 - Syntax highlighting and one-click code copy button
 - LaTeX math rendering (`$...$`, `$$...$$`, `\(...\)`, `\[...\]`)
 - OpenAI-compatible API calls for SGLang (`/v1/models`, `/v1/chat/completions`)
+- Stop button to cancel in-flight requests
 
 ## Run
 

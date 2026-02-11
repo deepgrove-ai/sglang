@@ -1,7 +1,19 @@
-const DEFAULT_API_BASE = "http://127.0.0.1:30080";
+// ── Configuration ────────────────────────────────────────────────
+// If served via the reverse proxy (serve.py), API is same-origin.
+// If served via plain http.server, fall back to SGLang port on same host.
+const SGLANG_PORT = 30080;
+const isSameOriginProxy = window.location.port !== "4173"; // plain dev server uses 4173
+const AUTO_API_BASE = isSameOriginProxy
+  ? window.location.origin
+  : `${window.location.protocol}//${window.location.hostname}:${SGLANG_PORT}`;
+
 const DEFAULT_MODEL_ID = "mangrove-alltern-overlap";
 const SYSTEM_PROMPT =
   "You are a helpful assistant. Reply with concise Markdown. Use LaTeX for math when useful.";
+
+const URL_PARAMS = new URLSearchParams(window.location.search);
+const API_BASE = (URL_PARAMS.get("api") || AUTO_API_BASE).replace(/\/+$/, "");
+const PREFERRED_MODEL_ID = (URL_PARAMS.get("model") || DEFAULT_MODEL_ID).trim();
 
 const state = {
   busy: false,
@@ -11,12 +23,7 @@ const state = {
   abortController: null,
 };
 
-const URL_PARAMS = new URLSearchParams(window.location.search);
-const apiBaseFromQuery = URL_PARAMS.get("api");
-const modelFromQuery = URL_PARAMS.get("model");
-const API_BASE = (apiBaseFromQuery || DEFAULT_API_BASE).replace(/\/+$/, "");
-const PREFERRED_MODEL_ID = (modelFromQuery || DEFAULT_MODEL_ID).trim();
-
+// ── DOM refs ─────────────────────────────────────────────────────
 const appShell = document.querySelector(".app-shell");
 const chatLog = document.getElementById("chat-log");
 const composer = document.getElementById("composer");
@@ -26,10 +33,7 @@ const resetBtn = document.getElementById("reset-chat");
 const typingTemplate = document.getElementById("typing-template");
 
 if (typeof marked !== "undefined") {
-  marked.setOptions({
-    gfm: true,
-    breaks: true,
-  });
+  marked.setOptions({ gfm: true, breaks: true });
 }
 
 initialize();
@@ -78,19 +82,16 @@ function bindEvents() {
     try {
       await navigator.clipboard.writeText(codeBlock.textContent || "");
       copyBtn.textContent = "Copied!";
-      window.setTimeout(() => {
-        copyBtn.textContent = originalLabel;
-      }, 1500);
+      setTimeout(() => { copyBtn.textContent = originalLabel; }, 1500);
     } catch (error) {
       copyBtn.textContent = "Failed";
-      window.setTimeout(() => {
-        copyBtn.textContent = originalLabel;
-      }, 1500);
+      setTimeout(() => { copyBtn.textContent = originalLabel; }, 1500);
       console.error(error);
     }
   });
 }
 
+// ── Submit handler ───────────────────────────────────────────────
 async function handleSubmit(event) {
   event.preventDefault();
   if (state.busy) return;
@@ -98,9 +99,7 @@ async function handleSubmit(event) {
   const userText = promptInput.value.trim();
   if (!userText) return;
 
-  if (!state.sessionStarted) {
-    setSessionStarted(true);
-  }
+  if (!state.sessionStarted) setSessionStarted(true);
 
   promptInput.value = "";
   autoResizeInput();
@@ -121,27 +120,22 @@ async function handleSubmit(event) {
       if (error.name === "AbortError") {
         assistantReply = "*Request cancelled.*";
       } else {
+        console.error("[RedMod] Chat error:", error);
         assistantReply =
-          "I could not reach the chat endpoint.\n\n```text\n" +
+          "Could not reach the model.\n\n```text\n" +
           error.message +
-          "\n```";
+          "\n```\n\nAPI: `" + API_BASE + "`";
       }
     }
 
-    // Only re-render if it wasn't streamed (error/cancel cases).
-    // For streamed responses, the bubble already has the final content —
-    // just do a final math + code pass without wiping innerHTML.
     if (wasStreamed) {
       finalizeStreamedBubble(bubble);
     } else {
       paintAssistantBubble(bubble, assistantReply, false);
     }
   } catch (error) {
-    const fallback =
-      "Something went wrong while rendering the response.\n\n```text\n" +
-      error.message +
-      "\n```";
-    paintAssistantBubble(bubble, fallback, false);
+    paintAssistantBubble(bubble,
+      "Something went wrong.\n\n```text\n" + error.message + "\n```", false);
   } finally {
     setBusy(false);
     state.abortController = null;
@@ -149,6 +143,7 @@ async function handleSubmit(event) {
   }
 }
 
+// ── State helpers ────────────────────────────────────────────────
 function setSessionStarted(started) {
   state.sessionStarted = started;
   appShell.classList.toggle("is-home", !started);
@@ -158,51 +153,46 @@ function setBusy(isBusy) {
   state.busy = isBusy;
   sendBtn.disabled = isBusy;
   promptInput.disabled = isBusy;
-  if (isBusy) {
-    resetBtn.textContent = "Stop";
-    resetBtn.disabled = false;
-  } else {
-    resetBtn.textContent = "New chat";
-    resetBtn.disabled = false;
-  }
+  resetBtn.textContent = isBusy ? "Stop" : "New chat";
 }
 
+// ── Model resolution ─────────────────────────────────────────────
 async function resolveModel() {
   if (state.modelId) return state.modelId;
 
   const response = await fetch(`${API_BASE}/v1/models`);
   if (!response.ok) {
-    throw new Error(`Model discovery failed (${response.status}).`);
+    throw new Error(`Model discovery failed (${response.status}). API: ${API_BASE}`);
   }
 
   const payload = await response.json();
   const models = Array.isArray(payload?.data) ? payload.data : [];
-  const preferredModel = models.find((item) => item?.id === PREFERRED_MODEL_ID);
-  const modelId = preferredModel?.id || models[0]?.id;
-  if (!modelId) {
-    throw new Error("No models returned by /v1/models.");
-  }
+  const match = models.find((m) => m?.id === PREFERRED_MODEL_ID);
+  const modelId = match?.id || models[0]?.id;
+  if (!modelId) throw new Error("No models returned by /v1/models.");
 
   state.modelId = modelId;
   return modelId;
 }
 
+// ── Streaming chat ───────────────────────────────────────────────
 async function streamAssistantReply(bubble) {
   const modelId = await resolveModel();
   const controller = new AbortController();
   state.abortController = controller;
 
-  const payload = {
-    model: modelId,
-    messages: state.messages,
-    temperature: 0.35,
-    stream: true,
-  };
-
   const response = await fetch(`${API_BASE}/v1/chat/completions`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
+    body: JSON.stringify({
+      model: modelId,
+      messages: state.messages,
+      temperature: 0.7,
+      top_p: 0.9,
+      frequency_penalty: 0.3,
+      presence_penalty: 0.3,
+      stream: true,
+    }),
     signal: controller.signal,
   });
 
@@ -236,7 +226,7 @@ async function streamAssistantReply(bubble) {
       try {
         const parsed = JSON.parse(data);
         const delta = parsed?.choices?.[0]?.delta?.content;
-        if (typeof delta === "string") {
+        if (typeof delta === "string" && delta.length > 0) {
           fullText += delta;
           renderStreamChunk(bubble, fullText);
           scrollToBottom();
@@ -254,55 +244,97 @@ async function streamAssistantReply(bubble) {
   return fullText;
 }
 
+// ── Rendering helpers ────────────────────────────────────────────
+let _mathRenderTimer = null;
 function renderStreamChunk(bubble, text) {
-  const html = markdownToHtml(text);
-  bubble.innerHTML = html;
+  bubble.innerHTML = markdownToHtml(text);
   decorateCodeBlocks(bubble);
-  // Don't render math on every chunk — too expensive.
-  // Math is finalized once streaming is complete.
+  // Throttle math rendering during streaming (every 500ms)
+  if (!_mathRenderTimer) {
+    _mathRenderTimer = setTimeout(() => {
+      renderMath(bubble);
+      _mathRenderTimer = null;
+    }, 500);
+  }
 }
 
 function finalizeStreamedBubble(bubble) {
-  // The bubble already has the streamed HTML. Just re-run the finalizers
-  // (code highlighting, math) without wiping the content.
+  clearTimeout(_mathRenderTimer);
+  _mathRenderTimer = null;
   decorateCodeBlocks(bubble);
   renderMath(bubble);
   scrollToBottom();
 }
 
 function paintAssistantBubble(bubble, markdown, animate) {
-  const html = markdownToHtml(markdown);
-  bubble.innerHTML = html;
+  bubble.innerHTML = markdownToHtml(markdown);
   decorateCodeBlocks(bubble);
   renderMath(bubble);
-  if (animate) {
-    applyWordFadeIn(bubble);
-  }
+  if (animate) applyWordFadeIn(bubble);
   scrollToBottom();
 }
 
 function markdownToHtml(markdown) {
-  const rawHtml =
-    typeof marked !== "undefined"
-      ? marked.parse(markdown)
-      : escapeHtml(markdown);
+  // Protect math blocks from being mangled by the Markdown parser.
+  // We extract them, replace with placeholders, parse MD, then restore.
+  const mathBlocks = [];
+  const PLACEHOLDER = (i) => `%%MATH_${i}%%`;
+
+  // Order matters: longer/greedier patterns first.
+  // 1. Display math: $$ ... $$ and \[ ... \]
+  // 2. Inline math:  $ ... $  and \( ... \)
+  // 3. Also protect ```...``` code fences (already safe, but belt-and-suspenders)
+  let protected_ = markdown;
+
+  // Display: $$ ... $$ (can span lines)
+  protected_ = protected_.replace(/\$\$([\s\S]+?)\$\$/g, (match) => {
+    mathBlocks.push(match);
+    return PLACEHOLDER(mathBlocks.length - 1);
+  });
+
+  // Display: \[ ... \] (can span lines)
+  protected_ = protected_.replace(/\\\[([\s\S]+?)\\\]/g, (match) => {
+    mathBlocks.push(match);
+    return PLACEHOLDER(mathBlocks.length - 1);
+  });
+
+  // Inline: $ ... $ (single line, non-greedy, must have content)
+  protected_ = protected_.replace(/\$([^\$\n]+?)\$/g, (match) => {
+    mathBlocks.push(match);
+    return PLACEHOLDER(mathBlocks.length - 1);
+  });
+
+  // Inline: \( ... \) (single line)
+  protected_ = protected_.replace(/\\\((.+?)\\\)/g, (match) => {
+    mathBlocks.push(match);
+    return PLACEHOLDER(mathBlocks.length - 1);
+  });
+
+  // Parse Markdown
+  let html = typeof marked !== "undefined"
+    ? marked.parse(protected_)
+    : escapeHtml(protected_);
+
+  // Sanitize
   if (typeof DOMPurify !== "undefined") {
-    return DOMPurify.sanitize(rawHtml);
+    html = DOMPurify.sanitize(html);
   }
-  return rawHtml;
+
+  // Restore math blocks
+  for (let i = 0; i < mathBlocks.length; i++) {
+    html = html.replace(PLACEHOLDER(i), mathBlocks[i]);
+  }
+
+  return html;
 }
 
 function decorateCodeBlocks(root) {
-  root.querySelectorAll("pre > code").forEach((codeElement) => {
+  root.querySelectorAll("pre > code").forEach((codeEl) => {
     if (typeof hljs !== "undefined") {
-      try {
-        hljs.highlightElement(codeElement);
-      } catch (error) {
-        console.warn("Code highlight skipped.", error);
-      }
+      try { hljs.highlightElement(codeEl); } catch { /* skip */ }
     }
 
-    const pre = codeElement.parentElement;
+    const pre = codeEl.parentElement;
     if (!pre || pre.parentElement?.classList.contains("code-wrap")) return;
 
     const wrapper = document.createElement("div");
@@ -312,30 +344,26 @@ function decorateCodeBlocks(root) {
     header.className = "code-header";
 
     const langLabel = document.createElement("span");
-    langLabel.textContent = detectLanguage(codeElement);
+    langLabel.textContent = detectLanguage(codeEl);
 
-    const copyButton = document.createElement("button");
-    copyButton.type = "button";
-    copyButton.className = "copy-code-btn";
-    copyButton.textContent = "Copy";
+    const copyBtn = document.createElement("button");
+    copyBtn.type = "button";
+    copyBtn.className = "copy-code-btn";
+    copyBtn.textContent = "Copy";
 
-    header.append(langLabel, copyButton);
+    header.append(langLabel, copyBtn);
     pre.parentNode.insertBefore(wrapper, pre);
     wrapper.append(header, pre);
   });
 }
 
-function detectLanguage(codeElement) {
-  const languageClass = Array.from(codeElement.classList).find((name) =>
-    name.startsWith("language-")
-  );
-  if (!languageClass) return "text";
-  return languageClass.slice("language-".length) || "text";
+function detectLanguage(codeEl) {
+  const cls = Array.from(codeEl.classList).find((n) => n.startsWith("language-"));
+  return cls ? cls.slice(9) || "text" : "text";
 }
 
 function renderMath(root) {
   if (typeof renderMathInElement !== "function") return;
-
   renderMathInElement(root, {
     delimiters: [
       { left: "$$", right: "$$", display: true },
@@ -348,79 +376,99 @@ function renderMath(root) {
   });
 }
 
+// ── Message DOM ──────────────────────────────────────────────────
+function addUserMessage(content) {
+  const bubble = createMessageShell("user");
+  bubble.textContent = content;
+  scrollToBottom();
+}
+
+function addTypingBubble() {
+  const bubble = createMessageShell("assistant");
+  bubble.innerHTML = "";
+  bubble.append(typingTemplate.content.cloneNode(true));
+  scrollToBottom();
+  return bubble;
+}
+
+function createMessageShell(role) {
+  const article = document.createElement("article");
+  article.className = `msg msg-${role}`;
+
+  const roleLabel = document.createElement("div");
+  roleLabel.className = "msg-role";
+  roleLabel.textContent = role === "user" ? "You" : "Assistant";
+
+  const bubble = document.createElement("div");
+  bubble.className = "bubble";
+
+  article.append(roleLabel, bubble);
+  chatLog.appendChild(article);
+  scrollToBottom();
+  return bubble;
+}
+
+// ── Word fade-in (non-streamed only) ─────────────────────────────
 function applyWordFadeIn(root) {
   const textNodes = [];
-  const blockedSelector = "pre, code, .katex, .katex-display, .copy-code-btn";
+  const blocked = "pre, code, .katex, .katex-display, .copy-code-btn";
   const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
 
   while (walker.nextNode()) {
-    const textNode = walker.currentNode;
-    if (!textNode.nodeValue || !textNode.nodeValue.trim()) continue;
-    const parent = textNode.parentElement;
-    if (!parent || parent.closest(blockedSelector)) continue;
-    textNodes.push(textNode);
+    const node = walker.currentNode;
+    if (!node.nodeValue?.trim()) continue;
+    if (node.parentElement?.closest(blocked)) continue;
+    textNodes.push(node);
   }
 
-  const totalRenderableChars = textNodes.reduce((count, node) => {
-    return count + node.nodeValue.replace(/\s+/g, "").length;
-  }, 0);
-  const shouldAnimateLetters = totalRenderableChars <= 900;
+  const totalChars = textNodes.reduce((n, nd) =>
+    n + nd.nodeValue.replace(/\s+/g, "").length, 0);
+  const letterMode = totalChars <= 900;
 
-  let wordIndex = 0;
+  let wi = 0;
   for (const node of textNodes) {
-    const fragment = document.createDocumentFragment();
-    const segments = node.nodeValue.split(/(\s+)/);
+    const frag = document.createDocumentFragment();
+    for (const seg of node.nodeValue.split(/(\s+)/)) {
+      if (!seg) continue;
+      if (/^\s+$/.test(seg)) { frag.append(document.createTextNode(seg)); continue; }
 
-    for (const segment of segments) {
-      if (!segment) continue;
-      if (/^\s+$/.test(segment)) {
-        fragment.append(document.createTextNode(segment));
-        continue;
-      }
+      const delay = Math.min(wi * 20, 2000);
+      const span = document.createElement("span");
+      span.style.setProperty("--word-delay", `${delay}ms`);
 
-      const delayMs = Math.min(wordIndex * 20, 2000);
-      const wordSpan = document.createElement("span");
-      wordSpan.style.setProperty("--word-delay", `${delayMs}ms`);
-
-      if (shouldAnimateLetters) {
-        wordSpan.className = "diff-word";
-        const chars = Array.from(segment);
-        for (let charIndex = 0; charIndex < chars.length; charIndex += 1) {
-          const charSpan = document.createElement("span");
-          const letterDelayMs = charIndex * 10 + (wordIndex % 3) * 4;
-          charSpan.className = "diff-letter";
-          charSpan.style.setProperty("--word-delay", `${delayMs}ms`);
-          charSpan.style.setProperty("--letter-delay", `${letterDelayMs}ms`);
-          charSpan.textContent = chars[charIndex];
-          wordSpan.append(charSpan);
-        }
+      if (letterMode) {
+        span.className = "diff-word";
+        Array.from(seg).forEach((ch, ci) => {
+          const cs = document.createElement("span");
+          cs.className = "diff-letter";
+          cs.style.setProperty("--word-delay", `${delay}ms`);
+          cs.style.setProperty("--letter-delay", `${ci * 10 + (wi % 3) * 4}ms`);
+          cs.textContent = ch;
+          span.append(cs);
+        });
       } else {
-        wordSpan.className = "diff-word--only";
-        wordSpan.textContent = segment;
+        span.className = "diff-word--only";
+        span.textContent = seg;
       }
-
-      fragment.append(wordSpan);
-      wordIndex += 1;
+      frag.append(span);
+      wi++;
     }
-
-    node.parentNode.replaceChild(fragment, node);
+    node.parentNode.replaceChild(frag, node);
   }
 }
 
+// ── Utilities ────────────────────────────────────────────────────
 function autoResizeInput() {
   promptInput.style.height = "0px";
   promptInput.style.height = `${Math.min(promptInput.scrollHeight, 200)}px`;
 }
 
 function scrollToBottom() {
-  requestAnimationFrame(() => {
-    chatLog.scrollTop = chatLog.scrollHeight;
-  });
+  requestAnimationFrame(() => { chatLog.scrollTop = chatLog.scrollHeight; });
 }
 
-function trimText(text, maxLen) {
-  if (text.length <= maxLen) return text;
-  return text.slice(0, maxLen - 1) + "\u2026";
+function trimText(text, max) {
+  return text.length <= max ? text : text.slice(0, max - 1) + "\u2026";
 }
 
 function escapeHtml(text) {

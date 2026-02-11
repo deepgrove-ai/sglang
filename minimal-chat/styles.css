@@ -1,3 +1,20 @@
+/* ── Fonts ─────────────────────────────────────────────────────── */
+@font-face {
+  font-family: "Geist Mono";
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+  src: url("https://cdn.jsdelivr.net/npm/geist@1.3.1/dist/fonts/geist-mono/GeistMono-Variable.woff2") format("woff2");
+}
+
+@font-face {
+  font-family: "Geist Pixel";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("./fonts/GeistPixel-Square.woff2") format("woff2");
+}
+
 /* ── Design tokens ──────────────────────────────────────────────── */
 :root {
   --bg: #0e0e10;
@@ -28,6 +45,7 @@
   --radius-full: 9999px;
   --content-max: 720px;
   --transition: 150ms cubic-bezier(0.4, 0, 0.2, 1);
+  --header-h: 48px;
 }
 
 /* ── Reset & base ──────────────────────────────────────────────── */
@@ -35,8 +53,8 @@
 html, body { height: 100%; margin: 0; }
 
 body {
-  font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
-    Helvetica, Arial, sans-serif;
+  font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI",
+    Roboto, Helvetica, Arial, sans-serif;
   font-size: 15px;
   line-height: 1.6;
   color: var(--text);
@@ -106,21 +124,38 @@ body {
   justify-content: center;
 }
 
-/* ── Top bar (New chat button) ─────────────────────────────────── */
+/* ── Top bar / header ──────────────────────────────────────────── */
 .top-bar {
-  position: absolute;
-  top: 0;
-  left: 0;
-  right: 0;
+  position: relative;
   z-index: 20;
+  height: var(--header-h);
+  flex-shrink: 0;
   display: flex;
-  justify-content: flex-end;
-  padding: 0.75rem 1rem;
-  pointer-events: none;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 1rem;
+  border-bottom: 1px solid var(--border);
+  background: rgba(14, 14, 16, 0.75);
+  backdrop-filter: blur(var(--glass-blur));
+  -webkit-backdrop-filter: blur(var(--glass-blur));
 }
 
-.top-bar .btn {
-  pointer-events: auto;
+.top-bar-left {
+  font-family: "Geist Pixel", monospace;
+  font-size: 0.9rem;
+  font-weight: 400;
+  letter-spacing: -0.02em;
+  color: #ffffff;
+}
+
+.brand-red {
+  color: #ffffff;
+}
+
+.brand-version {
+  color: #ffffff;
+  font-weight: 400;
+  font-size: 0.8rem;
 }
 
 .app-shell.is-home .top-bar {
@@ -150,15 +185,12 @@ body {
 
 .home-hero h1 {
   margin: 0;
+  font-family: "Geist Pixel", monospace;
   font-size: clamp(2rem, 5vw, 2.75rem);
-  font-weight: 700;
-  letter-spacing: -0.04em;
+  font-weight: 400;
+  letter-spacing: -0.02em;
   color: var(--text);
   text-align: center;
-}
-
-.brand-red {
-  color: var(--red);
 }
 
 .app-shell.is-home .chat-log {
@@ -166,21 +198,15 @@ body {
 }
 
 @keyframes hero-in {
-  from {
-    opacity: 0;
-    transform: translateY(12px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
+  from { opacity: 0; transform: translateY(12px); }
+  to   { opacity: 1; transform: translateY(0); }
 }
 
 /* ── Chat log ──────────────────────────────────────────────────── */
 .chat-log {
   flex: 1;
   overflow-y: auto;
-  padding: 3.5rem 1.5rem 1rem;
+  padding: 1.5rem 1.5rem 1rem;
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -224,7 +250,7 @@ body {
 
 @keyframes msg-in {
   from { opacity: 0; transform: translateY(8px); }
-  to { opacity: 1; transform: translateY(0); }
+  to   { opacity: 1; transform: translateY(0); }
 }
 
 /* ── Bubbles ───────────────────────────────────────────────────── */
@@ -318,8 +344,7 @@ body {
 
 /* ── Inline code ───────────────────────────────────────────────── */
 :not(pre) > code {
-  font-family: "SF Mono", "Fira Code", "Fira Mono", "Roboto Mono", Consolas,
-    "Courier New", monospace;
+  font-family: "Geist Mono", "SF Mono", "Fira Code", Consolas, monospace;
   font-size: 0.85em;
   background: rgba(255, 255, 255, 0.06);
   border: 1px solid var(--code-border);
@@ -363,6 +388,7 @@ body {
   padding: 0.3rem 0.5rem;
   cursor: pointer;
   transition: all var(--transition);
+  font-family: inherit;
 }
 
 .copy-code-btn:hover {
@@ -390,14 +416,16 @@ pre::-webkit-scrollbar-thumb {
 }
 
 pre code {
-  font-family: "SF Mono", "Fira Code", "Fira Mono", "Roboto Mono", Consolas,
-    "Courier New", monospace;
+  font-family: "Geist Mono", "SF Mono", "Fira Code", Consolas, monospace;
   font-size: 0.84rem;
   line-height: 1.6;
 }
 
 /* ── Math (KaTeX dark theme) ──────────────────────────────────── */
-.katex { color: var(--text); }
+.katex { color: var(--text) !important; }
+.katex .mord, .katex .mop, .katex .mrel,
+.katex .mbin, .katex .mopen, .katex .mclose,
+.katex .mpunct, .katex .minner { color: var(--text) !important; }
 .katex-display { overflow-x: auto; overflow-y: hidden; padding: 0.5rem 0; }
 .katex-display > .katex {
   padding: 0.75rem 1rem;
@@ -625,7 +653,7 @@ pre code {
   .blob-1 { width: 280px; height: 280px; }
   .blob-2 { width: 220px; height: 220px; }
 
-  .chat-log { padding: 3rem 1rem 0.75rem; }
+  .chat-log { padding: 1rem 1rem 0.75rem; }
   .composer { padding: 0.35rem 1rem 0.75rem; }
 
   .composer-shell {
