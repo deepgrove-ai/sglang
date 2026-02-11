@@ -66,7 +66,7 @@ while [[ $# -gt 0 ]]; do
             MODEL_NAME_OVERRIDE="$2"
             shift 2
             ;;
-    fp16|i2s|i2s-tuned|i2s-maxspeed|i2s-tuned-dp2|i2s-kvfp8|i2s-fp8|i2s-fp8-full|ternary)
+    fp16|i2s|i2s-tuned|i2s-alltern|i2s-maxspeed|i2s-tuned-dp2|i2s-kvfp8|i2s-fp8|i2s-fp8-full|ternary)
             QUANT_MODE="$1"
             shift
             ;;
@@ -78,6 +78,7 @@ while [[ $# -gt 0 ]]; do
             echo "  i2s:            Ternary + I2_S (8x memory reduction, FP16 inference)"
             echo "  ternary:        Ternary-only (no FP16 fallback; i2s/BitNet only)"
             echo "  i2s-tuned:      Ternary + I2_S + Optimized FlashInfer (RECOMMENDED)"
+            echo "  i2s-alltern:    All-ternary kernels (no cuBLAS fallback) + overlap"
             echo "  i2s-maxspeed:   Ternary + I2_S + Speculative decode (maximize C=1 and mid-load TPS)"
             echo "  i2s-tuned-dp2:  i2s-tuned + Data Parallel on 2 GPUs (2x throughput)"
             echo "  i2s-kvfp8:      Ternary + I2_S + FP8 KV Cache (memory optimized, ~30% slower)"
@@ -349,6 +350,23 @@ case "$QUANT_MODE" in
         QUANT_FLAG="--quantization ternary --attention-backend flashinfer"
         QUANT_DESC="Ternary + I2_S + Tuned FlashInfer (RECOMMENDED for H100)"
         echo "Note: FlashInfer optimizations enabled (Tensor Cores, 1GB workspace, 4K tiles, MoE Triton=${SGLANG_TERNARY_MOE_TRITON})"
+        ;;
+
+    i2s-alltern)
+        # All-ternary kernel mode: forces ternary CUDA kernels for ALL batch sizes
+        # (no cuBLAS BF16 fallback for M>8). Overlap scheduling stays enabled.
+        # This eliminates cuBLAS workspace pressure under concurrency.
+        export SGLANG_FLASHINFER_USE_TENSOR_CORE=true
+        export SGLANG_FLASHINFER_WORKSPACE_SIZE=$((1024*1024*1024))  # 1GB
+        export SGLANG_FLASHINFER_DECODE_SPLIT_TILE_SIZE=4096
+        export SGLANG_TERNARY_ENABLE_EXPERIMENTAL_MGT1_LINEAR=1
+        export SGLANG_TERNARY_MGT1_LINEAR_MAX_M=99999
+        export SGLANG_TERNARY_MOE_TRITON=1
+        export SGLANG_TERNARY_MOE_COMBINE_TRITON=1
+        QUANT_FLAG="--quantization ternary --attention-backend flashinfer"
+        QUANT_DESC="All-ternary kernels (no cuBLAS fallback) + overlap"
+        echo "Note: All-ternary mode — MGT1_LINEAR_MAX_M=99999 (no cuBLAS fallback)"
+        echo "Note: FlashInfer optimizations enabled (Tensor Cores, 1GB workspace, 4K tiles)"
         ;;
 
     i2s-maxspeed)
