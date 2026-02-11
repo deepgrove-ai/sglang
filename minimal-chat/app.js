@@ -1,5 +1,5 @@
-const DEFAULT_API_BASE = "http://127.0.0.1:31080";
-const DEFAULT_MODEL_ID = "mangrove-i2s-tuned";
+const DEFAULT_API_BASE = window.location.origin;
+const DEFAULT_MODEL_ID = "mangrove-alltern-overlap";
 const SYSTEM_PROMPT =
   "You are a helpful assistant. Reply with concise Markdown. Use LaTeX for math when useful.";
 
@@ -8,6 +8,7 @@ const state = {
   modelId: null,
   sessionStarted: false,
   messages: [{ role: "system", content: SYSTEM_PROMPT }],
+  abortController: null,
 };
 
 const URL_PARAMS = new URLSearchParams(window.location.search);
@@ -51,7 +52,12 @@ function bindEvents() {
   });
 
   resetBtn.addEventListener("click", () => {
-    if (state.busy) return;
+    if (state.busy) {
+      if (state.abortController) {
+        state.abortController.abort();
+      }
+      return;
+    }
     state.messages = [{ role: "system", content: SYSTEM_PROMPT }];
     state.sessionStarted = false;
     chatLog.innerHTML = "";
@@ -71,15 +77,15 @@ function bindEvents() {
     const originalLabel = copyBtn.textContent;
     try {
       await navigator.clipboard.writeText(codeBlock.textContent || "");
-      copyBtn.textContent = "Copied";
+      copyBtn.textContent = "Copied!";
       window.setTimeout(() => {
         copyBtn.textContent = originalLabel;
-      }, 1200);
+      }, 1500);
     } catch (error) {
-      copyBtn.textContent = "Copy failed";
+      copyBtn.textContent = "Failed";
       window.setTimeout(() => {
         copyBtn.textContent = originalLabel;
-      }, 1200);
+      }, 1500);
       console.error(error);
     }
   });
@@ -101,24 +107,35 @@ async function handleSubmit(event) {
   addUserMessage(userText);
   state.messages.push({ role: "user", content: userText });
 
-  const typingBubble = addTypingBubble();
+  const bubble = addTypingBubble();
   setBusy(true);
 
   try {
     let assistantReply;
     try {
-      assistantReply = await requestAssistantReply();
+      assistantReply = await streamAssistantReply(bubble);
       state.messages.push({ role: "assistant", content: assistantReply });
     } catch (error) {
-      assistantReply = "I could not reach the chat endpoint.\n\n```text\n" + error.message + "\n```";
+      if (error.name === "AbortError") {
+        assistantReply = "*Request cancelled.*";
+      } else {
+        assistantReply =
+          "I could not reach the chat endpoint.\n\n```text\n" +
+          error.message +
+          "\n```";
+      }
     }
 
-    paintAssistantBubble(typingBubble, assistantReply, true);
+    paintAssistantBubble(bubble, assistantReply, true);
   } catch (error) {
-    const fallback = "Something went wrong while rendering the response.\n\n```text\n" + error.message + "\n```";
-    paintAssistantBubble(typingBubble, fallback, false);
+    const fallback =
+      "Something went wrong while rendering the response.\n\n```text\n" +
+      error.message +
+      "\n```";
+    paintAssistantBubble(bubble, fallback, false);
   } finally {
     setBusy(false);
+    state.abortController = null;
     promptInput.focus();
   }
 }
@@ -131,8 +148,14 @@ function setSessionStarted(started) {
 function setBusy(isBusy) {
   state.busy = isBusy;
   sendBtn.disabled = isBusy;
-  resetBtn.disabled = isBusy;
   promptInput.disabled = isBusy;
+  if (isBusy) {
+    resetBtn.textContent = "Stop";
+    resetBtn.disabled = false;
+  } else {
+    resetBtn.textContent = "New chat";
+    resetBtn.disabled = false;
+  }
 }
 
 async function resolveModel() {
@@ -155,6 +178,81 @@ async function resolveModel() {
   return modelId;
 }
 
+async function streamAssistantReply(bubble) {
+  const modelId = await resolveModel();
+  const controller = new AbortController();
+  state.abortController = controller;
+
+  const payload = {
+    model: modelId,
+    messages: state.messages,
+    temperature: 0.35,
+    stream: true,
+  };
+
+  const response = await fetch(`${API_BASE}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+    signal: controller.signal,
+  });
+
+  if (!response.ok) {
+    const body = await response.text();
+    throw new Error(`Chat failed (${response.status}): ${trimText(body, 280)}`);
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let fullText = "";
+  let buffer = "";
+
+  // Clear thinking indicator
+  bubble.innerHTML = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() || "";
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed || !trimmed.startsWith("data:")) continue;
+      const data = trimmed.slice(5).trim();
+      if (data === "[DONE]") continue;
+
+      try {
+        const parsed = JSON.parse(data);
+        const delta = parsed?.choices?.[0]?.delta?.content;
+        if (typeof delta === "string") {
+          fullText += delta;
+          renderStreamChunk(bubble, fullText);
+          scrollToBottom();
+        }
+      } catch {
+        // skip malformed chunks
+      }
+    }
+  }
+
+  if (!fullText.trim()) {
+    throw new Error("Assistant response was empty.");
+  }
+
+  return fullText;
+}
+
+function renderStreamChunk(bubble, text) {
+  const html = markdownToHtml(text);
+  bubble.innerHTML = html;
+  decorateCodeBlocks(bubble);
+  renderMath(bubble);
+}
+
+// Fallback non-streaming request (kept for compatibility)
 async function requestAssistantReply() {
   const modelId = await resolveModel();
   const payload = {
@@ -172,7 +270,9 @@ async function requestAssistantReply() {
 
   if (!response.ok) {
     const body = await response.text();
-    throw new Error(`Chat failed (${response.status}): ${trimText(body, 280)}`);
+    throw new Error(
+      `Chat failed (${response.status}): ${trimText(body, 280)}`
+    );
   }
 
   const data = await response.json();
@@ -232,7 +332,10 @@ function paintAssistantBubble(bubble, markdown, animate) {
 }
 
 function markdownToHtml(markdown) {
-  const rawHtml = typeof marked !== "undefined" ? marked.parse(markdown) : escapeHtml(markdown);
+  const rawHtml =
+    typeof marked !== "undefined"
+      ? marked.parse(markdown)
+      : escapeHtml(markdown);
   if (typeof DOMPurify !== "undefined") {
     return DOMPurify.sanitize(rawHtml);
   }
@@ -273,7 +376,9 @@ function decorateCodeBlocks(root) {
 }
 
 function detectLanguage(codeElement) {
-  const languageClass = Array.from(codeElement.classList).find((name) => name.startsWith("language-"));
+  const languageClass = Array.from(codeElement.classList).find((name) =>
+    name.startsWith("language-")
+  );
   if (!languageClass) return "text";
   return languageClass.slice("language-".length) || "text";
 }
@@ -323,7 +428,7 @@ function applyWordFadeIn(root) {
         continue;
       }
 
-      const delayMs = Math.min(wordIndex * 24, 2400);
+      const delayMs = Math.min(wordIndex * 20, 2000);
       const wordSpan = document.createElement("span");
       wordSpan.style.setProperty("--word-delay", `${delayMs}ms`);
 
@@ -332,7 +437,7 @@ function applyWordFadeIn(root) {
         const chars = Array.from(segment);
         for (let charIndex = 0; charIndex < chars.length; charIndex += 1) {
           const charSpan = document.createElement("span");
-          const letterDelayMs = charIndex * 12 + (wordIndex % 3) * 5;
+          const letterDelayMs = charIndex * 10 + (wordIndex % 3) * 4;
           charSpan.className = "diff-letter";
           charSpan.style.setProperty("--word-delay", `${delayMs}ms`);
           charSpan.style.setProperty("--letter-delay", `${letterDelayMs}ms`);
@@ -354,16 +459,18 @@ function applyWordFadeIn(root) {
 
 function autoResizeInput() {
   promptInput.style.height = "0px";
-  promptInput.style.height = `${promptInput.scrollHeight}px`;
+  promptInput.style.height = `${Math.min(promptInput.scrollHeight, 200)}px`;
 }
 
 function scrollToBottom() {
-  chatLog.scrollTop = chatLog.scrollHeight;
+  requestAnimationFrame(() => {
+    chatLog.scrollTop = chatLog.scrollHeight;
+  });
 }
 
 function trimText(text, maxLen) {
   if (text.length <= maxLen) return text;
-  return text.slice(0, maxLen - 1) + "...";
+  return text.slice(0, maxLen - 1) + "\u2026";
 }
 
 function escapeHtml(text) {
