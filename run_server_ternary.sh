@@ -225,6 +225,23 @@ export SGLANG_TERNARY_CACHE_WRITE="${SGLANG_TERNARY_CACHE_WRITE:-1}"
 # - 1: keep original BF16 MoE weights for prefill, use ternary kernel for decode when available
 # - 0: quantize MoE BF16 weights too (slower startup)
 export TERNARY_MOE_DECODE_ONLY="${TERNARY_MOE_DECODE_ONLY:-1}"
+# Optional: profile batched MoE Triton stages (gateup/silu/down/combine) in logs.
+export SGLANG_TERNARY_MOE_BATCHED_PROFILE="${SGLANG_TERNARY_MOE_BATCHED_PROFILE:-0}"
+# H100-specific gate_up tuning toggle (applies to bucket m>4 in ternary MoE Triton path).
+export SGLANG_TERNARY_MOE_GATEUP_H100_TUNE="${SGLANG_TERNARY_MOE_GATEUP_H100_TUNE:-1}"
+# Experimental batched MoE INT8 stage mode:
+#   0 (default): disabled
+#   gateup: INT8 gate_up only
+#   down: INT8 down only
+#   both: INT8 gate_up + down
+export SGLANG_TERNARY_MOE_INT8_MODE="${SGLANG_TERNARY_MOE_INT8_MODE:-0}"
+export SGLANG_TERNARY_MOE_INT8_MIN_TOKENS="${SGLANG_TERNARY_MOE_INT8_MIN_TOKENS:-0}"
+export SGLANG_TERNARY_MOE_INT8_STRICT="${SGLANG_TERNARY_MOE_INT8_STRICT:-0}"
+# Batched MoE combine policy:
+# - 1 (default): use Triton reduce kernel for top_k > 2 (best on H100 in local tests)
+# - 0: use legacy mixed policy (torch-compile up to SGLANG_TERNARY_MOE_COMBINE_TORCH_MAX_M)
+export SGLANG_TERNARY_MOE_COMBINE_TRITON="${SGLANG_TERNARY_MOE_COMBINE_TRITON:-1}"
+export SGLANG_TERNARY_MOE_COMBINE_TORCH_MAX_M="${SGLANG_TERNARY_MOE_COMBINE_TORCH_MAX_M:-32}"
 
 # Optional: quantize LM head (vocab projection) to ternary for decode speed.
 # Can affect output quality; enable only for experiments.
@@ -244,6 +261,20 @@ export TERNARY_ENABLE_PDL="${TERNARY_ENABLE_PDL:-1}"
 # This is critical for avoiding the per-step ~3ms stall seen as aten::to/copy_ + cudaMemcpyAsync.
 export SGLANG_ENABLE_PINNED_OUTPUT_COPY="${SGLANG_ENABLE_PINNED_OUTPUT_COPY:-1}"
 export SGLANG_PINNED_OUTPUT_COPY_MAX_BYTES="${SGLANG_PINNED_OUTPUT_COPY_MAX_BYTES:-1048576}"
+
+# Experimental M>1 ternary linear path (disabled by default).
+# Enable only for controlled bring-up with external correctness harnessing.
+export SGLANG_TERNARY_ENABLE_EXPERIMENTAL_MGT1_LINEAR="${SGLANG_TERNARY_ENABLE_EXPERIMENTAL_MGT1_LINEAR:-0}"
+# M-threshold: use ternary CUDA kernel only for M <= this value; beyond it cuBLAS BF16 is faster.
+# Benchmarked on H100 (Feb 2026): crossover at M~8. Set to 0 to always use cuBLAS for M>1.
+export SGLANG_TERNARY_MGT1_LINEAR_MAX_M="${SGLANG_TERNARY_MGT1_LINEAR_MAX_M:-8}"
+export SGLANG_TERNARY_MGT1_VALIDATE="${SGLANG_TERNARY_MGT1_VALIDATE:-0}"
+export SGLANG_TERNARY_MGT1_VALIDATE_REF="${SGLANG_TERNARY_MGT1_VALIDATE_REF:-m1_kernel}"
+export SGLANG_TERNARY_MGT1_VALIDATE_ROWS="${SGLANG_TERNARY_MGT1_VALIDATE_ROWS:-8}"
+export SGLANG_TERNARY_MGT1_VALIDATE_MAX_ABS="${SGLANG_TERNARY_MGT1_VALIDATE_MAX_ABS:-0.08}"
+export SGLANG_TERNARY_MGT1_VALIDATE_MAX_REL="${SGLANG_TERNARY_MGT1_VALIDATE_MAX_REL:-0.25}"
+export SGLANG_TERNARY_MGT1_VALIDATE_REL_FLOOR="${SGLANG_TERNARY_MGT1_VALIDATE_REL_FLOOR:-0.05}"
+export SGLANG_TERNARY_MGT1_DISABLE_ON_FAIL="${SGLANG_TERNARY_MGT1_DISABLE_ON_FAIL:-1}"
 
 # Enable ternary profiling (set to 1 to enable for debugging)
 # When enabled, tracks timing for ternary operations and saves to JSON file
@@ -314,9 +345,10 @@ case "$QUANT_MODE" in
         export SGLANG_FLASHINFER_USE_TENSOR_CORE=true
         export SGLANG_FLASHINFER_WORKSPACE_SIZE=$((1024*1024*1024))  # 1GB
         export SGLANG_FLASHINFER_DECODE_SPLIT_TILE_SIZE=4096
+        export SGLANG_TERNARY_MOE_TRITON="${SGLANG_TERNARY_MOE_TRITON:-1}"
         QUANT_FLAG="--quantization ternary --attention-backend flashinfer"
         QUANT_DESC="Ternary + I2_S + Tuned FlashInfer (RECOMMENDED for H100)"
-        echo "Note: FlashInfer optimizations enabled (Tensor Cores, 1GB workspace, 4K tiles)"
+        echo "Note: FlashInfer optimizations enabled (Tensor Cores, 1GB workspace, 4K tiles, MoE Triton=${SGLANG_TERNARY_MOE_TRITON})"
         ;;
 
     i2s-maxspeed)
@@ -551,6 +583,10 @@ echo "MoE decode-only (ternary MoE only on decode): $TERNARY_MOE_DECODE_ONLY"
 echo "Batched MoE max tokens: $TERNARY_BATCHED_MOE_MAX_TOKENS (0=disabled)"
 echo "Batched MoE debug logging: $TERNARY_BATCHED_MOE_DEBUG"
 echo "Batched ternary MoE (Triton): ${SGLANG_TERNARY_MOE_TRITON:-0}"
+echo "Batched MoE gate_up H100 tune: ${SGLANG_TERNARY_MOE_GATEUP_H100_TUNE:-1}"
+echo "Batched MoE INT8 mode: ${SGLANG_TERNARY_MOE_INT8_MODE:-0} (min_tokens=${SGLANG_TERNARY_MOE_INT8_MIN_TOKENS:-0}, strict=${SGLANG_TERNARY_MOE_INT8_STRICT:-0})"
+echo "Batched MoE stage profiling: ${SGLANG_TERNARY_MOE_BATCHED_PROFILE:-0}"
+echo "Batched MoE combine policy: triton=${SGLANG_TERNARY_MOE_COMBINE_TRITON:-1} (legacy_torch_max_m=${SGLANG_TERNARY_MOE_COMBINE_TORCH_MAX_M:-32})"
 if [[ "${SGLANG_TERNARY_I2S_ONLY:-0}" == "1" && "${SGLANG_TERNARY_DROP_FP16_WEIGHTS:-0}" == "1" && "${SGLANG_TERNARY_MOE_TRITON:-0}" != "1" ]]; then
     echo "WARNING: Ternary-only + drop-FP16 is enabled but SGLANG_TERNARY_MOE_TRITON=0."
     echo "         M>1 MoE will fall back to FP16 and fail during CUDA graph capture."
@@ -559,6 +595,8 @@ echo "Quantize LM head (TERNARY_QUANTIZE_LM_HEAD): $TERNARY_QUANTIZE_LM_HEAD"
 echo "SGLANG_PROFILE_OPLEVEL (1 disables cuda graphs/overlap/compile): $SGLANG_PROFILE_OPLEVEL"
 echo "TORCH_COMPILE_DISABLE: ${TORCH_COMPILE_DISABLE:-0}  TORCHINDUCTOR_DISABLE: ${TORCHINDUCTOR_DISABLE:-0}"
 echo "Pinned output copy: $SGLANG_ENABLE_PINNED_OUTPUT_COPY (max_bytes=$SGLANG_PINNED_OUTPUT_COPY_MAX_BYTES)"
+echo "Experimental M>1 linear kernel: ${SGLANG_TERNARY_ENABLE_EXPERIMENTAL_MGT1_LINEAR:-0} (max_m=${SGLANG_TERNARY_MGT1_LINEAR_MAX_M:-8})"
+echo "M>1 validation gate: ${SGLANG_TERNARY_MGT1_VALIDATE:-0} (ref=${SGLANG_TERNARY_MGT1_VALIDATE_REF:-m1_kernel}, rows=${SGLANG_TERNARY_MGT1_VALIDATE_ROWS:-8}, max_abs=${SGLANG_TERNARY_MGT1_VALIDATE_MAX_ABS:-0.08}, max_rel=${SGLANG_TERNARY_MGT1_VALIDATE_MAX_REL:-0.25}, rel_floor=${SGLANG_TERNARY_MGT1_VALIDATE_REL_FLOOR:-0.05}, disable_on_fail=${SGLANG_TERNARY_MGT1_DISABLE_ON_FAIL:-1})"
 echo "Ternary-only (no FP16 fallback): ${SGLANG_TERNARY_I2S_ONLY:-0}"
 echo "Drop FP16 ternary weights: ${SGLANG_TERNARY_DROP_FP16_WEIGHTS:-0}"
 if [[ "$TERNARY_ENABLE_PROFILING" == "1" ]]; then

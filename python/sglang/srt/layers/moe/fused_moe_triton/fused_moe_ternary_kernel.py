@@ -371,6 +371,89 @@ def _bucket_m_for_config(m: int) -> int:
     return 8
 
 
+def _apply_kind_env_overrides(kind: str, cfg: dict) -> dict:
+    """
+    Apply optional per-kind Triton config overrides from environment.
+
+    Example (gate_up):
+      SGLANG_TERNARY_MOE_GATEUP_BLOCK_SIZE_M=16
+      SGLANG_TERNARY_MOE_GATEUP_BLOCK_SIZE_N=128
+      SGLANG_TERNARY_MOE_GATEUP_BLOCK_SIZE_K=256
+      SGLANG_TERNARY_MOE_GATEUP_GROUP_SIZE_M=1
+      SGLANG_TERNARY_MOE_GATEUP_NUM_WARPS=8
+      SGLANG_TERNARY_MOE_GATEUP_NUM_STAGES=5
+    """
+    prefix = {
+        "gate_up": "SGLANG_TERNARY_MOE_GATEUP_",
+        "down": "SGLANG_TERNARY_MOE_DOWN_",
+    }.get(kind)
+    if prefix is None:
+        return cfg
+
+    key_map = {
+        "BLOCK_SIZE_M": "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N": "BLOCK_SIZE_N",
+        "BLOCK_SIZE_K": "BLOCK_SIZE_K",
+        "GROUP_SIZE_M": "GROUP_SIZE_M",
+        "NUM_WARPS": "num_warps",
+        "NUM_STAGES": "num_stages",
+    }
+    out = dict(cfg)
+    for env_key, cfg_key in key_map.items():
+        raw = os.environ.get(prefix + env_key, "").strip()
+        if not raw:
+            continue
+        try:
+            val = int(raw)
+        except ValueError:
+            continue
+        if val <= 0:
+            continue
+        out[cfg_key] = val
+    return out
+
+
+def _apply_h100_gateup_defaults(kind: str, bucket: int, cfg: dict) -> dict:
+    """
+    Apply H100-specific gate_up defaults from component-sweep results.
+
+    This path is enabled by default on SM90 and can be disabled via:
+      SGLANG_TERNARY_MOE_GATEUP_H100_TUNE=0
+    """
+    if kind != "gate_up" or bucket != 8:
+        return cfg
+    if os.environ.get("SGLANG_TERNARY_MOE_GATEUP_H100_TUNE", "1").strip().lower() not in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        return cfg
+    if not torch.cuda.is_available():
+        return cfg
+    try:
+        major, _minor = torch.cuda.get_device_capability()
+    except Exception:
+        return cfg
+    if major != 9:
+        return cfg
+
+    tuned = dict(cfg)
+    # Component sweep on H100 showed this config improving end-to-end throughput
+    # while preserving kernel-level numerical parity to baseline in the tested set.
+    tuned.update(
+        {
+            "BLOCK_SIZE_M": 16,
+            "BLOCK_SIZE_N": 128,
+            "BLOCK_SIZE_K": 256,
+            "GROUP_SIZE_M": 64,
+            "num_warps": 4,
+            "num_stages": 3,
+        }
+    )
+    return tuned
+
+
 def get_default_ternary_moe_config(kind: str, m: int) -> dict:
     """
     Return a tuned (heuristic) config for `fused_moe_ternary_kernel`.
@@ -385,10 +468,10 @@ def get_default_ternary_moe_config(kind: str, m: int) -> dict:
     base["FP32_ALPHA"] = 1 if fp32_alpha_env in ("1", "true", "yes", "on") else 0
     bucket = _bucket_m_for_config(int(m))
     cfg = _QWEN3_MOE_TERNARY_CONFIG_MAP.get(kind, {}).get(bucket)
-    if cfg is None:
-        return base
-    base.update(cfg)
-    return base
+    if cfg is not None:
+        base.update(cfg)
+    base = _apply_h100_gateup_defaults(kind, bucket, base)
+    return _apply_kind_env_overrides(kind, base)
 
 
 @triton.jit
@@ -523,7 +606,10 @@ def fused_moe_ternary_int8_kernel(
 
 
 # Default config for INT8 MMA variant (can be tuned separately from BF16 path)
-DEFAULT_TERNARY_MOE_INT8_CONFIG = dict(DEFAULT_TERNARY_MOE_CONFIG)
+# INT8 kernel does not consume FP32_ALPHA (per-K alpha path is BF16 kernel only).
+DEFAULT_TERNARY_MOE_INT8_CONFIG = {
+    k: v for k, v in DEFAULT_TERNARY_MOE_CONFIG.items() if k != "FP32_ALPHA"
+}
 
 # Tuned (rough) on B200 for the INT8 MMA variant (Jan 2026).
 # These differ from the BF16 map (notably: BK must be >=128 for int8 dot, and
@@ -650,6 +736,7 @@ def get_default_ternary_moe_int8_config(kind: str, m: int) -> dict:
     if cfg is None:
         return base
     base.update(cfg)
+    base.pop("FP32_ALPHA", None)
     return base
 
 
@@ -676,6 +763,9 @@ def invoke_fused_moe_ternary_int8_kernel(
     if config is None:
         kind = "down" if int(top_k) == 1 else "gate_up"
         config = get_default_ternary_moe_int8_config(kind=kind, m=int(topk_ids.shape[0]))
+    else:
+        config = dict(config)
+    config.pop("FP32_ALPHA", None)
 
     even_Ks = (K % int(config["BLOCK_SIZE_K"]) == 0)
     compute_type = tl.bfloat16 if C.dtype == torch.bfloat16 else tl.float16

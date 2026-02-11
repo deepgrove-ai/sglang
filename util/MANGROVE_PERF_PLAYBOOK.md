@@ -152,7 +152,57 @@ Outputs include:
 - per-concurrency KV budget per user (`max_total_num_tokens / users`)
 - throughput and latency comparisons across concurrency levels
 
-## 9) Hybrid swap (ternary + fp16)
+## 9) Freeze a reproducible baseline matrix (Phase 1)
+
+Use the one-command baseline freezer to produce a single artifact bundle with:
+
+- corpus-backed support-envelope worksheet (wafer citations)
+- baseline ternary runtime path/fallback counters
+- M=1 decode + TTFT/KV + concurrency benchmark outputs
+- optional kernel sweep + fp16-vs-ternary capacity compare artifacts
+
+```bash
+bash util/freeze_ternary_baseline_matrix.sh \
+  --mode i2s-tuned \
+  --model-path /scratch/mangrove
+```
+
+By default, this command skips the long optional sweep/compare phases.  
+Enable them explicitly when you want full extended coverage:
+
+```bash
+bash util/freeze_ternary_baseline_matrix.sh \
+  --mode i2s-tuned \
+  --model-path /scratch/mangrove \
+  --run-kernel-sweep 1 \
+  --run-capacity-compare 1
+```
+
+The baseline freezer now enforces ternary kernel availability by default for
+`i2s*` / `ternary` modes. If `libternary_bitnet.so` is missing or not loaded,
+the run exits early to avoid misleading (FP16-fallback) tok/s results.
+
+Quick iteration mode:
+
+```bash
+bash util/freeze_ternary_baseline_matrix.sh --quick
+```
+
+Preview planned commands without running workloads:
+
+```bash
+bash util/freeze_ternary_baseline_matrix.sh --dry-run
+```
+
+Output directory (`baseline_matrix_<timestamp>/`) includes:
+
+- `baseline_summary.json` + `baseline_summary.md` (single-glance report)
+- `support_envelope_matrix.csv` + `support_envelope_matrix.md`
+- `baseline_family_counters.json` (linear/moe family counters from runtime stats)
+- benchmark JSON/log artifacts (`baseline_m1_decode.json`, `baseline_ttft_kv.json`, `baseline_concurrency.json`)
+- `commands.log` + `config.env` for reproducibility
+
+## 10) Hybrid swap (ternary + fp16)
 
 Run both backends and an autoswap router:
 
@@ -186,4 +236,126 @@ Router introspection:
 
 ```bash
 curl -s http://127.0.0.1:30080/routing_stats
+```
+
+## 11) H100 M>1 PoC probe (shape x M gate)
+
+Before enabling any runtime M>1 ternary linear path, run the dedicated probe:
+
+```bash
+bash util/run_h100_mgt1_poc.sh
+```
+
+This invokes `util/benchmark_mgt1_linear.py` and writes:
+
+- `mgt1_linear_probe_<timestamp>/probe.json`
+- `mgt1_linear_probe_<timestamp>/probe.log`
+
+The probe reports, for each `(M, N, K)` case:
+
+- kernel return status (`v4_batch_megafused_v2_launch`)
+- correctness deltas vs configurable reference (`m1_kernel` default, or `dense`) using `max_abs`, `max_rel`, `non_finite`
+- latency stats (`avg`, `p50`, `p95`)
+
+Runtime has a guarded M>1 switch for controlled bring-up only:
+
+```bash
+SGLANG_TERNARY_ENABLE_EXPERIMENTAL_MGT1_LINEAR=1 \
+SGLANG_TERNARY_MGT1_VALIDATE=1 \
+SGLANG_TERNARY_MGT1_VALIDATE_REF=m1_kernel \
+SGLANG_TERNARY_MGT1_VALIDATE_ROWS=8 \
+SGLANG_TERNARY_MGT1_VALIDATE_MAX_ABS=0.08 \
+SGLANG_TERNARY_MGT1_VALIDATE_MAX_REL=0.25 \
+SGLANG_TERNARY_MGT1_VALIDATE_REL_FLOOR=0.05 \
+SGLANG_TERNARY_MGT1_DISABLE_ON_FAIL=1 \
+bash run_server_ternary.sh i2s-tuned --model-path /scratch/mangrove
+```
+
+Keep this disabled in production until probe + validation gates pass.
+
+`i2s-tuned` now defaults `SGLANG_TERNARY_MOE_TRITON=1` (override with `SGLANG_TERNARY_MOE_TRITON=0` when debugging fallback behavior).
+
+To profile batched MoE stage split (`gateup`, `silu_mul`, `down`, `combine`) in server logs:
+
+```bash
+SGLANG_TERNARY_MOE_BATCHED_PROFILE=1 \
+bash run_server_ternary.sh i2s-tuned --model-path /scratch/mangrove
+```
+
+Summarize those log lines into stage-share artifacts:
+
+```bash
+python util/summarize_moe_batched_profile.py \
+  --log /path/to/server.log \
+  --output-dir /path/to/profile_summary
+```
+
+Combine policy (for `top_k > 2`) defaults to Triton reduce:
+
+```bash
+# default (recommended on H100)
+SGLANG_TERNARY_MOE_COMBINE_TRITON=1
+
+# legacy fallback policy
+SGLANG_TERNARY_MOE_COMBINE_TRITON=0
+SGLANG_TERNARY_MOE_COMBINE_TORCH_MAX_M=32
+```
+
+Gate/down Triton tile overrides for quick H100 sweeps (optional):
+
+```bash
+SGLANG_TERNARY_MOE_GATEUP_BLOCK_SIZE_M=16
+SGLANG_TERNARY_MOE_GATEUP_BLOCK_SIZE_N=128
+SGLANG_TERNARY_MOE_GATEUP_BLOCK_SIZE_K=256
+SGLANG_TERNARY_MOE_GATEUP_GROUP_SIZE_M=1
+SGLANG_TERNARY_MOE_GATEUP_NUM_WARPS=8
+SGLANG_TERNARY_MOE_GATEUP_NUM_STAGES=5
+
+SGLANG_TERNARY_MOE_DOWN_BLOCK_SIZE_M=16
+SGLANG_TERNARY_MOE_DOWN_BLOCK_SIZE_N=128
+SGLANG_TERNARY_MOE_DOWN_BLOCK_SIZE_K=128
+SGLANG_TERNARY_MOE_DOWN_GROUP_SIZE_M=64
+SGLANG_TERNARY_MOE_DOWN_NUM_WARPS=4
+SGLANG_TERNARY_MOE_DOWN_NUM_STAGES=3
+```
+
+Run the built-in gateup sweep harness (throughput + stage profile summary):
+
+```bash
+bash util/sweep_moe_gateup_configs.sh --model-path /scratch/mangrove
+```
+
+On H100, `gate_up` bucket `m>4` now defaults to a sweep-backed config
+(`m16 n128 k256 g64 w4 s3`). Disable this if needed:
+
+```bash
+SGLANG_TERNARY_MOE_GATEUP_H100_TUNE=0 \
+bash run_server_ternary.sh i2s-tuned --model-path /scratch/mangrove
+```
+
+Experimental high-batch INT8 MoE stage mode (keeps ternary packed weights, switches
+`gate_up`/`down` compute path to INT8 Triton kernels):
+
+```bash
+# gate_up + down
+SGLANG_TERNARY_MOE_INT8_MODE=both \
+SGLANG_TERNARY_MOE_INT8_MIN_TOKENS=64 \
+bash run_server_ternary.sh i2s-tuned --model-path /scratch/mangrove
+
+# gate_up only
+SGLANG_TERNARY_MOE_INT8_MODE=gateup \
+bash run_server_ternary.sh i2s-tuned --model-path /scratch/mangrove
+```
+
+Use `SGLANG_TERNARY_MOE_INT8_STRICT=1` for debug bring-up (fail fast instead of
+falling back to BF16 stage execution).
+
+Current status: this path is **benchmark-only**. Component probes on H100 show
+good speedups, but large output deltas vs BF16 baseline, so keep disabled for
+production correctness until calibrated.
+
+Quick run:
+
+```bash
+bash util/run_h100_mgt1_poc.sh --quick
 ```

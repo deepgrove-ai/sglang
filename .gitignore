@@ -249,6 +249,8 @@ dp_compare_*/
 kernel_sweep_i2s-tuned_*/
 ternary_tuning_*/
 ternary_vs_fp16_perf_*/
+baseline_matrix_*/
+mgt1_linear_probe_*/
 dp4_fp16_validate_conc.json
 i2s_maxspeed_test_conc.json
 i2s_spec2_validate_conc.json
@@ -258,3 +260,20 @@ i2s_spec4_moefull_conc.json
 i2s_spec4_moefull_ttft_kv.json
 i2s_spec4_validate_conc.json
 minimal-chat/Inception Chat.html
+
+# Benchmark artifact directories
+dp8_ab_final_*/
+dp8_fp16_vs_ternary_*/
+dp8_readiness_*/
+fp16_vs_ternary_*/
+gateup_candidate_validate_*/
+gateup_h100_default_ab_*/
+mgt1_ab_medium_*/
+moe_component_sweep_*/
+moe_counter_probe_*/
+moe_default_validate_*/
+moe_down_ab_*/
+moe_fp32alpha0_probe_*/
+moe_gateup_sweep_*/
+moe_profile_long_*/
+moe_component_int8_probe.json

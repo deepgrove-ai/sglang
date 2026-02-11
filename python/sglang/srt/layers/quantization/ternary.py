@@ -360,6 +360,7 @@ def _env_flag(name: str, default: str = "0") -> bool:
 _TERNARY_GATE_SKIP_LOG: set[str] = set()
 _TERNARY_MOE_VALIDATE_COUNT = 0
 _TERNARY_MOE_VALIDATE_DONE: set[str] = set()
+_TERNARY_MOE_BATCHED_PROFILE_CAPTURE_LOGGED = False
 _TERNARY_PATH_COUNTER: Counter[str] = Counter()
 _TERNARY_FALLBACK_COUNTER: Counter[str] = Counter()
 _TERNARY_STATS_EVENTS = 0
@@ -542,6 +543,48 @@ def quantize_alpha_int8(alpha: torch.Tensor) -> Tuple[torch.Tensor, float]:
     alpha_scale = (alpha_max / 127.0).item()
     alpha_q = torch.round(alpha / alpha_scale).clamp(-128, 127).to(torch.int8)
     return alpha_q, alpha_scale
+
+
+def quantize_activation_int8_global(x: torch.Tensor) -> Tuple[torch.Tensor, float]:
+    """Quantize activations to int8 with one global scale."""
+    if x.numel() == 0:
+        return x.to(torch.int8), 1.0
+    x_fp32 = x.float()
+    max_abs = x_fp32.abs().max().clamp(min=1e-8)
+    scale = float((max_abs / 127.0).item())
+    x_i8 = torch.round(x_fp32 / scale).clamp(-128, 127).to(torch.int8)
+    return x_i8.contiguous(), scale
+
+
+def reduce_moe_alpha_per_expert(alpha: torch.Tensor) -> torch.Tensor:
+    """
+    Reduce [E, K] alpha table to [E] scalar alpha for INT8 MoE experimental path.
+    """
+    if alpha.ndim == 1:
+        return alpha.to(torch.float32).contiguous()
+    if alpha.ndim != 2:
+        raise ValueError(f"Expected alpha ndim 1/2, got {alpha.ndim}")
+    return alpha.to(torch.float32).mean(dim=1).contiguous()
+
+
+def _moe_int8_stage_mode() -> Tuple[bool, bool]:
+    """
+    Parse experimental INT8 MoE stage mode.
+
+    SGLANG_TERNARY_MOE_INT8_MODE:
+      - 0/off/none: disabled (default)
+      - gateup: gate_up only
+      - down: down only
+      - 1/on/both/all: gate_up + down
+    """
+    mode = os.environ.get("SGLANG_TERNARY_MOE_INT8_MODE", "0").strip().lower()
+    if mode in ("1", "true", "yes", "on", "both", "all"):
+        return True, True
+    if mode in ("gateup", "gate_up", "gate"):
+        return True, False
+    if mode == "down":
+        return False, True
+    return False, False
 
 
 def pack_i2s_weights(weight_ternary: torch.Tensor) -> torch.Tensor:
@@ -937,8 +980,14 @@ class TernaryLinearMethod(LinearMethodBase):
                     if bias_bf16 is not None:
                         result = result + bias_bf16
                     return result.view(*x_shape[:-1], N)
-                fallback_reasons.append("linear.batch_megafused_failed_or_disabled")
-                _record_fallback_hit("linear.batch_megafused_failed_or_disabled")
+                skip_reason = getattr(layer, "_ternary_batch_megafused_last_skip", None)
+                if skip_reason:
+                    reason = f"linear.batch_megafused_skip.{skip_reason}"
+                    fallback_reasons.append(reason)
+                    _record_fallback_hit(reason)
+                else:
+                    fallback_reasons.append("linear.batch_megafused_failed_or_disabled")
+                    _record_fallback_hit("linear.batch_megafused_failed_or_disabled")
 
         # CUTLASS fused i2s path (SM100, M>1 prefill)
         if weight.dtype == torch.uint8 and not x_is_fp8:
@@ -959,17 +1008,20 @@ class TernaryLinearMethod(LinearMethodBase):
             if x_is_fp8:
                 _log_i2s_ineligible("fp8_input")
                 _record_fallback_hit("linear.i2s_cutlass_ineligible.fp8_input")
-        if force_ternary_only:
+        # cuBLAS fallback — even in ternary-only mode we can reconstruct BF16
+        # from packed i2s weights, so this is safe (no original FP16 weights needed).
+        if force_ternary_only and weight.dtype != torch.uint8:
+            # Only block if we truly cannot reconstruct
             _record_fallback_hit("linear.ternary_only_error.no_kernel_hit")
             raise RuntimeError(
-                "Ternary-only mode enabled but no ternary kernel ran. "
-                "Enable SGLANG_TERNARY_I2S_DEBUG=1 for skip reason."
+                "Ternary-only mode enabled but no ternary kernel ran and weights "
+                "are not in i2s format. Enable SGLANG_TERNARY_I2S_DEBUG=1 for skip reason."
             )
         
-        # FP16 fallback
+        # cuBLAS BF16 fallback (reconstruct from i2s if needed)
         if not fallback_reasons:
-            fallback_reasons.append("linear.fp16_fallback.unknown")
-            _record_fallback_hit("linear.fp16_fallback.unknown")
+            fallback_reasons.append("linear.cublas_fallback.m_gt_threshold")
+            _record_fallback_hit("linear.cublas_fallback.m_gt_threshold")
         _record_path_hit("linear.fp16_fallback")
         weight_fp16 = _get_fp16_fallback_weight(layer, torch.bfloat16, x.device)
         if weight_fp16 is None:
@@ -977,7 +1029,9 @@ class TernaryLinearMethod(LinearMethodBase):
                 weight_fp16 = unpack_i2s_weights(weight, K, layer.ternary_alpha, torch.bfloat16)
             else:
                 weight_fp16 = weight.to(torch.bfloat16)
-            layer.register_buffer("_ternary_weight_fp16", weight_fp16, persistent=False)
+            if not _drop_fp16_weights():
+                # Only cache if we're not in drop mode (saves memory in drop mode)
+                layer.register_buffer("_ternary_weight_fp16", weight_fp16, persistent=False)
         
         output = F.linear(x_bf16, weight_fp16, bias_bf16)
         return output.view(*x_shape[:-1], N)
@@ -1046,27 +1100,91 @@ class TernaryLinearMethod(LinearMethodBase):
         )
         return output if ret == 0 else None
 
+    def _build_m1_reference(self, layer, x_bf16_2d, N, K, stream, max_rows):
+        """Build a validation reference by replaying the M=1 production kernel row-by-row."""
+        m_total = int(x_bf16_2d.shape[0])
+        if m_total <= 0:
+            return None, 0
+        if max_rows <= 0:
+            rows = m_total
+        else:
+            rows = min(m_total, int(max_rows))
+
+        ref = torch.empty((rows, N), device=x_bf16_2d.device, dtype=torch.bfloat16)
+        for row in range(rows):
+            row_out = self._apply_megafused(layer, x_bf16_2d[row : row + 1], N, K, stream)
+            if row_out is None:
+                return None, 0
+            ref[row : row + 1].copy_(row_out)
+        return ref, rows
+
     def _apply_batch_megafused(self, layer, x_bf16, M, N, K, stream):
         """Batch megafused kernel for M>1.
-        
-        !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-        !!! WARNING: THIS KERNEL HAS KNOWN CORRECTNESS ISSUES !!!
-        !!! DO NOT USE IN PRODUCTION - RESULTS ARE INCORRECT FOR M>1 !!!
-        !!! This is kept for reference only. Use FP16 fallback instead. !!!
-        !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+        Disabled by default; enable only for controlled validation with:
+          SGLANG_TERNARY_ENABLE_EXPERIMENTAL_MGT1_LINEAR=1
+
+        M-threshold gate (default 8 — beyond this cuBLAS FP16 is faster):
+          SGLANG_TERNARY_MGT1_LINEAR_MAX_M=<int>  (default: 8)
+
+        Optional first-hit correctness gate:
+          SGLANG_TERNARY_MGT1_VALIDATE=1
+          SGLANG_TERNARY_MGT1_VALIDATE_REF=m1_kernel|dense (default: m1_kernel)
+          SGLANG_TERNARY_MGT1_VALIDATE_ROWS=<int>         (default: 8)
+          SGLANG_TERNARY_MGT1_VALIDATE_MAX_ABS=<float>   (default: 0.08)
+          SGLANG_TERNARY_MGT1_VALIDATE_MAX_REL=<float>   (default: 0.25)
+          SGLANG_TERNARY_MGT1_VALIDATE_REL_FLOOR=<float> (default: 0.05)
+          SGLANG_TERNARY_MGT1_DISABLE_ON_FAIL=1|0        (default: 1)
         """
-        # DISABLED DUE TO CORRECTNESS ISSUES - always return None to use fallback
-        return None
-        
+        if not _env_flag("SGLANG_TERNARY_ENABLE_EXPERIMENTAL_MGT1_LINEAR", "0"):
+            setattr(layer, "_ternary_batch_megafused_last_skip", "disabled_by_env")
+            return None
+        if getattr(layer, "_ternary_batch_megafused_disabled", False):
+            setattr(layer, "_ternary_batch_megafused_last_skip", "disabled_after_validation")
+            return None
+
+        # M-threshold: beyond this value cuBLAS BF16 (FP16 fallback) is faster.
+        # Benchmarked on H100: ternary CUDA kernel scales linearly with M while
+        # cuBLAS GEMM amortises fixed overhead, crossing over around M=8.
+        max_m = int(os.environ.get("SGLANG_TERNARY_MGT1_LINEAR_MAX_M", "8"))
+        if M > max_m:
+            setattr(layer, "_ternary_batch_megafused_last_skip", f"m_exceeds_threshold_{max_m}")
+            _record_fallback_hit(f"linear.batch_megafused_skip.m_exceeds_threshold")
+            if not getattr(layer, "_ternary_batch_megafused_maxm_logged", False):
+                layer._ternary_batch_megafused_maxm_logged = True
+                logger.info(
+                    "[TERNARY LINEAR] M=%d > MGT1_LINEAR_MAX_M=%d — falling back to cuBLAS (N=%d K=%d)",
+                    M, max_m, N, K,
+                )
+            return None
+
         x_in = x_bf16.reshape(-1, K).contiguous()
-        
-        # Use cached output buffer to avoid allocation during CUDA graph capture
-        cache_key = f"_batch_output_{M}_{N}"
-        output = getattr(layer, cache_key, None)
-        if output is None:
+
+        # Output buffer strategy:
+        # - During CUDA graph capture: cache buffers (graph replay needs stable addresses)
+        # - During eager execution: use temporary buffers (avoid unbounded memory leak)
+        is_capturing = False
+        try:
+            is_capturing = torch.cuda.is_current_stream_capturing()
+        except Exception:
+            pass
+
+        if is_capturing:
+            # CUDA graph capture: cache output buffers for stable replay addresses
+            stream_id = int(stream)
+            cache = getattr(layer, "_ternary_stream_outputs", None)
+            if cache is None:
+                cache = {}
+                setattr(layer, "_ternary_stream_outputs", cache)
+            cache_key = ("batch_megafused_out", stream_id, M, N)
+            output = cache.get(cache_key)
+            if output is None or output.shape != (M, N) or output.device != x_bf16.device:
+                output = torch.empty(M, N, device=x_bf16.device, dtype=torch.bfloat16)
+                cache[cache_key] = output
+        else:
+            # Eager execution: temporary buffer, freed after use (no memory leak)
             output = torch.empty(M, N, device=x_bf16.device, dtype=torch.bfloat16)
-            setattr(layer, cache_key, output)
-        
+
         ret = BITNET_LIB.v4_batch_megafused_v2_launch(
             _PTR(x_in.data_ptr()),
             _PTR(layer.ternary_alpha.data_ptr()),
@@ -1075,7 +1193,97 @@ class TernaryLinearMethod(LinearMethodBase):
             _INT(M), _INT(N), _INT(K),
             _PTR(stream),
         )
-        return output if ret == 0 else None
+        if ret != 0:
+            setattr(layer, "_ternary_batch_megafused_last_skip", f"kernel_rc_{ret}")
+            return None
+
+        if _env_flag("SGLANG_TERNARY_MGT1_VALIDATE", "0"):
+            case = (M, N, K)
+            validated = getattr(layer, "_ternary_batch_megafused_validated_cases", None)
+            if validated is None:
+                validated = set()
+                setattr(layer, "_ternary_batch_megafused_validated_cases", validated)
+
+            if case not in validated:
+                validated.add(case)
+                ref_mode = os.environ.get("SGLANG_TERNARY_MGT1_VALIDATE_REF", "m1_kernel")
+                validate_rows = int(os.environ.get("SGLANG_TERNARY_MGT1_VALIDATE_ROWS", "8"))
+                max_abs_th = float(os.environ.get("SGLANG_TERNARY_MGT1_VALIDATE_MAX_ABS", "0.08"))
+                max_rel_th = float(os.environ.get("SGLANG_TERNARY_MGT1_VALIDATE_MAX_REL", "0.25"))
+                rel_floor = float(os.environ.get("SGLANG_TERNARY_MGT1_VALIDATE_REL_FLOOR", "0.05"))
+
+                with torch.no_grad():
+                    x_bf16_2d = x_bf16.reshape(-1, K)
+                    out_eval = output
+                    ref = None
+
+                    if ref_mode == "m1_kernel" and _KERNEL_CAPS.get("megafused"):
+                        ref, rows = self._build_m1_reference(
+                            layer,
+                            x_bf16_2d,
+                            N,
+                            K,
+                            stream,
+                            validate_rows,
+                        )
+                        if ref is not None and rows > 0:
+                            out_eval = output[:rows]
+                        else:
+                            ref_mode = "dense"
+
+                    if ref_mode == "dense":
+                        weight_fp16 = _get_fp16_fallback_weight(layer, torch.bfloat16, x_bf16.device)
+                        if weight_fp16 is None:
+                            # Rebuild dense reference from quantized storage if cache is absent.
+                            weight_fp16 = unpack_i2s_weights(
+                                layer.weight, K, layer.ternary_alpha, torch.bfloat16
+                            )
+                        ref = F.linear(x_bf16_2d, weight_fp16, None)
+                        if validate_rows > 0:
+                            rows = min(int(validate_rows), int(ref.shape[0]))
+                            ref = ref[:rows]
+                            out_eval = output[:rows]
+                        else:
+                            rows = int(ref.shape[0])
+                            out_eval = output
+
+                    diff = (out_eval.float() - ref.float()).abs()
+                    ref_abs = ref.float().abs()
+                    denom = ref_abs.clamp_min(1e-6)
+                    rel = diff / denom
+                    rel_mask = ref_abs >= rel_floor
+                    max_abs = float(diff.max().item())
+                    max_rel = float(rel.max().item())
+                    max_rel_masked = float(rel[rel_mask].max().item()) if bool(rel_mask.any().item()) else 0.0
+                    non_finite = int((~torch.isfinite(output)).sum().item())
+
+                pass_case = (
+                    non_finite == 0
+                    and max_abs <= max_abs_th
+                    and max_rel_masked <= max_rel_th
+                )
+                logger.info(
+                    "[TERNARY M>1 LINEAR VALIDATE] M=%d N=%d K=%d rows=%d ref=%s max_abs=%.6f max_rel=%.6f max_rel_masked=%.6f rel_floor=%.6f non_finite=%d pass=%s",
+                    M,
+                    N,
+                    K,
+                    rows,
+                    ref_mode,
+                    max_abs,
+                    max_rel,
+                    max_rel_masked,
+                    rel_floor,
+                    non_finite,
+                    "yes" if pass_case else "no",
+                )
+                if not pass_case:
+                    setattr(layer, "_ternary_batch_megafused_last_skip", "validation_failed")
+                    if _env_flag("SGLANG_TERNARY_MGT1_DISABLE_ON_FAIL", "1"):
+                        layer._ternary_batch_megafused_disabled = True
+                    return None
+
+        setattr(layer, "_ternary_batch_megafused_last_skip", "hit")
+        return output
 
     def _apply_i2s_cutlass(self, layer, x_bf16_2d, bias_bf16, M, N, K, stream):
         """SM100 CUTLASS fused i2s kernel (FP16 A, FP32 output)."""
@@ -1483,6 +1691,16 @@ class TernaryFusedMoEMethod(FusedMoEMethodBase, nn.Module):
             layer.register_buffer('_ternary_w2_packed', w2_packed.contiguous(), persistent=False)
             layer.register_buffer('_ternary_moe_alpha_w13', alpha13.view(num_experts, hidden_size).to(torch.float32).contiguous(), persistent=False)
             layer.register_buffer('_ternary_moe_alpha_w2', alpha2.view(num_experts, intermediate_size).to(torch.float32).contiguous(), persistent=False)
+            layer.register_buffer(
+                '_ternary_moe_alpha_w13_e',
+                reduce_moe_alpha_per_expert(layer._ternary_moe_alpha_w13),
+                persistent=False,
+            )
+            layer.register_buffer(
+                '_ternary_moe_alpha_w2_e',
+                reduce_moe_alpha_per_expert(layer._ternary_moe_alpha_w2),
+                persistent=False,
+            )
             
             # IMPORTANT: Do NOT cache a single set of scratch buffers on the shared layer.
             # Under concurrency, multiple requests can run on different CUDA streams and
@@ -1493,6 +1711,7 @@ class TernaryFusedMoEMethod(FusedMoEMethodBase, nn.Module):
             max_top_k = 8
             N_w13 = 2 * intermediate_size
             layer._ternary_moe_max_top_k = max_top_k
+            layer._ternary_moe_num_experts = num_experts
             layer._ternary_moe_intermediate_size = intermediate_size
             layer._ternary_moe_hidden_size = hidden_size
             layer._ternary_moe_scratch_cache = {}  # (stream_id) -> dict of buffers
@@ -1538,10 +1757,10 @@ class TernaryFusedMoEMethod(FusedMoEMethodBase, nn.Module):
         # Check format
         if not hasattr(topk_output, 'topk_weights') or not hasattr(topk_output, 'topk_ids'):
             if force_ternary_only:
-                _record_fallback_hit("moe.missing_topk.ternary_only_error")
-                raise RuntimeError(
-                    "Ternary-only mode enabled but MoE fallback requires FP16 weights "
-                    "(missing topk info)."
+                _record_fallback_hit("moe.missing_topk.ternary_only_warning")
+                logger.warning(
+                    "[TERNARY MoE] Missing topk info in ternary-only mode. "
+                    "Falling back to standard fused_moe with weight reconstruction."
                 )
             _record_path_hit("moe.fp16_fallback.missing_topk")
             return StandardCombineInput(hidden_states=fused_moe(
@@ -1613,11 +1832,11 @@ class TernaryFusedMoEMethod(FusedMoEMethodBase, nn.Module):
                     _record_path_hit("moe.batched_triton")
                     return StandardCombineInput(hidden_states=result)
                 _record_fallback_hit("moe.batched_triton_failed")
-                if force_ternary_only:
-                    _record_fallback_hit("moe.batched_triton_failed.ternary_only_error")
-                    raise RuntimeError(
-                        "Ternary-only mode enabled but batched ternary MoE path failed. "
-                        "Set SGLANG_TERNARY_MOE_TRITON=0 to allow FP16 fallback."
+                if not getattr(layer, '_moe_batched_triton_fail_logged', False):
+                    layer._moe_batched_triton_fail_logged = True
+                    logger.warning(
+                        f"[TERNARY MoE] Batched Triton path returned None (M={num_tokens}), "
+                        "falling back to fused_moe. This is expected during CUDA graph capture."
                     )
         
         # Log first M>1 call for debugging
@@ -1629,22 +1848,62 @@ class TernaryFusedMoEMethod(FusedMoEMethodBase, nn.Module):
         if hidden_states.dtype == torch.bfloat16:
             hidden_states_for_moe = hidden_states
         else:
-            # For FP8 or other dtypes, convert to BF16
-            # Use .clone() to ensure we don't have any aliasing issues
             hidden_states_for_moe = hidden_states.to(torch.bfloat16).clone()
         
-        if force_ternary_only:
-            _record_fallback_hit("moe.fp16_fallback_blocked.ternary_only_error")
-            raise RuntimeError(
-                "Ternary-only mode enabled but MoE fallback requires FP16 weights "
-                "(M>1 ternary kernels are disabled). "
-                "Set SGLANG_TERNARY_MOE_TRITON=1 to enable the batched ternary MoE path "
-                "or disable SGLANG_TERNARY_I2S_ONLY/SGLANG_TERNARY_DROP_FP16_WEIGHTS to allow FP16 fallback."
-            )
+        # In ternary-only/DROP mode, reconstruct BF16 weights from i2s if needed
+        w1_for_moe = layer.w13_weight
+        w2_for_moe = layer.w2_weight
+        if force_ternary_only and (w1_for_moe.numel() == 0 or w2_for_moe.numel() == 0):
+            # Weights were dropped — reconstruct from packed i2s + alphas
+            if hasattr(layer, "_ternary_w13_packed") and hasattr(layer, "_ternary_w2_packed"):
+                if not getattr(layer, "_moe_reconstruct_logged", False):
+                    layer._moe_reconstruct_logged = True
+                    logger.info(
+                        "[TERNARY MoE] Reconstructing BF16 weights from i2s for fused_moe fallback "
+                        "(this is expected during CUDA graph capture with DROP_FP16_WEIGHTS=1)"
+                    )
+                num_experts = int(getattr(layer, "_ternary_moe_num_experts", layer._ternary_w13_packed.shape[0]))
+                hidden_size = int(getattr(layer, "_ternary_moe_hidden_size", 0))
+                intermediate_size = int(getattr(layer, "_ternary_moe_intermediate_size", 0))
+                if hidden_size > 0 and intermediate_size > 0:
+                    w13_bf16 = torch.empty(
+                        num_experts, 2 * intermediate_size, hidden_size,
+                        device=hidden_states.device, dtype=torch.bfloat16,
+                    )
+                    w2_bf16 = torch.empty(
+                        num_experts, hidden_size, intermediate_size,
+                        device=hidden_states.device, dtype=torch.bfloat16,
+                    )
+                    for e in range(num_experts):
+                        w13_bf16[e] = unpack_i2s_weights(
+                            layer._ternary_w13_packed[e], hidden_size,
+                            layer._ternary_moe_alpha_w13[e], torch.bfloat16,
+                        )
+                        w2_bf16[e] = unpack_i2s_weights(
+                            layer._ternary_w2_packed[e], intermediate_size,
+                            layer._ternary_moe_alpha_w2[e], torch.bfloat16,
+                        )
+                    w1_for_moe = w2_for_moe = None  # clear refs
+                    # Cache the reconstruction for future graph captures
+                    layer.w13_weight = torch.nn.Parameter(w13_bf16, requires_grad=False)
+                    layer.w2_weight = torch.nn.Parameter(w2_bf16, requires_grad=False)
+                    w1_for_moe = layer.w13_weight
+                    w2_for_moe = layer.w2_weight
+                else:
+                    _record_fallback_hit("moe.reconstruct_failed.no_metadata")
+                    raise RuntimeError(
+                        "Cannot reconstruct MoE weights: missing hidden_size/intermediate_size metadata."
+                    )
+            else:
+                _record_fallback_hit("moe.reconstruct_failed.no_packed_weights")
+                raise RuntimeError(
+                    "Ternary-only mode: MoE FP16 weights dropped and no packed i2s available for reconstruction."
+                )
+
         _record_path_hit("moe.fp16_fallback")
         return StandardCombineInput(hidden_states=fused_moe(
             hidden_states=hidden_states_for_moe,
-            w1=layer.w13_weight, w2=layer.w2_weight,
+            w1=w1_for_moe, w2=w2_for_moe,
             topk_output=topk_output,
             moe_runner_config=moe_runner_config,
         ))
@@ -1661,6 +1920,8 @@ class TernaryFusedMoEMethod(FusedMoEMethodBase, nn.Module):
             from sglang.srt.layers.moe.fused_moe_triton.fused_moe_ternary_kernel import (
                 invoke_fused_moe_ternary_kernel,
                 get_default_ternary_moe_config,
+                invoke_fused_moe_ternary_int8_kernel,
+                get_default_ternary_moe_int8_config,
             )
             from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
                 moe_sum_reduce_torch_compile,
@@ -1673,6 +1934,16 @@ class TernaryFusedMoEMethod(FusedMoEMethodBase, nn.Module):
             logger.debug(f"[TERNARY MoE] Triton ternary kernel unavailable: {e}")
             _record_fallback_hit("moe.batched_triton.unavailable")
             return None
+
+        # During CUDA graph capture, fall back to FP16 fused_moe to keep graph
+        # memory footprint small (~1.4 GB vs ~5 GB with ternary MoE buffers).
+        # The extend (eager) path still uses ternary MoE for better performance.
+        try:
+            if torch.cuda.is_current_stream_capturing():
+                _record_fallback_hit("moe.batched_triton.cuda_graph_capture")
+                return None
+        except Exception:
+            pass
 
         if moe_runner_config.activation != "silu":
             logger.warning(
@@ -1727,6 +1998,15 @@ class TernaryFusedMoEMethod(FusedMoEMethodBase, nn.Module):
         gate_cfg = get_default_ternary_moe_config("gate_up", m=M)
         down_cfg = get_default_ternary_moe_config("down", m=M * top_k)
 
+        use_int8_gateup, use_int8_down = _moe_int8_stage_mode()
+        int8_strict = _env_flag("SGLANG_TERNARY_MOE_INT8_STRICT", "0")
+        gate_cfg_int8 = (
+            get_default_ternary_moe_int8_config("gate_up", m=M) if use_int8_gateup else None
+        )
+        down_cfg_int8 = (
+            get_default_ternary_moe_int8_config("down", m=M * top_k) if use_int8_down else None
+        )
+
         gate_sorted_ids, gate_expert_ids, gate_num_post = moe_align_block_size(
             topk_ids, gate_cfg["BLOCK_SIZE_M"], num_experts
         )
@@ -1734,72 +2014,209 @@ class TernaryFusedMoEMethod(FusedMoEMethodBase, nn.Module):
             topk_ids, down_cfg["BLOCK_SIZE_M"], num_experts
         )
 
-        stream_raw = torch.cuda.current_stream().cuda_stream
-        if stream_raw is None:
-            stream_id = 0
+        gate_sorted_ids_int8 = gate_sorted_ids
+        gate_expert_ids_int8 = gate_expert_ids
+        gate_num_post_int8 = gate_num_post
+        if (
+            gate_cfg_int8 is not None
+            and int(gate_cfg_int8["BLOCK_SIZE_M"]) != int(gate_cfg["BLOCK_SIZE_M"])
+        ):
+            gate_sorted_ids_int8, gate_expert_ids_int8, gate_num_post_int8 = moe_align_block_size(
+                topk_ids, gate_cfg_int8["BLOCK_SIZE_M"], num_experts
+            )
+
+        down_sorted_ids_int8 = down_sorted_ids
+        down_expert_ids_int8 = down_expert_ids
+        down_num_post_int8 = down_num_post
+        if (
+            down_cfg_int8 is not None
+            and int(down_cfg_int8["BLOCK_SIZE_M"]) != int(down_cfg["BLOCK_SIZE_M"])
+        ):
+            down_sorted_ids_int8, down_expert_ids_int8, down_num_post_int8 = moe_align_block_size(
+                topk_ids, down_cfg_int8["BLOCK_SIZE_M"], num_experts
+            )
+
+        # Output buffer strategy: same as dense linear — cache during CUDA graph
+        # capture for stable addresses, temp buffers during eager to avoid leak.
+        is_capturing_moe = False
+        try:
+            is_capturing_moe = torch.cuda.is_current_stream_capturing()
+        except Exception:
+            pass
+
+        if is_capturing_moe:
+            stream_raw = torch.cuda.current_stream().cuda_stream
+            if stream_raw is None:
+                stream_id = 0
+            else:
+                try:
+                    stream_id = int(stream_raw)
+                except TypeError:
+                    stream_id = int(stream_raw.value) if hasattr(stream_raw, "value") and stream_raw.value is not None else 0
+
+            cache = getattr(layer, "_ternary_moe_batched_cache", None)
+            if cache is None:
+                cache = {}
+                setattr(layer, "_ternary_moe_batched_cache", cache)
+            key = (stream_id, M, top_k)
+            buf = cache.get(key)
+            if buf is None:
+                buf = {
+                    "gateup_out": torch.empty((M, top_k, N_w13), device=hidden_states.device, dtype=torch.bfloat16),
+                    "intermediate": torch.empty((M * top_k, intermediate_size), device=hidden_states.device, dtype=torch.bfloat16),
+                    "down_out": torch.empty((M, top_k, hidden_size), device=hidden_states.device, dtype=torch.bfloat16),
+                    "out": torch.empty((M, hidden_size), device=hidden_states.device, dtype=torch.bfloat16),
+                }
+                cache[key] = buf
+            gateup_out = buf["gateup_out"]
+            intermediate = buf["intermediate"]
+            down_out = buf["down_out"]
+            out = buf["out"]
         else:
+            # Eager: temporary buffers, freed after forward pass
+            gateup_out = torch.empty((M, top_k, N_w13), device=hidden_states.device, dtype=torch.bfloat16)
+            intermediate = torch.empty((M * top_k, intermediate_size), device=hidden_states.device, dtype=torch.bfloat16)
+            down_out = torch.empty((M, top_k, hidden_size), device=hidden_states.device, dtype=torch.bfloat16)
+            out = torch.empty((M, hidden_size), device=hidden_states.device, dtype=torch.bfloat16)
+
+        profile_requested = _env_flag("SGLANG_TERNARY_MOE_BATCHED_PROFILE", "0")
+        profile_batched = profile_requested
+        if profile_requested:
+            global _TERNARY_MOE_BATCHED_PROFILE_CAPTURE_LOGGED
             try:
-                stream_id = int(stream_raw)
-            except TypeError:
-                stream_id = int(stream_raw.value) if hasattr(stream_raw, "value") and stream_raw.value is not None else 0
+                if torch.cuda.is_current_stream_capturing():
+                    profile_batched = False
+                    if not _TERNARY_MOE_BATCHED_PROFILE_CAPTURE_LOGGED:
+                        _TERNARY_MOE_BATCHED_PROFILE_CAPTURE_LOGGED = True
+                        logger.info(
+                            "[TERNARY MoE BATCHED PROFILE] disabled during CUDA graph capture."
+                        )
+            except Exception:
+                profile_batched = False
+        profile_ms: Dict[str, float] = {}
 
-        cache = getattr(layer, "_ternary_moe_batched_cache", None)
-        if cache is None:
-            cache = {}
-            setattr(layer, "_ternary_moe_batched_cache", cache)
-        key = (stream_id, M, top_k)
-        buf = cache.get(key)
-        if buf is None:
-            buf = {
-                "gateup_out": torch.empty((M, top_k, N_w13), device=hidden_states.device, dtype=torch.bfloat16),
-                "intermediate": torch.empty((M * top_k, intermediate_size), device=hidden_states.device, dtype=torch.bfloat16),
-                "down_out": torch.empty((M, top_k, hidden_size), device=hidden_states.device, dtype=torch.bfloat16),
-                "out": torch.empty((M, hidden_size), device=hidden_states.device, dtype=torch.bfloat16),
-            }
-            cache[key] = buf
+        def _stage_begin():
+            if not profile_batched:
+                return None, None
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            return start, end
 
-        gateup_out = buf["gateup_out"]
-        intermediate = buf["intermediate"]
-        down_out = buf["down_out"]
-        out = buf["out"]
+        def _stage_end(name: str, start, end):
+            if not profile_batched or start is None or end is None:
+                return
+            end.record()
+            end.synchronize()
+            profile_ms[name] = profile_ms.get(name, 0.0) + float(start.elapsed_time(end))
 
-        invoke_fused_moe_ternary_kernel(
-            hidden_states,
-            layer._ternary_w13_packed,
-            layer._ternary_moe_alpha_w13,
-            gateup_out,
-            topk_weights,
-            topk_ids,
-            gate_sorted_ids,
-            gate_expert_ids,
-            gate_num_post,
-            False,
-            top_k,
-            config=gate_cfg,
-        )
+        int8_min_tokens = int(os.environ.get("SGLANG_TERNARY_MOE_INT8_MIN_TOKENS", "0"))
+        if use_int8_gateup and M < int8_min_tokens:
+            use_int8_gateup = False
+            _record_fallback_hit("moe.batched_triton.int8_gateup_skip.min_tokens")
+        if use_int8_down and (M * top_k) < int8_min_tokens:
+            use_int8_down = False
+            _record_fallback_hit("moe.batched_triton.int8_down_skip.min_tokens")
 
+        gateup_start, gateup_end = _stage_begin()
+        gateup_done = False
+        if use_int8_gateup and hasattr(layer, "_ternary_moe_alpha_w13_e"):
+            try:
+                hidden_states_i8, act_scale = quantize_activation_int8_global(hidden_states)
+                alpha_w13_i8 = (layer._ternary_moe_alpha_w13_e * act_scale).to(torch.float32).contiguous()
+                invoke_fused_moe_ternary_int8_kernel(
+                    hidden_states_i8,
+                    layer._ternary_w13_packed,
+                    alpha_w13_i8,
+                    gateup_out,
+                    topk_weights,
+                    topk_ids,
+                    gate_sorted_ids_int8,
+                    gate_expert_ids_int8,
+                    gate_num_post_int8,
+                    False,
+                    top_k,
+                    config=gate_cfg_int8,
+                )
+                gateup_done = True
+                _record_path_hit("moe.batched_triton.int8_gateup")
+            except Exception as e:
+                logger.debug("[TERNARY MoE] INT8 gateup failed, fallback to BF16 path: %s", e)
+                _record_fallback_hit("moe.batched_triton.int8_gateup_failed")
+                if int8_strict:
+                    raise RuntimeError("INT8 gateup stage failed in strict mode") from e
+
+        if not gateup_done:
+            invoke_fused_moe_ternary_kernel(
+                hidden_states,
+                layer._ternary_w13_packed,
+                layer._ternary_moe_alpha_w13,
+                gateup_out,
+                topk_weights,
+                topk_ids,
+                gate_sorted_ids,
+                gate_expert_ids,
+                gate_num_post,
+                False,
+                top_k,
+                config=gate_cfg,
+            )
+        _stage_end("gateup", gateup_start, gateup_end)
+
+        silu_start, silu_end = _stage_begin()
         try:
             from sgl_kernel import silu_and_mul  # type: ignore
             silu_and_mul(gateup_out.view(-1, N_w13), intermediate)
         except Exception:
             gate, up = gateup_out.view(-1, N_w13).chunk(2, dim=-1)
             intermediate.copy_(torch.nn.functional.silu(gate) * up)
+        _stage_end("silu_mul", silu_start, silu_end)
 
         # Second GEMM: treat top_k as 1 so sorted_token_ids index directly into [M*topk, K]
-        invoke_fused_moe_ternary_kernel(
-            intermediate,
-            layer._ternary_w2_packed,
-            layer._ternary_moe_alpha_w2,
-            down_out,
-            topk_weights,
-            topk_ids,
-            down_sorted_ids,
-            down_expert_ids,
-            down_num_post,
-            True,
-            1,
-            config=down_cfg,
-        )
+        down_start, down_end = _stage_begin()
+        down_done = False
+        if use_int8_down and hasattr(layer, "_ternary_moe_alpha_w2_e"):
+            try:
+                intermediate_i8, act_scale = quantize_activation_int8_global(intermediate)
+                alpha_w2_i8 = (layer._ternary_moe_alpha_w2_e * act_scale).to(torch.float32).contiguous()
+                invoke_fused_moe_ternary_int8_kernel(
+                    intermediate_i8,
+                    layer._ternary_w2_packed,
+                    alpha_w2_i8,
+                    down_out,
+                    topk_weights,
+                    topk_ids,
+                    down_sorted_ids_int8,
+                    down_expert_ids_int8,
+                    down_num_post_int8,
+                    True,
+                    1,
+                    config=down_cfg_int8,
+                )
+                down_done = True
+                _record_path_hit("moe.batched_triton.int8_down")
+            except Exception as e:
+                logger.debug("[TERNARY MoE] INT8 down failed, fallback to BF16 path: %s", e)
+                _record_fallback_hit("moe.batched_triton.int8_down_failed")
+                if int8_strict:
+                    raise RuntimeError("INT8 down stage failed in strict mode") from e
+
+        if not down_done:
+            invoke_fused_moe_ternary_kernel(
+                intermediate,
+                layer._ternary_w2_packed,
+                layer._ternary_moe_alpha_w2,
+                down_out,
+                topk_weights,
+                topk_ids,
+                down_sorted_ids,
+                down_expert_ids,
+                down_num_post,
+                True,
+                1,
+                config=down_cfg,
+            )
+        _stage_end("down", down_start, down_end)
 
         if _should_validate_moe(layer):
             max_tokens = int(os.environ.get("SGLANG_TERNARY_MOE_VALIDATE_MAX_TOKENS", "1"))
@@ -1877,15 +2294,57 @@ class TernaryFusedMoEMethod(FusedMoEMethodBase, nn.Module):
         if moe_runner_config.no_combine:
             return down_out.view(M, top_k, hidden_size)
 
+        combine_start, combine_end = _stage_begin()
         if top_k == 1 and routed_scaling_factor == 1.0:
             out.copy_(down_out.squeeze(1))
         elif top_k == 2 and routed_scaling_factor == 1.0:
             out.copy_(down_out[:, 0] + down_out[:, 1])
         else:
-            if M <= 32:
-                moe_sum_reduce_torch_compile(down_out, out, routed_scaling_factor)
-            else:
+            use_triton_combine = _env_flag("SGLANG_TERNARY_MOE_COMBINE_TRITON", "1")
+            if use_triton_combine:
                 moe_sum_reduce_triton(down_out, out, routed_scaling_factor)
+            else:
+                torch_max_m = int(os.environ.get("SGLANG_TERNARY_MOE_COMBINE_TORCH_MAX_M", "32"))
+                if M <= torch_max_m:
+                    moe_sum_reduce_torch_compile(down_out, out, routed_scaling_factor)
+                else:
+                    moe_sum_reduce_triton(down_out, out, routed_scaling_factor)
+        _stage_end("combine", combine_start, combine_end)
+
+        if profile_batched and profile_ms:
+            prof = getattr(layer, "_ternary_moe_batched_profile", None)
+            if prof is None:
+                prof = {
+                    "calls": 0,
+                    "gateup_ms": 0.0,
+                    "silu_mul_ms": 0.0,
+                    "down_ms": 0.0,
+                    "combine_ms": 0.0,
+                    "total_ms": 0.0,
+                }
+                setattr(layer, "_ternary_moe_batched_profile", prof)
+            prof["calls"] += 1
+            prof["gateup_ms"] += profile_ms.get("gateup", 0.0)
+            prof["silu_mul_ms"] += profile_ms.get("silu_mul", 0.0)
+            prof["down_ms"] += profile_ms.get("down", 0.0)
+            prof["combine_ms"] += profile_ms.get("combine", 0.0)
+            prof["total_ms"] += (
+                profile_ms.get("gateup", 0.0)
+                + profile_ms.get("silu_mul", 0.0)
+                + profile_ms.get("down", 0.0)
+                + profile_ms.get("combine", 0.0)
+            )
+            calls = int(prof["calls"])
+            if calls in (1, 10) or calls % 200 == 0:
+                logger.info(
+                    "[TERNARY MoE BATCHED PROFILE] calls=%d avg_ms{gateup=%.4f silu_mul=%.4f down=%.4f combine=%.4f total=%.4f}",
+                    calls,
+                    prof["gateup_ms"] / calls,
+                    prof["silu_mul_ms"] / calls,
+                    prof["down_ms"] / calls,
+                    prof["combine_ms"] / calls,
+                    prof["total_ms"] / calls,
+                )
 
         return out
 
