@@ -1,5 +1,5 @@
 const DEFAULT_API_BASE = "http://127.0.0.1:30080";
-const DEFAULT_MODEL_ID = "mangrove-alltern-overlap";  // auto-discovers from /v1/models
+const DEFAULT_MODEL_ID = "mangrove-alltern-overlap";
 const SYSTEM_PROMPT =
   "You are a helpful assistant. Reply with concise Markdown. Use LaTeX for math when useful.";
 
@@ -112,8 +112,10 @@ async function handleSubmit(event) {
 
   try {
     let assistantReply;
+    let wasStreamed = false;
     try {
       assistantReply = await streamAssistantReply(bubble);
+      wasStreamed = true;
       state.messages.push({ role: "assistant", content: assistantReply });
     } catch (error) {
       if (error.name === "AbortError") {
@@ -126,7 +128,14 @@ async function handleSubmit(event) {
       }
     }
 
-    paintAssistantBubble(bubble, assistantReply, true);
+    // Only re-render if it wasn't streamed (error/cancel cases).
+    // For streamed responses, the bubble already has the final content —
+    // just do a final math + code pass without wiping innerHTML.
+    if (wasStreamed) {
+      finalizeStreamedBubble(bubble);
+    } else {
+      paintAssistantBubble(bubble, assistantReply, false);
+    }
   } catch (error) {
     const fallback =
       "Something went wrong while rendering the response.\n\n```text\n" +
@@ -249,75 +258,16 @@ function renderStreamChunk(bubble, text) {
   const html = markdownToHtml(text);
   bubble.innerHTML = html;
   decorateCodeBlocks(bubble);
+  // Don't render math on every chunk — too expensive.
+  // Math is finalized once streaming is complete.
+}
+
+function finalizeStreamedBubble(bubble) {
+  // The bubble already has the streamed HTML. Just re-run the finalizers
+  // (code highlighting, math) without wiping the content.
+  decorateCodeBlocks(bubble);
   renderMath(bubble);
-}
-
-// Fallback non-streaming request (kept for compatibility)
-async function requestAssistantReply() {
-  const modelId = await resolveModel();
-  const payload = {
-    model: modelId,
-    messages: state.messages,
-    temperature: 0.35,
-    stream: false,
-  };
-
-  const response = await fetch(`${API_BASE}/v1/chat/completions`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-
-  if (!response.ok) {
-    const body = await response.text();
-    throw new Error(
-      `Chat failed (${response.status}): ${trimText(body, 280)}`
-    );
-  }
-
-  const data = await response.json();
-  const text = data?.choices?.[0]?.message?.content;
-  if (typeof text !== "string" || !text.trim()) {
-    throw new Error("Assistant response was empty.");
-  }
-
-  return text;
-}
-
-function addUserMessage(content) {
-  const bubble = createMessageShell("user");
-  bubble.textContent = content;
   scrollToBottom();
-}
-
-function addAssistantMessage(content, animate = true) {
-  const bubble = createMessageShell("assistant");
-  paintAssistantBubble(bubble, content, animate);
-}
-
-function addTypingBubble() {
-  const bubble = createMessageShell("assistant");
-  bubble.innerHTML = "";
-  bubble.append(typingTemplate.content.cloneNode(true));
-  scrollToBottom();
-  return bubble;
-}
-
-function createMessageShell(role) {
-  const article = document.createElement("article");
-  article.className = `msg msg-${role}`;
-
-  const roleLabel = document.createElement("div");
-  roleLabel.className = "msg-role";
-  roleLabel.textContent = role === "user" ? "You" : "Assistant";
-
-  const bubble = document.createElement("div");
-  bubble.className = "bubble";
-
-  article.append(roleLabel, bubble);
-  chatLog.appendChild(article);
-  scrollToBottom();
-  return bubble;
 }
 
 function paintAssistantBubble(bubble, markdown, animate) {

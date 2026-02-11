@@ -10,34 +10,34 @@
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
   <link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin />
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css" />
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.10.0/styles/github.min.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.10.0/styles/github-dark.min.css" />
   <link rel="stylesheet" href="./styles.css" />
 </head>
 <body>
-  <!-- Animated background blobs for liquid glass effect -->
+  <!-- Subtle background blobs -->
   <div class="bg-blobs" aria-hidden="true">
     <div class="blob blob-1"></div>
     <div class="blob blob-2"></div>
-    <div class="blob blob-3"></div>
   </div>
 
   <main class="app-shell is-home">
+    <header class="top-bar">
+      <button id="reset-chat" class="btn btn-subtle btn-reset" type="button">New chat</button>
+    </header>
+
     <section class="home-hero" aria-hidden="true">
       <div class="home-brand">
-        <h1>RedMod Chat</h1>
+        <h1><span class="brand-red">RedMod</span> Chat</h1>
       </div>
     </section>
     <section id="chat-log" class="chat-log" aria-live="polite"></section>
 
     <form id="composer" class="composer" autocomplete="off">
-      <div class="composer-meta">
-        <button id="reset-chat" class="btn btn-subtle btn-reset-inline" type="button">New chat</button>
-      </div>
       <div class="composer-shell">
         <textarea id="prompt-input" rows="1" placeholder="Send a message..." required></textarea>
         <button id="send-btn" class="btn btn-send" type="submit" aria-label="Send message">
           <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
-            <path d="M5 12h14M12 5l7 7-7 7" />
+            <path d="M12 19V5M5 12l7-7 7 7" />
           </svg>
         </button>
       </div>
