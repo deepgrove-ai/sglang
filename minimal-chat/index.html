@@ -17,8 +17,7 @@
   <main class="app-shell is-home">
     <section class="home-hero" aria-hidden="true">
       <div class="home-brand">
-        <span class="home-fake-icon"></span>
-        <h1>RedMod Chat</h1>
+        <h1>Minimal Chat</h1>
       </div>
     </section>
     <section id="chat-log" class="chat-log" aria-live="polite"></section>
@@ -28,10 +27,10 @@
         <button id="reset-chat" class="btn btn-subtle btn-reset-inline" type="button">New chat</button>
       </div>
       <div class="composer-shell">
-        <textarea id="prompt-input" rows="1" placeholder="Ask anything..." required></textarea>
+        <textarea id="prompt-input" rows="1" placeholder="Send a message..." required></textarea>
         <button id="send-btn" class="btn btn-send" type="submit" aria-label="Send message">
           <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
-            <path d="M6 12L12 6L18 12M12 18V6" />
+            <path d="M5 12h14M12 5l7 7-7 7" />
           </svg>
         </button>
       </div>
@@ -40,12 +39,12 @@
 
   <template id="typing-template">
     <div class="thinking-widget" aria-hidden="true">
-      <div class="thinking-orb">
-        <span class="orb-halo"></span>
-        <span class="orb-pulse"></span>
-        <span class="orb-core"></span>
+      <div class="thinking-dots">
+        <span></span>
+        <span></span>
+        <span></span>
       </div>
-      <div class="thinking-text" aria-label="Thinking">Thinking</div>
+      <div class="thinking-text">Thinking</div>
     </div>
   </template>
 
