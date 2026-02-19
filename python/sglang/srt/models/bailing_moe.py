@@ -82,6 +82,20 @@ logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 
 
+def get_attention_sliding_window_size(config: PretrainedConfig):
+    # Aligned with HF sliding window semantics (inclusive),
+    # while SGLang attention backend expects exclusive window size.
+    layer_types = getattr(config, "layer_types", None)
+    if layer_types is None or "sliding_attention" not in layer_types:
+        return None
+    if not hasattr(config, "sliding_window"):
+        return None
+    sliding_window = config.sliding_window
+    if sliding_window is None:
+        return None
+    return sliding_window - 1
+
+
 class BailingMoEMLP(nn.Module):
     def __init__(
         self,
@@ -412,6 +426,7 @@ class BailingMoEAttention(nn.Module):
         alt_stream: Optional[torch.cuda.Stream] = None,
     ):
         super().__init__()
+        self.layer_id = layer_id
         self.hidden_size = config.hidden_size
         self.total_num_heads = config.num_attention_heads
         self.total_kv_heads = config.num_key_value_heads
@@ -440,6 +455,27 @@ class BailingMoEAttention(nn.Module):
         self.scale = self.head_dim**-0.5
 
         self.use_qk_norm = getattr(config, "use_qk_norm", False)
+        layer_types = getattr(config, "layer_types", None)
+        if layer_types is None:
+            layer_types = ["full_attention"] * config.num_hidden_layers
+        if len(layer_types) != config.num_hidden_layers:
+            raise ValueError(
+                f"Expected layer_types length {config.num_hidden_layers}, got {len(layer_types)}"
+            )
+        self.layer_type = layer_types[layer_id]
+        if self.layer_type not in {"full_attention", "sliding_attention"}:
+            raise ValueError(
+                f"Unsupported layer type {self.layer_type} at layer {layer_id}."
+            )
+        self.is_sliding = self.layer_type == "sliding_attention"
+        self.has_any_sliding_layers = "sliding_attention" in layer_types
+        # Backward-compatible switch:
+        # - mixed SWA/full model: apply RoPE only on sliding layers
+        # - no sliding layers at all: apply RoPE on all layers (legacy behavior)
+        self.apply_rope = (not self.has_any_sliding_layers) or self.is_sliding
+        self.sliding_window = (
+            get_attention_sliding_window_size(config) if self.is_sliding else None
+        )
 
         self.query_key_value = QKVParallelLinear(
             self.hidden_size,
@@ -488,6 +524,9 @@ class BailingMoEAttention(nn.Module):
             self.scale,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
+            sliding_window_size=(
+                self.sliding_window if self.sliding_window is not None else -1
+            ),
             prefix=add_prefix("attn", prefix),
         )
 
@@ -527,26 +566,32 @@ class BailingMoEAttention(nn.Module):
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         if self.use_qk_norm:
             q, k = self._apply_qk_norm(q, k)
-        q, k = self.rotary_emb(
-            positions,
-            q,
-            k,
-            fused_set_kv_buffer_arg=(
-                create_fused_set_kv_buffer_arg(
-                    value=v,
-                    layer=self.attn,
-                    forward_batch=forward_batch,
-                )
-                if enable_fused_set_kv_buffer(forward_batch)
-                else None
-            ),
-        )
+        # Match HF BailingMoEV2 behavior:
+        # - sliding_attention layers apply rotary embeddings
+        # - full_attention layers skip positional embedding on q/k
+        use_fused_set_kv = self.is_sliding and enable_fused_set_kv_buffer(forward_batch)
+        if self.apply_rope:
+            q, k = self.rotary_emb(
+                positions,
+                q,
+                k,
+                fused_set_kv_buffer_arg=(
+                    create_fused_set_kv_buffer_arg(
+                        value=v,
+                        layer=self.attn,
+                        forward_batch=forward_batch,
+                    )
+                    if use_fused_set_kv
+                    else None
+                ),
+            )
         context_layer = self.attn(
             q,
             k,
             v,
             forward_batch,
-            save_kv_cache=not enable_fused_set_kv_buffer(forward_batch),
+            # For global/full layers we always use explicit KV save path.
+            save_kv_cache=not use_fused_set_kv,
         )
         attn_output, _ = self.dense(context_layer)
         return attn_output
@@ -574,6 +619,9 @@ class BailingMoEBlock(nn.Module):
             prefix=add_prefix("attention", prefix),
             alt_stream=alt_stream,
         )
+        # Runtime compatibility: some SGLang scheduler/model-runner paths
+        # introspect `layer.self_attn.attn.sliding_window_size`.
+        self.self_attn = self.attention
         self.layer_id = layer_id
         self.attn_tp_size = get_attention_tp_size()
         self.attn_tp_rank = get_attention_tp_rank()
@@ -803,6 +851,9 @@ class BailingMoEForCausalLM(nn.Module):
     @property
     def end_layer(self):
         return self.model.end_layer
+
+    def get_attention_sliding_window_size(self):
+        return get_attention_sliding_window_size(self.config)
 
     def get_embed_and_head(self):
         """Used by the eagle_worker."""
