@@ -1157,6 +1157,9 @@ class TokenizerManager(TokenizerCommunicatorMixin):
     async def pause_generation(self):
         async with self.is_pause_cond:
             self.is_pause = True
+            # Do double abort to ensure all in-flight requests are aborted.
+            self.abort_request(abort_all=True)
+            await asyncio.sleep(1)
             self.abort_request(abort_all=True)
 
     async def continue_generation(self):
@@ -1604,7 +1607,11 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         if recv_obj.input_token_logprobs_val is None:
             return
 
-        if len(recv_obj.input_token_logprobs_val) > 0:
+        if (
+            len(recv_obj.input_token_logprobs_val) > 0
+            and recv_obj.input_token_logprobs_val[recv_obj_index] is not None
+            and recv_obj.input_token_logprobs_val[recv_obj_index]
+        ):
             state.input_token_logprobs_val.extend(
                 recv_obj.input_token_logprobs_val[recv_obj_index]
             )

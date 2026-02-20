@@ -758,6 +758,7 @@ class CudaGraphRunner:
         if bs != raw_bs:
             self.seq_lens.fill_(self.seq_len_fill_value)
             self.out_cache_loc.zero_()
+            self.positions.zero_()
 
         # Common inputs
         self.input_ids[:raw_num_token].copy_(forward_batch.input_ids)
@@ -806,6 +807,20 @@ class CudaGraphRunner:
             )
         if forward_batch.forward_mode.is_idle() and forward_batch.spec_info is not None:
             forward_batch.spec_info.custom_mask = self.custom_mask
+        if forward_batch.forward_mode.is_target_verify() and bs - raw_bs > 0:
+            # Pad spec_info.custom_mask when replay uses a larger captured batch size.
+            spec_info = forward_batch.spec_info
+            pad_len = (
+                (bs - raw_bs)
+                * spec_info.draft_token_num
+                * (spec_info.draft_token_num + self.seq_len_fill_value)
+            )
+            pad_mask = torch.full(
+                (pad_len,),
+                True,
+                device=spec_info.custom_mask.device,
+            )
+            spec_info.custom_mask = torch.cat([spec_info.custom_mask, pad_mask], dim=0)
         # Attention backend
         self.model_runner.attn_backend.init_forward_metadata_replay_cuda_graph(
             bs,
