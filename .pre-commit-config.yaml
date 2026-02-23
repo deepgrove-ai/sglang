@@ -18,7 +18,6 @@ repos:
       - id: check-shebang-scripts-are-executable
       - id: detect-private-key
       - id: debug-statements
-      - id: no-commit-to-branch
   - repo: https://github.com/PyCQA/isort
     rev: 5.13.2
     hooks:
@@ -50,8 +49,14 @@ repos:
     rev: v2.4.1
     hooks:
       - id: codespell
-        additional_dependencies: ['tomli']
-        args: ['--toml', 'python/pyproject.toml', '-L', 'cann,thi,makro,wil,rouge,PRIS']
+        additional_dependencies: ["tomli"]
+        args:
+          [
+            "--toml",
+            "python/pyproject.toml",
+            "-L",
+            "cann,thi,makro,wil,rouge,PRIS",
+          ]
         exclude: |
           (?x)^(
             test/srt/test_reasoning_parser\.py|
@@ -64,13 +69,13 @@ repos:
   - repo: https://github.com/pre-commit/mirrors-clang-format
     rev: v18.1.8
     hooks:
-    - id: clang-format
-      types_or: [c++, cuda]
-      args: [--style=file, --verbose]
+      - id: clang-format
+        types_or: [c++, cuda]
+        args: [--style=file, --verbose]
   - repo: https://github.com/kynan/nbstripout
     rev: 0.8.1
     hooks:
       - id: nbstripout
         args:
-          - '--keep-output'
-          - '--extra-keys=metadata.kernelspec metadata.language_info.version'
+          - "--keep-output"
+          - "--extra-keys=metadata.kernelspec metadata.language_info.version"
