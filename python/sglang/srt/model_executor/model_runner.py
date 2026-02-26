@@ -1784,6 +1784,7 @@ class ModelRunner:
                     full_attention_layer_ids=self.model_config.full_attention_layer_ids,
                     enable_kvcache_transpose=False,
                     device=self.device,
+                    enable_memory_saver=self.server_args.enable_memory_saver,
                 )
             elif config := self.mambaish_config:
                 extra_args = {}

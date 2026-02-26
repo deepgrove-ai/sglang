@@ -552,7 +552,6 @@ class KVCache(abc.ABC):
 
 
 class MHATokenToKVPool(KVCache):
-
     def __init__(
         self,
         size: int,
@@ -1039,6 +1038,7 @@ class SWAKVPool(KVCache):
         full_attention_layer_ids: List[int],
         enable_kvcache_transpose: bool,
         device: str,
+        enable_memory_saver: bool = False,
         token_to_kv_pool_class: KVCache = MHATokenToKVPool,
         **kwargs,
     ):
@@ -1054,7 +1054,8 @@ class SWAKVPool(KVCache):
         self.page_size = 1
 
         kwargs["page_size"] = 1
-        kwargs["enable_memory_saver"] = False
+        # TODO: For some reason this is permanently disabled previously?
+        kwargs["enable_memory_saver"] = enable_memory_saver
         kwargs["head_num"] = head_num
         kwargs["head_dim"] = head_dim
         kwargs["device"] = device
@@ -1184,7 +1185,6 @@ class SWAKVPool(KVCache):
 
 
 class AscendTokenToKVPool(MHATokenToKVPool):
-
     def _create_buffers(self):
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             # [size, head_num, head_dim] for each layer

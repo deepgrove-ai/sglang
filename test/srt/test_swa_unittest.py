@@ -1,4 +1,6 @@
 import unittest
+from contextlib import contextmanager
+from unittest.mock import patch
 
 import torch
 
@@ -16,6 +18,49 @@ class TestSWA(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         pass
+
+    def test_swa_kv_pool_propagates_enable_memory_saver(self):
+        """Regression test: SWAKVPool must not hard-disable memory saver."""
+
+        class _DummyAdapter:
+            def __init__(self, enabled: bool):
+                self._enabled = enabled
+
+            @contextmanager
+            def region(self, _tag: str, enable_cpu_backup: bool = False):
+                _ = enable_cpu_backup
+                yield
+
+            @property
+            def enabled(self):
+                return self._enabled
+
+        with patch(
+            "sglang.srt.mem_cache.memory_pool.TorchMemorySaverAdapter.create"
+        ) as mock_create:
+            mock_create.side_effect = lambda enable: _DummyAdapter(enable)
+
+            SWAKVPool(
+                size=8,
+                size_swa=8,
+                dtype=torch.float16,
+                head_num=2,
+                head_dim=4,
+                swa_attention_layer_ids=[1, 2],
+                full_attention_layer_ids=[0, 3],
+                enable_kvcache_transpose=False,
+                device="cpu",
+                enable_memory_saver=True,
+            )
+
+            # SWAKVPool creates two inner pools: swa_kv_pool and full_kv_pool.
+            self.assertGreaterEqual(mock_create.call_count, 2)
+            self.assertTrue(
+                all(
+                    call.kwargs.get("enable") is True
+                    for call in mock_create.call_args_list[-2:]
+                )
+            )
 
     def test_swa_memory_pool(self):
         size = 16
