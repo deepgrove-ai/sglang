@@ -18,6 +18,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """SGLang BailingMoE model."""
+
 import logging
 from typing import Iterable, Optional, Tuple, Union
 
@@ -58,7 +59,7 @@ from sglang.srt.layers.moe import get_deepep_mode, get_moe_a2a_backend
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.token_dispatcher import DeepEPDispatcher
-from sglang.srt.layers.moe.topk import TopK
+from sglang.srt.layers.moe.topk import ScoringFunc, TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -252,6 +253,9 @@ class BailingMoESparseMoeBlock(nn.Module):
                 self.score_function == "sigmoid" and self.correction_bias is not None
             ), "score_function and correction_bias should be in 2 combination (softmax, None) or (sigmoid, not None)"
 
+        scoring_func = ScoringFunc(
+            self.score_function if self.score_function is not None else "softmax"
+        )
         self.topk = TopK(
             top_k=self.top_k,
             renormalize=self.norm_topk_prob,
@@ -261,6 +265,7 @@ class BailingMoESparseMoeBlock(nn.Module):
             topk_group=self.topk_group,
             correction_bias=self.correction_bias,
             routed_scaling_factor=self.routed_scaling_factor,
+            scoring_func=scoring_func,
         )
 
         self.experts = get_moe_impl_class(quant_config)(
@@ -722,7 +727,6 @@ class BailingMoEBlock(nn.Module):
 
 
 class BailingMoEModel(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,

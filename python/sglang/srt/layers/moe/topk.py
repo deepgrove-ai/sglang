@@ -87,6 +87,11 @@ if _is_npu:
 # -------------------------------- TopKConfig ---------------------------------------
 
 
+class ScoringFunc(str, Enum):
+    SOFTMAX = "softmax"
+    SIGMOID = "sigmoid"
+
+
 @dataclass
 class TopKConfig:
     top_k: int
@@ -97,17 +102,17 @@ class TopKConfig:
     num_fused_shared_experts: int = 0
     custom_routing_function: Optional[Callable] = None
     correction_bias: Optional[torch.Tensor] = None
-    torch_native: bool = False
+    torch_native: bool = True
     routed_scaling_factor: Optional[float] = None
     apply_routed_scaling_factor_on_output: bool = False
     output_format: Optional[TopKOutputFormat] = None
+    scoring_func: ScoringFunc = ScoringFunc.SOFTMAX
 
 
 # -------------------------------- TopKOutput ---------------------------------------
 
 
 class TopKOutputChecker:
-
     @staticmethod
     def format_is_standard(topk_output: TopKOutput) -> TypeGuard[StandardTopKOutput]:
         return topk_output.format.is_standard()
@@ -190,7 +195,6 @@ class BypassedTopKOutput(NamedTuple):
 
 
 class TopK(CustomOp):
-
     def __init__(
         self,
         top_k: int,
@@ -201,7 +205,7 @@ class TopK(CustomOp):
         renormalize: bool = True,
         num_fused_shared_experts: int = 0,
         custom_routing_function: Optional[Callable] = None,
-        scoring_func: str = "softmax",
+        scoring_func: ScoringFunc = ScoringFunc.SOFTMAX,
         correction_bias: Optional[torch.Tensor] = None,
         quant_config: Optional[QuantizationConfig] = None,
         routed_scaling_factor: Optional[float] = None,
@@ -227,7 +231,9 @@ class TopK(CustomOp):
             routed_scaling_factor=routed_scaling_factor,
             apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
             output_format=output_format,
+            scoring_func=scoring_func,
         )
+        assert self.topk_config.torch_native, "torch_native must be True"
 
     def forward_native(
         self,
@@ -433,6 +439,38 @@ def fused_topk_torch_native(
         )
         topk_ids = torch.empty(M, topk, dtype=torch.int32, device=hidden_states.device)
         topk_weights = F.softmax(gating_output.float(), dim=-1)
+        topk_weights, topk_ids = torch.topk(topk_weights, topk, dim=-1)
+
+    if renormalize:
+        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+    return topk_weights, topk_ids
+
+
+def fused_topk_torch_native_sigmoid(
+    hidden_states: torch.Tensor,
+    gating_output: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+    correction_bias: torch.Tensor = None,
+):
+    if correction_bias is not None:
+        n_routed_experts = gating_output.shape[-1]
+        scores = torch.sigmoid(gating_output.float())
+        scores_for_choice = scores.view(
+            -1, n_routed_experts
+        ) + correction_bias.unsqueeze(0)
+        topk_ids = torch.topk(scores_for_choice, k=topk, dim=-1, sorted=False)[1]
+        topk_weights = scores.gather(1, topk_ids)
+    else:
+        assert (
+            hidden_states.shape[0] == gating_output.shape[0]
+        ), f"Number of tokens mismatch, {hidden_states.shape=} vs {gating_output.shape=}"
+        M, _ = hidden_states.shape
+        topk_weights = torch.empty(
+            M, topk, dtype=torch.float32, device=hidden_states.device
+        )
+        topk_ids = torch.empty(M, topk, dtype=torch.int32, device=hidden_states.device)
+        topk_weights = torch.sigmoid(gating_output.float())
         topk_weights, topk_ids = torch.topk(topk_weights, topk, dim=-1)
 
     if renormalize:
@@ -840,6 +878,28 @@ def select_experts(
     apply_routed_scaling_factor_on_output = (
         topk_config.apply_routed_scaling_factor_on_output
     )
+    scoring_func = topk_config.scoring_func
+
+    if scoring_func == ScoringFunc.SIGMOID:
+        # Assert we are using torch native and custom_routing_function is None
+        assert torch_native, "torch_native must be True when scoring_func is SIGMOID"
+        assert (
+            custom_routing_function is None
+        ), "custom_routing_function must be None when scoring_func is SIGMOID"
+        assert (
+            num_token_non_padded is None
+        ), "num_token_non_padded is not yet supported in fused_topk_native"
+        assert expert_location_dispatch_info is None
+        assert not apply_routed_scaling_factor_on_output, "Not implemented"
+        topk_weights, topk_ids = fused_topk_torch_native_sigmoid(
+            hidden_states=hidden_states,
+            gating_output=router_logits,
+            topk=top_k,
+            renormalize=renormalize,
+            correction_bias=correction_bias,
+        )
+        get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
+        return StandardTopKOutput(topk_weights, topk_ids, router_logits)
 
     router_logits, correction_bias = (
         expert_location_dispatch.transform_select_experts_inputs(
