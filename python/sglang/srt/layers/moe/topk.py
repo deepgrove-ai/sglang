@@ -471,16 +471,16 @@ def fused_topk_torch_native_sigmoid(
         assert (
             hidden_states.shape[0] == gating_output.shape[0]
         ), f"Number of tokens mismatch, {hidden_states.shape=} vs {gating_output.shape=}"
-        M, _ = hidden_states.shape
-        topk_weights = torch.empty(
-            M, topk, dtype=torch.float32, device=hidden_states.device
-        )
-        topk_ids = torch.empty(M, topk, dtype=torch.int32, device=hidden_states.device)
-        topk_weights = torch.sigmoid(gating_output.float())
-        topk_weights, topk_ids = torch.topk(topk_weights, topk, dim=-1)
+    M, _ = hidden_states.shape
+    topk_weights = torch.empty(
+        M, topk, dtype=torch.float32, device=hidden_states.device
+    )
+    topk_ids = torch.empty(M, topk, dtype=torch.int32, device=hidden_states.device)
+    topk_weights = torch.sigmoid(gating_output.float())
+    topk_weights, topk_ids = torch.topk(topk_weights, topk, dim=-1)
 
     if renormalize:
-        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+        topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-6) #/ topk_weights.sum(dim=-1, keepdim=True)
     return topk_weights, topk_ids
 
 
@@ -886,7 +886,7 @@ def select_experts(
     )
     scoring_func = topk_config.scoring_func
 
-    if scoring_func == ScoringFunc.SIGMOID:
+    if True: #scoring_func == ScoringFunc.SIGMOID:
         # Assert we are using torch native and custom_routing_function is None
         assert torch_native, "torch_native must be True when scoring_func is SIGMOID"
         assert (
@@ -901,8 +901,8 @@ def select_experts(
             hidden_states=hidden_states,
             gating_output=router_logits,
             topk=top_k,
-            renormalize=renormalize,
-            correction_bias=correction_bias,
+            renormalize=True,
+            correction_bias=correction_bias*0.0,
         )
         get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
         return StandardTopKOutput(topk_weights, topk_ids, router_logits)
