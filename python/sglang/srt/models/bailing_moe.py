@@ -247,11 +247,8 @@ class BailingMoESparseMoeBlock(nn.Module):
         )
 
         if self.score_function is not None:
-            assert (
-                self.score_function == "softmax" and self.correction_bias is None
-            ) or (
-                self.score_function == "sigmoid" and self.correction_bias is not None
-            ), "score_function and correction_bias should be in 2 combination (softmax, None) or (sigmoid, not None)"
+            if self.score_function == "softmax":
+                assert self.correction_bias is None
 
         scoring_func = ScoringFunc(
             self.score_function if self.score_function is not None else "softmax"
