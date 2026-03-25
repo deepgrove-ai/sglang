@@ -398,6 +398,11 @@ class Scheduler(
             self.full_tokens_per_layer, self.swa_tokens_per_layer = (
                 self.tp_worker.get_tokens_per_layer_info()
             )
+            # Sync attention_chunk_size from model_runner into the scheduler's
+            # model_config (a separate object). Without this, SWAChunkCache.evict_swa
+            # receives None for non-Llama4 SWA models whose HF config lacks the field.
+            if self.model_config.attention_chunk_size is None:
+                self.model_config.attention_chunk_size = self.sliding_window_size
 
         # Print debug info
         if tp_rank == 0:
