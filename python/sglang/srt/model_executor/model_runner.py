@@ -407,6 +407,13 @@ class ModelRunner:
             architectures = self.model_config.hf_config.architectures
             if architectures and not any("Llama4" in arch for arch in architectures):
                 self.is_hybrid = self.model_config.is_hybrid = True
+                # For non-Llama4 SWA models, attention_chunk_size may not be
+                # in the HF config. Fall back to sliding_window_size so that
+                # SWAChunkCache.evict_swa (used when radix cache is disabled,
+                # e.g. with deterministic inference) doesn't receive None.
+                if self.model_config.attention_chunk_size is None:
+                    self.model_config.attention_chunk_size = self.sliding_window_size
+                    self.attention_chunk_size = self.sliding_window_size
 
         if config := self.mamba2_config:
             class_name = config.__class__.__name__
