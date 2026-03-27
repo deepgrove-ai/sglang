@@ -28,7 +28,7 @@ dependencies = [
   "datasets",
   "einops",
   "fastapi",
-  "flashinfer_python==0.6.3", # keep it aligned with jit-cache version in Dockerfile
+  "flashinfer_python==0.6.3",                                                                                                                                                    # keep it aligned with jit-cache version in Dockerfile
   "flashinfer_cubin==0.6.3",
   "gguf",
   "hf_transfer",
@@ -76,7 +76,7 @@ dependencies = [
   "uvloop",
   "xgrammar==0.1.27",
 
-  "smg-grpc-proto>=0.3.3",
+  "smg-grpc-proto @ git+https://github.com/deepgrove-ai/smg.git@main#subdirectory=crates/grpc_client/python",
   "grpcio>=1.78.0",
   "grpcio-reflection>=1.78.0",
   "grpcio-health-checking>=1.78.0",
@@ -94,8 +94,8 @@ explicit = true
 
 [tool.uv.sources]
 torch = [
-  { index = "pypi", marker = "platform_machine == 'x86_64'"},
-  { index = "torch-cu129", marker = "platform_machine == 'aarch64'"},
+  { index = "pypi", marker = "platform_machine == 'x86_64'" },
+  { index = "torch-cu129", marker = "platform_machine == 'aarch64'" },
 ]
 
 [project.optional-dependencies]
@@ -113,7 +113,7 @@ diffusion = [
   "vsa==0.0.4 ; platform_machine != 'aarch64' and platform_machine != 'arm64'",
   "runai_model_streamer>=0.15.5",
   "cache-dit==1.2.0",
-  "addict"
+  "addict",
 ]
 
 tracing = [
@@ -140,10 +140,7 @@ test = [
 
 dev = ["sglang[test]"]
 
-all = [
-  "sglang[diffusion]",
-  "sglang[tracing]",
-]
+all = ["sglang[diffusion]", "sglang[tracing]"]
 
 [tool.uv.extra-build-dependencies]
 st-attn = ["torch", "setuptools"]
@@ -157,10 +154,7 @@ vsa = ["torch", "setuptools"]
 sglang = "sglang.cli.main:main"
 
 [tool.setuptools.package-data]
-"sglang" = [
-  "srt/**/*",
-  "jit_kernel/**/*"
-]
+"sglang" = ["srt/**/*", "jit_kernel/**/*"]
 
 [tool.setuptools.packages.find]
 exclude = [
@@ -187,6 +181,10 @@ exclude = [
 [tool.setuptools_scm]
 root = ".."
 version_file = "sglang/_version.py"
-git_describe_command = ["bash", "-c", "git tag --list --sort=-version:refname 'v*.*.*' | head -1 | xargs git describe --tags --long"]
+git_describe_command = [
+  "bash",
+  "-c",
+  "git tag --list --sort=-version:refname 'v*.*.*' | head -1 | xargs git describe --tags --long",
+]
 # Allow editable installs even when .git metadata is not available.
 fallback_version = "0.0.0.dev0"

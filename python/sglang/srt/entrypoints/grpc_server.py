@@ -767,9 +767,9 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
     ) -> list:
         """Convert hidden states (list of numpy arrays) to proto HiddenStates messages.
 
-        Hidden states arrive as numpy arrays (float16) from the scheduler.
-        We convert to float32 and use .tolist() for protobuf's packed repeated-float
-        encoding. This is a single conversion — the scheduler no longer calls .tolist().
+        Hidden states arrive as numpy arrays from the scheduler.
+        We send them as raw bytes through TensorData to avoid the expensive
+        numpy -> Python list conversion on the gRPC path.
         """
         if not hidden_states:
             return []
@@ -779,11 +779,18 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         result = []
         for i, hs in enumerate(hidden_states):
             if hasattr(hs, "astype"):
-                values = hs.astype(np.float32).flatten().tolist()
+                arr = np.ascontiguousarray(hs)
             else:
                 continue
             result.append(
-                sglang_scheduler_pb2.HiddenStates(values=values, position=i)
+                sglang_scheduler_pb2.HiddenStates(
+                    position=i,
+                    tensor_data=sglang_scheduler_pb2.TensorData(
+                        data=arr.tobytes(),
+                        shape=list(arr.shape),
+                        dtype=str(arr.dtype),
+                    ),
+                )
             )
         return result
 

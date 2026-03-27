@@ -25,6 +25,16 @@ import numpy as np
 from smg_grpc_proto import sglang_scheduler_pb2, sglang_scheduler_pb2_grpc
 
 
+def hidden_states_proto_to_numpy(hs_proto) -> np.ndarray:
+    if hs_proto.HasField("tensor_data"):
+        tensor_data = hs_proto.tensor_data
+        arr = np.frombuffer(tensor_data.data, dtype=np.dtype(tensor_data.dtype))
+        if tensor_data.shape:
+            arr = arr.reshape(tuple(tensor_data.shape))
+        return arr
+    return np.array(hs_proto.values, dtype=np.float32)
+
+
 def get_hidden_states(
     stub: sglang_scheduler_pb2_grpc.SglangSchedulerStub,
     input_ids: list[int],
@@ -53,8 +63,7 @@ def get_hidden_states(
             )
         if response.HasField("complete"):
             for hs_proto in response.complete.all_hidden_states:
-                arr = np.array(hs_proto.values, dtype=np.float32)
-                hidden_states.append(arr)
+                hidden_states.append(hidden_states_proto_to_numpy(hs_proto))
 
     return hidden_states
 
