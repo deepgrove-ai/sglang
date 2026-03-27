@@ -146,5 +146,50 @@ class TestHiddenState(CustomTestCase):
             )
 
 
+    def test_chunked_prefill_hidden_states_length(self):
+        """Regression test: hidden states must cover all input tokens even when
+        chunked prefill splits a request across multiple iterations.
+
+        Before the fix, hidden states were only collected in the final chunk
+        (the ``is_chunked <= 0`` branch), so intermediate chunks' hidden states
+        were silently dropped and ``hidden_state_offset`` drifted for
+        co-batched requests.
+        """
+        model_path = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+
+        engine = sgl.Engine(
+            model_path=model_path,
+            random_seed=42,
+            skip_tokenizer_init=True,
+            enable_return_hidden_states=True,
+            disable_radix_cache=True,
+            chunked_prefill_size=256,
+        )
+
+        sampling_params = {"temperature": 0, "max_new_tokens": 0}
+
+        DUMMY_TOKEN = 9
+        lengths = [50, 200, 500, 350]
+        all_input_ids = [[DUMMY_TOKEN] * n for n in lengths]
+
+        outputs = engine.generate(
+            input_ids=all_input_ids,
+            sampling_params=sampling_params,
+            return_hidden_states=True,
+        )
+        engine.shutdown()
+
+        for input_ids, output in zip(all_input_ids, outputs):
+            hs_chunks = output["meta_info"]["hidden_states"]
+            total_hs_tokens = sum(len(chunk) for chunk in hs_chunks)
+            self.assertEqual(
+                total_hs_tokens,
+                len(input_ids),
+                f"Hidden states token count {total_hs_tokens} != input length "
+                f"{len(input_ids)} (chunks={[len(c) for c in hs_chunks]})",
+            )
+
+
+
 if __name__ == "__main__":
     unittest.main()

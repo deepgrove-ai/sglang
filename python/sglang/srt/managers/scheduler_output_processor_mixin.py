@@ -166,6 +166,30 @@ class SchedulerOutputProcessorMixin:
                     # decode req in mixed batch or retracted req
                     continue
 
+                # Collect hidden states for every chunk (both intermediate
+                # and final) so that chunked prefill doesn't lose tokens.
+                if (
+                    req.return_hidden_states
+                    and logits_output.hidden_states is not None
+                ):
+                    extend_len = (
+                        extend_input_len_per_req[i]
+                        if extend_input_len_per_req is not None
+                        else len(req.origin_input_ids)
+                    )
+                    hs_chunk = logits_output.hidden_states[
+                        hidden_state_offset : hidden_state_offset + extend_len
+                    ]
+                    hidden_state_offset += extend_len
+                    req.hidden_states.append(
+                        hs_chunk.half().cpu().numpy().tolist()
+                    )
+                elif (
+                    logits_output.hidden_states is not None
+                    and extend_input_len_per_req is not None
+                ):
+                    hidden_state_offset += extend_input_len_per_req[i]
+
                 if req.is_chunked <= 0:
                     if req.time_stats.prefill_finished_ts == 0.0:
                         req.time_stats.prefill_finished_ts = time.time()
@@ -204,22 +228,6 @@ class SchedulerOutputProcessorMixin:
                                 logits_output,
                             )
                         logprob_pt += num_input_logprobs
-
-                    if (
-                        req.return_hidden_states
-                        and logits_output.hidden_states is not None
-                    ):
-                        req.hidden_states.append(
-                            logits_output.hidden_states[
-                                hidden_state_offset : (
-                                    hidden_state_offset := hidden_state_offset
-                                    + len(req.origin_input_ids)
-                                )
-                            ]
-                            .half()
-                            .cpu()
-                            .numpy()
-                        )
 
                     if req.grammar is not None:
                         # FIXME: this try-except block is for handling unexpected xgrammar issue.
