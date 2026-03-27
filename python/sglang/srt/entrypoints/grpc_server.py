@@ -590,6 +590,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             token_ids_logprob=(
                 list(grpc_req.token_ids_logprob) if grpc_req.token_ids_logprob else None
             ),
+            return_hidden_states=grpc_req.return_hidden_states or False,
             bootstrap_host=bootstrap_host,
             bootstrap_port=bootstrap_port,
             bootstrap_room=bootstrap_room,
@@ -761,6 +762,32 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             top_logprobs=top_logprobs_proto,
         )
 
+    def _convert_hidden_states_to_proto(
+        self, hidden_states
+    ) -> list:
+        """Convert hidden states (list of numpy arrays) to proto HiddenStates messages.
+
+        Each numpy array is flattened to float32 and packed into the proto's
+        repeated-float field, which uses protobuf packed encoding (binary, not text).
+        """
+        if not hidden_states:
+            return []
+
+        import numpy as np
+
+        result = []
+        for i, hs in enumerate(hidden_states):
+            if hasattr(hs, "astype"):
+                values = hs.astype(np.float32).flatten().tolist()
+            elif isinstance(hs, list):
+                values = [float(v) for sublist in hs for v in (sublist if isinstance(sublist, list) else [sublist])]
+            else:
+                continue
+            result.append(
+                sglang_scheduler_pb2.HiddenStates(values=values, position=i)
+            )
+        return result
+
     def _create_chunk_response(
         self, request_id: str, output: Dict
     ) -> sglang_scheduler_pb2.GenerateResponse:
@@ -832,6 +859,11 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             output.get("input_logprobs")
         )
 
+        # Convert hidden states if present (numpy arrays → proto HiddenStates)
+        all_hidden_states_proto = self._convert_hidden_states_to_proto(
+            output.get("hidden_states")
+        )
+
         return sglang_scheduler_pb2.GenerateResponse(
             request_id=request_id,
             complete=sglang_scheduler_pb2.GenerateComplete(
@@ -843,6 +875,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 ),
                 cached_tokens=meta_info.get("cached_tokens", 0),
                 output_logprobs=output_logprobs_proto,
+                all_hidden_states=all_hidden_states_proto,
                 input_logprobs=input_logprobs_proto,
                 index=output.get("index", 0),
                 **matched_stop_kwargs,

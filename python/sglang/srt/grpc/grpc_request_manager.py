@@ -718,6 +718,14 @@ class GrpcRequestManager:
                         "top_logprobs_idx": state.output_top_logprobs_idx,
                     }
 
+            # Forward hidden states if available
+            if (
+                batch_out.output_hidden_states
+                and i < len(batch_out.output_hidden_states)
+                and output_data["finished"]
+            ):
+                output_data["hidden_states"] = batch_out.output_hidden_states[i]
+
             # Update state for accumulation
             if output_data["token_ids"]:
                 state.output_ids.extend(output_data["token_ids"])

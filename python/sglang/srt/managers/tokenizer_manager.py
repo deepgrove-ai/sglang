@@ -1540,7 +1540,10 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     ]
 
             if getattr(recv_obj, "output_hidden_states", None):
-                meta_info["hidden_states"] = recv_obj.output_hidden_states[i]
+                hs = recv_obj.output_hidden_states[i]
+                meta_info["hidden_states"] = [
+                    h.tolist() if hasattr(h, "tolist") else h for h in hs
+                ]
             if getattr(recv_obj, "routed_experts", None):
                 meta_info["routed_experts"] = recv_obj.routed_experts[i]
             if getattr(recv_obj, "customized_info", None):
