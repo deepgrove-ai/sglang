@@ -182,7 +182,7 @@ class SchedulerOutputProcessorMixin:
                     ]
                     hidden_state_offset += extend_len
                     req.hidden_states.append(
-                        hs_chunk.half().cpu().numpy().tolist()
+                        hs_chunk.half().cpu().numpy()
                     )
                 elif (
                     logits_output.hidden_states is not None
