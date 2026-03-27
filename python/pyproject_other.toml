@@ -13,7 +13,14 @@ classifiers = [
   "Programming Language :: Python :: 3",
   "License :: OSI Approved :: Apache Software License",
 ]
-dependencies = ["aiohttp", "requests", "tqdm", "numpy", "IPython", "setproctitle"]
+dependencies = [
+  "aiohttp",
+  "requests",
+  "tqdm",
+  "numpy",
+  "IPython",
+  "setproctitle",
+]
 
 [project.optional-dependencies]
 runtime_common = [
@@ -62,9 +69,11 @@ runtime_common = [
   "uvicorn",
   "uvloop",
   "xgrammar==0.1.25",
-  "grpcio==1.75.1", # keep it align with compile_proto.py
-  "grpcio-tools==1.75.1", # keep it align with compile_proto.py
-  "grpcio-reflection==1.75.1", # required by srt/entrypoints/grpc_server.py
+
+  "smg-grpc-proto @ git+https://github.com/deepgrove-ai/smg.git@main#subdirectory=crates/grpc_client/python",
+  "grpcio>=1.78.0",
+  "grpcio-reflection>=1.78.0",
+  "grpcio-health-checking>=1.78.0",
 ]
 
 tracing = [

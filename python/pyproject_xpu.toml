@@ -65,9 +65,10 @@ dependencies = [
   "uvicorn",
   "uvloop",
   # "xgrammar==0.1.24", , xgrammar depends on CUDA PyTorch and Triton only
-  "grpcio==1.75.1", # keep it align with compile_proto.py
-  "grpcio-tools==1.75.1", # keep it align with compile_proto.py
-  "grpcio-reflection==1.75.1", # required by srt/entrypoints/grpc_server.py
+  "smg-grpc-proto @ git+https://github.com/deepgrove-ai/smg.git@main#subdirectory=crates/grpc_client/python",
+  "grpcio>=1.78.0",
+  "grpcio-reflection>=1.78.0",
+  "grpcio-health-checking>=1.78.0",
 ]
 
 [project.optional-dependencies]
