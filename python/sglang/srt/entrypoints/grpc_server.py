@@ -970,11 +970,13 @@ async def serve_grpc(
     )
 
     # Create gRPC server
+    # Use -1 to allow unlimited message size (gRPC default limit is too
+    # small for large hidden-state payloads, e.g. 32k tokens × 4096 dim × fp32 = 512MB).
     server = grpc.aio.server(
         futures.ThreadPoolExecutor(max_workers=10),
         options=[
-            ("grpc.max_send_message_length", 1024 * 1024 * 256),
-            ("grpc.max_receive_message_length", 1024 * 1024 * 256),
+            ("grpc.max_send_message_length", -1),
+            ("grpc.max_receive_message_length", -1),
         ],
     )
 
@@ -1069,8 +1071,8 @@ def _execute_grpc_server_warmup(server_args: ServerArgs):
         channel = grpc.insecure_channel(
             grpc_url,
             options=[
-                ("grpc.max_send_message_length", 1024 * 1024 * 256),
-                ("grpc.max_receive_message_length", 1024 * 1024 * 256),
+                ("grpc.max_send_message_length", -1),
+                ("grpc.max_receive_message_length", -1),
             ],
         )
         stub = sglang_scheduler_pb2_grpc.SglangSchedulerStub(channel)
