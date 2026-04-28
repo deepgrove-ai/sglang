@@ -78,6 +78,23 @@ _is_flashinfer_available = is_flashinfer_available()
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 
+# ── debug tensor dumps ────────────────────────────────────────────────────────
+import atexit as _atexit
+_SGL_DBG   = {}
+_SGL_STEP  = [0]
+_SGL_LAYER = [0]
+
+def _sgl_dbg(name, t):
+    key = f"s{_SGL_STEP[0]:03d}_l{_SGL_LAYER[0]:02d}_{name}"
+    _SGL_DBG[key] = t[-1].detach().cpu().to(torch.float32).clone()
+
+def _sgl_save():
+    torch.save(_SGL_DBG, "/tmp/sgl_debug.pt")
+    print(f"[SGL debug] saved {len(_SGL_DBG)} tensors → /tmp/sgl_debug.pt")
+
+_atexit.register(_sgl_save)
+# ─────────────────────────────────────────────────────────────────────────────
+
 # Unchanged from qwen3
 class MapleSparseMoeBlock(nn.Module):
     def __init__(
@@ -284,6 +301,27 @@ class MapleSparseMoeBlock(nn.Module):
     def op_output(self, state):
         state.hidden_states_mlp_output = state.pop("hidden_states_after_combine")
 
+class MapleRMSNorm(nn.Module):
+    def __init__(self, hidden_size, eps=1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
+
+    def forward(self, hidden_states, residual=None):
+        input_dtype = hidden_states.dtype
+        if residual is not None:
+            # Match HF's explicit bf16 residual add (not fused fp32 add).
+            new_residual = hidden_states + residual
+            _sgl_dbg("post_residual", new_residual)  # final layer's post_residual
+            hidden_states = new_residual
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        out = self.weight.to(input_dtype) * hidden_states.to(input_dtype)
+        if residual is not None:
+            return out, new_residual
+        return out
+
 # adapted from qwen3: added NoPe global + half RoPe SWA
 class MapleAttention(nn.Module):
     def __init__(
@@ -393,8 +431,8 @@ class MapleAttention(nn.Module):
             sliding_window_size=(self.sliding_window_size if use_sliding_window else -1),
         )
 
-        self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
-        self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
+        self.q_norm = MapleRMSNorm(self.head_dim, eps=rms_norm_eps)
+        self.k_norm = MapleRMSNorm(self.head_dim, eps=rms_norm_eps)
         self.alt_stream = alt_stream
 
     def _apply_qk_norm(
@@ -584,6 +622,13 @@ class MapleDecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         captured_last_layer_outputs: Optional[List[torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        _SGL_LAYER[0] = self.layer_id
+        # The communicator defers the residual add to the next layer's prepare_attn.
+        # Capture it here so post_residual aligns with HF's layer N-1 post_residual.
+        if residual is not None:
+            _SGL_LAYER[0] = self.layer_id - 1
+            _sgl_dbg("post_residual", hidden_states + residual.to(torch.float32))
+            _SGL_LAYER[0] = self.layer_id
 
         hidden_states, residual = (
             self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
@@ -593,6 +638,7 @@ class MapleDecoderLayer(nn.Module):
                 captured_last_layer_outputs=captured_last_layer_outputs,
             )
         )
+        _sgl_dbg("post_input_norm", hidden_states)
 
         if hidden_states.shape[0] != 0:
             hidden_states = self.self_attn(
@@ -600,11 +646,12 @@ class MapleDecoderLayer(nn.Module):
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
             )
-            # print(f"post attention: {hidden_states[..., :5]}")
+        _sgl_dbg("post_attn", hidden_states)
 
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
+        _sgl_dbg("post_post_attn_norm", hidden_states)
 
         should_allreduce_fusion = (
             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
@@ -620,7 +667,7 @@ class MapleDecoderLayer(nn.Module):
         hidden_states = self.mlp(
             hidden_states, forward_batch, should_allreduce_fusion, use_reduce_scatter
         )
-        # print(f"post mlp: {hidden_states}")
+        _sgl_dbg("post_mlp", hidden_states)
 
         if should_allreduce_fusion:
             hidden_states._sglang_needs_allreduce_fusion = True
@@ -705,6 +752,7 @@ class MapleModel(Qwen2MoeModel):
             decoder_layer_type=decoder_layer_type,
             alt_stream=alt_stream,
         )
+        self.norm = MapleRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
 
 class MapleForCausalLM(nn.Module):
@@ -746,7 +794,6 @@ class MapleForCausalLM(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-        print("HI FROM MAPLE MOE")
         hidden_states = self.model(
             input_ids,
             positions,
@@ -759,11 +806,26 @@ class MapleForCausalLM(nn.Module):
         if self.capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states
 
+        _SGL_LAYER[0] = 99
+        _sgl_dbg("final_norm", hidden_states)
+
         if self.pp_group.is_last_rank:
-            return self.logits_processor(
+            logits_out = self.logits_processor(
                 input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
             )
+            # dump [num_selected_tokens, vocab] for KL analysis
+            # LogitsProcessor returns LogitsProcessorOutput, not a raw Tensor
+            _logits_t = getattr(logits_out, "next_token_logits", None)
+            if _logits_t is not None:
+                _SGL_DBG[f"s{_SGL_STEP[0]:03d}_logits"] = (
+                    _logits_t.detach().cpu().to(torch.float32).clone()
+                )
+            _SGL_STEP[0] += 1
+            torch.save(_SGL_DBG, "/tmp/sgl_debug.pt")
+            return logits_out
         else:
+            _SGL_STEP[0] += 1
+            torch.save(_SGL_DBG, "/tmp/sgl_debug.pt")
             return hidden_states
 
     @torch.no_grad()
