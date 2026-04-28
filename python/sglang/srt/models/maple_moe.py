@@ -161,9 +161,31 @@ class MapleSparseMoeBlock(nn.Module):
         hidden_states = hidden_states.view(-1, hidden_dim)
 
         # router_logits: (num_tokens, n_experts)
-        router_logits, _ = self.gate(hidden_states)
-        topk_output = self.topk(hidden_states, router_logits)
-        final_hidden_states = self.experts(hidden_states, topk_output)
+        # Match HF reference: gate and routing entirely in fp32.
+        # topk_softmax CUDA kernel only supports fp16/bf16, so bypass it with
+        # an inline Python routing path (softmax → topk → renormalize) instead.
+        router_logits_fp32 = torch.nn.functional.linear(
+            hidden_states.to(torch.float32), self.gate.weight.to(torch.float32)
+        )
+        routing_weights = torch.softmax(router_logits_fp32, dim=-1)
+        topk_weights, topk_ids = torch.topk(
+            routing_weights, self.topk.topk_config.top_k, dim=-1
+        )
+        topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-20)
+        from sglang.srt.layers.moe.topk import StandardTopKOutput
+        topk_output = StandardTopKOutput(
+            topk_weights=topk_weights,
+            topk_ids=topk_ids.to(torch.int32),
+            router_logits=router_logits_fp32,
+        )
+        # Use native sequential per-expert forward to match HF's moe_infer numerics.
+        from sglang.srt.layers.moe.fused_moe_native import moe_forward_native
+        final_hidden_states = moe_forward_native(
+            self.experts,
+            hidden_states,
+            topk_output,
+            self.experts.moe_runner_config,
+        )
         if (
             self.tp_size > 1
             and not should_allreduce_fusion
@@ -340,6 +362,7 @@ class MapleAttention(nn.Module):
         )
 
         # main change is using rotary embed half dim
+        self.use_sliding_window = use_sliding_window
         if use_sliding_window:
             self.rotary_emb = get_rope(
                 self.head_dim,
@@ -354,10 +377,11 @@ class MapleAttention(nn.Module):
         # self.compatible_with_fused_kv_buffer = (
         #     False if isinstance(self.rotary_emb, MRotaryEmbedding) else True
         # )
-        self.compatible_with_fused_kv_buffer = (
-            self.rotary_emb is not None
-            and not isinstance(self.rotary_emb, MRotaryEmbedding)
-        )
+        # self.compatible_with_fused_kv_buffer = (
+        #     self.rotary_emb is not None
+        #     and not isinstance(self.rotary_emb, MRotaryEmbedding)
+        # )
+        self.compatible_with_fused_kv_buffer = False
 
         self.attn = RadixAttention(
             self.num_heads,
@@ -413,27 +437,16 @@ class MapleAttention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
+        print(positions, self.sliding_window_size, self.use_sliding_window)
         if hidden_states.shape[0] == 0:
             return hidden_states, forward_batch, None
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self._apply_qk_norm(q, k)
         if self.rotary_emb is not None:
-            q, k = self.rotary_emb(
-                positions,
-                q,
-                k,
-                fused_set_kv_buffer_arg=(
-                    create_fused_set_kv_buffer_arg(
-                        value=v,
-                        layer=self.attn,
-                        forward_batch=forward_batch,
-                    )
-                    if enable_fused_set_kv_buffer(forward_batch)
-                    and self.compatible_with_fused_kv_buffer
-                    else None
-                ),
-            )
+            # Use native path to match HF: casts cos/sin to query dtype (bf16)
+            # before multiply, rather than using float32 cos_sin_cache directly.
+            q, k = self.rotary_emb.forward_native(positions, q, k)
         # print(f"q: {q[..., :1]}")
         # print(f"k: {k[..., :1]}")
         # print(f"v: {v[..., :1]}")
@@ -441,9 +454,15 @@ class MapleAttention(nn.Module):
         return None, forward_batch, inner_state
 
     def forward_core(self, intermediate_state):
+        
         hidden_states, forward_batch, inner_state = intermediate_state
         if inner_state is None:
             return hidden_states
+        
+        q, k, v, fb = inner_state
+        if self.attn.layer_id == 0:
+            print(f"[layer 0] q:{q.shape} seq_lens:{fb.seq_lens}")
+
         attn_output = self.attn(
             *inner_state,
             save_kv_cache=not (
@@ -727,6 +746,7 @@ class MapleForCausalLM(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
+        print("HI FROM MAPLE MOE")
         hidden_states = self.model(
             input_ids,
             positions,
