@@ -18,7 +18,7 @@
 """Inference-only Maple model compatible with HuggingFace weights."""
 
 import logging
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 from torch import nn
@@ -46,6 +46,11 @@ from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
+from sglang.srt.layers.dp_attention import (
+    get_attention_tp_rank,
+    get_attention_tp_size,
+    is_dp_attention_enabled,
+)
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
@@ -53,7 +58,7 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding, get_rope
 from sglang.srt.layers.utils import get_layer_id
-from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
+from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead, VocabParallelEmbedding
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
@@ -69,6 +74,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_flashinfer_available,
     is_non_idle_and_non_empty,
+    make_layers
 )
 
 MapleConfig = None
@@ -736,23 +742,128 @@ class MapleDecoderLayer(nn.Module):
         return output
 
 
-class MapleModel(Qwen2MoeModel):
+class MapleModel(nn.Module):
     def __init__(
         self,
         config: MapleConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         decoder_layer_type=MapleDecoderLayer,
+        alt_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
-        alt_stream = torch.cuda.Stream() if _is_cuda else None
-        super().__init__(
-            config=config,
-            quant_config=quant_config,
-            prefix=prefix,
-            decoder_layer_type=decoder_layer_type,
-            alt_stream=alt_stream,
+        super().__init__()
+        self.config = config 
+        
+        self.padding_idx = config.pad_token_id
+        self.vocab_size = config.vocab_size
+        self.pp_group = get_pp_group()
+
+        if self.pp_group.is_first_rank:
+            self.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+                enable_tp=not is_dp_attention_enabled(),
+                prefix=add_prefix("embed_tokens", prefix),
+            )
+        else:
+            self.embed_tokens = PPMissingLayer()
+
+        # Use the provided decoder layer type or default to MapleDecoderLayer
+        decoder_layer_type = decoder_layer_type or MapleDecoderLayer
+        self.layers, self.start_layer, self.end_layer = make_layers(
+            config.num_hidden_layers,
+            lambda idx, prefix: decoder_layer_type(
+                layer_id=idx,
+                config=config,
+                quant_config=quant_config,
+                prefix=prefix,
+                alt_stream=alt_stream,
+            ),
+            pp_rank=self.pp_group.rank_in_group,
+            pp_size=self.pp_group.world_size,
+            prefix=add_prefix("layers", prefix),
         )
-        self.norm = MapleRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        if self.pp_group.is_last_rank:
+            self.norm = MapleRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        else:
+            self.norm = PPMissingLayer(return_tuple=True)
+
+        # For EAGLE3 support
+        self.layers_to_capture = []
+        
+    def set_eagle3_layers_to_capture(self, layers_to_capture: List[int]):
+        self.layers_to_capture = layers_to_capture
+        for layer_id in self.layers_to_capture:
+            setattr(self.layers[layer_id], "_is_layer_to_capture", True)
+        
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: torch.Tensor = None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> Union[torch.Tensor, PPProxyTensors]:
+        if self.pp_group.is_first_rank:
+            if input_embeds is None:
+                hidden_states = self.embed_tokens(input_ids)
+            else:
+                hidden_states = input_embeds
+            residual = None
+        else:
+            assert pp_proxy_tensors is not None
+            hidden_states = pp_proxy_tensors["hidden_states"]
+            residual = pp_proxy_tensors["residual"]
+
+        aux_hidden_states = []
+        if forward_batch.can_run_tbo:
+            hidden_states, residual = model_forward_maybe_tbo(
+                layers=self.layers,
+                enable_tbo=True,
+                input_data_scatter_mode=ScatterMode.model_input_output(),
+                positions=positions,
+                forward_batch=forward_batch,
+                hidden_states=hidden_states,
+                residual=residual,
+            )
+        else:
+            for i in range(self.start_layer, self.end_layer):
+                ctx = (
+                    nullcontext()
+                    if get_global_server_args().enable_piecewise_cuda_graph
+                    else get_global_expert_distribution_recorder().with_current_layer(i)
+                )
+                with ctx:
+                    layer = self.layers[i]
+                    hidden_states, residual = layer(
+                        positions,
+                        hidden_states,
+                        forward_batch,
+                        residual,
+                        captured_last_layer_outputs=(
+                            aux_hidden_states
+                            if getattr(layer, "_is_layer_to_capture", False)
+                            else None
+                        ),
+                    )
+        if not self.pp_group.is_last_rank:
+            return PPProxyTensors(
+                {
+                    "hidden_states": hidden_states,
+                    "residual": residual,
+                }
+            )
+        else:
+            if hidden_states.shape[0] != 0:
+                if residual is None:
+                    hidden_states = self.norm(hidden_states)
+                else:
+                    hidden_states, _ = self.norm(hidden_states, residual)
+
+        if len(aux_hidden_states) == 0:
+            return hidden_states
+
+        return hidden_states, aux_hidden_states
 
 
 class MapleForCausalLM(nn.Module):
@@ -768,8 +879,10 @@ class MapleForCausalLM(nn.Module):
         self.pp_group = get_pp_group()
         self.config = config
         self.quant_config = quant_config
+        alt_stream = torch.cuda.Stream() if _is_cuda else None
         self.model = MapleModel(
-            config, quant_config, prefix=add_prefix("model", prefix)
+            config, quant_config, prefix=add_prefix("model", prefix),
+            alt_stream=alt_stream
         )
         # print(self.model)
         self.lm_head = ParallelLMHead(
