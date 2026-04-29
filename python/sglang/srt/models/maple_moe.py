@@ -56,7 +56,7 @@ from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.rotary_embedding import MRotaryEmbedding, get_rope
+from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead, VocabParallelEmbedding
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
@@ -451,6 +451,7 @@ class MapleAttention(nn.Module):
         alt_stream: Optional[torch.cuda.Stream] = None,
         layer_type = "full_attention",
         sliding_window_size: int = -1,
+        config=None,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -508,26 +509,9 @@ class MapleAttention(nn.Module):
             prefix=add_prefix("o_proj", prefix),
         )
 
-        # main change is using rotary embed half dim
         self.use_sliding_window = use_sliding_window
-        if use_sliding_window:
-            self.rotary_emb = get_rope(
-                self.head_dim,
-                rotary_dim=int(self.head_dim*0.5),
-                max_position=max_position_embeddings,
-                base=rope_theta,
-                rope_scaling=rope_scaling,
-                dual_chunk_attention_config=dual_chunk_attention_config,
-            )
-        else:
-            self.rotary_emb = None
-        # self.compatible_with_fused_kv_buffer = (
-        #     False if isinstance(self.rotary_emb, MRotaryEmbedding) else True
-        # )
-        # self.compatible_with_fused_kv_buffer = (
-        #     self.rotary_emb is not None
-        #     and not isinstance(self.rotary_emb, MRotaryEmbedding)
-        # )
+        partial_rotary_factor = 0.5  # kept for reference; rope coverage driven by cos.shape[-1]
+        self.rope_dim = int(self.head_dim * partial_rotary_factor)
         self.compatible_with_fused_kv_buffer = False
 
         self.attn = RadixAttention(
@@ -571,6 +555,7 @@ class MapleAttention(nn.Module):
             positions=state.positions,
             hidden_states=state.pop("hidden_states_after_comm_pre_attn"),
             forward_batch=state.forward_batch,
+            position_embeddings=state.get("position_embeddings"),
         )
 
     def op_core(self, state):
@@ -583,20 +568,25 @@ class MapleAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
     ):
-        print(positions, self.sliding_window_size, self.use_sliding_window)
         if hidden_states.shape[0] == 0:
             return hidden_states, forward_batch, None
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self._apply_qk_norm(q, k)
-        if self.rotary_emb is not None:
-            # Use native path to match HF: casts cos/sin to query dtype (bf16)
-            # before multiply, rather than using float32 cos_sin_cache directly.
-            q, k = self.rotary_emb.forward_native(positions, q, k)
-        # print(f"q: {q[..., :1]}")
-        # print(f"k: {k[..., :1]}")
-        # print(f"v: {v[..., :1]}")
+        if self.use_sliding_window and position_embeddings is not None:
+            cos, sin, _ = position_embeddings
+            cos = cos.squeeze(0)  # [num_tokens, head_dim]
+            sin = sin.squeeze(0)
+            q = q.view(-1, self.num_heads, self.head_dim)
+            k = k.view(-1, self.num_kv_heads, self.head_dim)
+            q, k = apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1)
+            q = q.reshape(-1, self.q_size)
+            k = k.reshape(-1, self.kv_size)
+        _sgl_dbg("q", q)
+        _sgl_dbg("k", k)
+        _sgl_dbg("v", v)
         inner_state = q, k, v, forward_batch
         return None, forward_batch, inner_state
 
@@ -617,7 +607,9 @@ class MapleAttention(nn.Module):
                 and self.compatible_with_fused_kv_buffer
             ),
         )
+        _sgl_dbg("attn_pre_o", attn_output)
         output, _ = self.o_proj(attn_output)
+        _sgl_dbg("o_proj", output)
         return output
 
     def forward(
@@ -625,11 +617,13 @@ class MapleAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
         s = self.forward_prepare(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
+            position_embeddings=position_embeddings,
         )
         return self.forward_core(s)
 
@@ -730,6 +724,7 @@ class MapleDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
         captured_last_layer_outputs: Optional[List[torch.Tensor]] = None,
+        position_embeddings=None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         _SGL_LAYER[0] = self.layer_id
         # The communicator defers the residual add to the next layer's prepare_attn.
@@ -754,6 +749,7 @@ class MapleDecoderLayer(nn.Module):
                 positions=positions,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
+                position_embeddings=position_embeddings,
             )
         _sgl_dbg("post_attn", hidden_states)
 
@@ -795,6 +791,7 @@ class MapleDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
         tbo_subbatch_index: Optional[int] = None,
+        position_embeddings=None,
     ):
         state.hidden_states_after_comm_pre_attn, state.residual_after_input_ln = (
             self.layer_communicator.prepare_attn(hidden_states, residual, forward_batch)
@@ -804,6 +801,7 @@ class MapleDecoderLayer(nn.Module):
                 forward_batch=forward_batch,
                 positions=positions,
                 tbo_subbatch_index=tbo_subbatch_index,
+                position_embeddings=position_embeddings,
             )
         )
 
@@ -891,6 +889,8 @@ class MapleModel(nn.Module):
         else:
             self.norm = PPMissingLayer(return_tuple=True)
 
+        self.rotary_emb = MapleRotaryEmbedding(config)
+
         # For EAGLE3 support
         self.layers_to_capture = []
         
@@ -912,11 +912,16 @@ class MapleModel(nn.Module):
                 hidden_states = self.embed_tokens(input_ids)
             else:
                 hidden_states = input_embeds
+            _SGL_LAYER[0] = 0
+            _sgl_dbg("embed", hidden_states)
             residual = None
         else:
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
+
+        # Compute once; sliding-window attention layers apply it, NoPe layers ignore it.
+        position_embeddings = self.rotary_emb(hidden_states, positions.unsqueeze(0))
 
         aux_hidden_states = []
         if forward_batch.can_run_tbo:
@@ -948,6 +953,7 @@ class MapleModel(nn.Module):
                             if getattr(layer, "_is_layer_to_capture", False)
                             else None
                         ),
+                        position_embeddings=position_embeddings,
                     )
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(

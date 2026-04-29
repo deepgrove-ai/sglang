@@ -33,3 +33,10 @@ python -m sglang.bench_serving \
   --random-range-ratio 1 \
   --num-prompts 20 \
   --profile
+
+
+python compare_tensors.py --plot --plot-out kl_plot.png --rtol 0.01 --atol 0.01 --tokenizer /scratch/ansh/models/maple_reference_model  | tee out_comp_with_plots.log
+
+python plot_range.py --start-step 46 --end-step 52 --per-stage
+
+python report_range.py --start-step 48 --end-step 49 --tokenizer-path /scratch/ansh/models/maple_reference_model
