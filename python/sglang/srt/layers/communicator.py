@@ -278,6 +278,7 @@ class LayerCommunicator:
                             None,
                         )
                     else:
+                        print("going through path a")
                         hidden_states = self.input_layernorm(hidden_states)
                 else:
                     if _use_aiter and _is_gfx95_supported and ("mxfp4" in qaunt_format):
@@ -291,6 +292,7 @@ class LayerCommunicator:
                             residual,
                         )
                     else:
+                        print("going through path b")
                         hidden_states, residual = self.input_layernorm(
                             hidden_states, residual
                         )

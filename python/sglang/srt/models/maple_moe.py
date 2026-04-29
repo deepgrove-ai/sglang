@@ -410,6 +410,19 @@ class MapleSparseMoeBlock(nn.Module):
     def op_output(self, state):
         state.hidden_states_mlp_output = state.pop("hidden_states_after_combine")
 
+class MapleRMSNormHuggingFace(nn.Module):
+    def __init__(self, hidden_size, eps=1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
+
+    def forward(self, hidden_states):
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        return self.weight * hidden_states.to(input_dtype)
+
 class MapleRMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
         super().__init__()
@@ -705,6 +718,7 @@ class MapleDecoderLayer(nn.Module):
                 prefix=add_prefix("mlp", prefix),
             )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # self.input_layernorm = MapleRMSNormHuggingFace(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
@@ -727,23 +741,34 @@ class MapleDecoderLayer(nn.Module):
         position_embeddings=None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         _SGL_LAYER[0] = self.layer_id
-        # The communicator defers the residual add to the next layer's prepare_attn.
-        # Capture it here so post_residual aligns with HF's layer N-1 post_residual.
+
+        # Fold the deferred residual from the previous layer (communicator did this
+        # in prepare_attn). Dump it as post_residual for layer N-1 to match HF keys.
         if residual is not None:
+            hidden_states = hidden_states + residual
             _SGL_LAYER[0] = self.layer_id - 1
-            _sgl_dbg("post_residual", hidden_states + residual.to(torch.float32))
+            _sgl_dbg("post_residual", hidden_states + residual)
             _SGL_LAYER[0] = self.layer_id
 
-        hidden_states, residual = (
-            self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
-                hidden_states,
-                residual,
-                forward_batch,
-                captured_last_layer_outputs=captured_last_layer_outputs,
-            )
-        )
+        # non comms path
+        # input layernorm  (mirrors HF: residual = x; x = input_layernorm(x))
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        # hidden_states_2 = self.input_layernorm2(hidden_states)
+
+
+        # comms path
+        # hidden_states, residual = (
+        #     self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
+        #         hidden_states,
+        #         residual,
+        #         forward_batch,
+        #         captured_last_layer_outputs=captured_last_layer_outputs,
+        #     )
+        # )
         _sgl_dbg("post_input_norm", hidden_states)
 
+        # attention
         if hidden_states.shape[0] != 0:
             hidden_states = self.self_attn(
                 positions=positions,
@@ -753,34 +778,20 @@ class MapleDecoderLayer(nn.Module):
             )
         _sgl_dbg("post_attn", hidden_states)
 
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
-            hidden_states, residual, forward_batch
-        )
+        # post-attention residual add + layernorm
+        # (mirrors HF: x = residual + attn_out; residual = x; x = post_attn_ln(x))
+        hidden_states = hidden_states + residual
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
         _sgl_dbg("post_post_attn_norm", hidden_states)
 
-        should_allreduce_fusion = (
-            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
-                forward_batch
-            )
-        )
-
-        # For DP with padding, reduce scatter can be used instead of all-reduce.
-        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
-            forward_batch
-        )
-
-        hidden_states = self.mlp(
-            hidden_states, forward_batch, should_allreduce_fusion, use_reduce_scatter
-        )
+        # MLP — no allreduce/reduce-scatter on single GPU
+        hidden_states = self.mlp(hidden_states, forward_batch, False, False)
         _sgl_dbg("post_mlp", hidden_states)
 
-        if should_allreduce_fusion:
-            hidden_states._sglang_needs_allreduce_fusion = True
-        else:
-            hidden_states, residual = self.layer_communicator.postprocess_layer(
-                hidden_states, residual, forward_batch
-            )
-
+        # Return with deferred residual: the post_residual fold (mlp_out + residual)
+        # is done either by the next layer's fold above, or by the final MapleRMSNorm
+        # when called as self.norm(hidden_states, residual).
         return hidden_states, residual
 
     def op_comm_prepare_attn(

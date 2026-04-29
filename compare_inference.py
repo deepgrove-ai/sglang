@@ -3,7 +3,7 @@ import openai
 
 MODEL_PATH = "/scratch/ansh/models/maple_reference_model"
 PROMPT = "The capital of France is"
-MAX_NEW_TOKENS = 64
+MAX_NEW_TOKENS = 128
 
 
 def run_hf(model_path: str, prompt: str) -> str:
