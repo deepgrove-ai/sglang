@@ -1,6 +1,17 @@
 import torch
 import openai
 
+# Maximize determinism and force fp32 accumulation where possible.
+# Note: these affect PyTorch ops (linear projections, layernorm, etc.) but NOT
+# custom CUDA kernels like FA3 — those manage their own internal precision.
+# torch.use_deterministic_algorithms(True, warn_only=True)
+# torch.backends.cuda.matmul.allow_tf32 = False
+# torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
+# torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
+# torch.backends.cudnn.allow_tf32 = False
+# torch.backends.cudnn.deterministic = True
+# torch.backends.cudnn.benchmark = False
+
 MODEL_PATH = "/scratch/ansh/models/maple_reference_model"
 PROMPT = "The capital of France is"
 MAX_NEW_TOKENS = 128

@@ -421,7 +421,8 @@ class MapleRMSNormHuggingFace(nn.Module):
         hidden_states = hidden_states.to(torch.float32)
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        return self.weight * hidden_states.to(input_dtype)
+        o = self.weight.to(torch.float32) * hidden_states
+        return o.to(input_dtype) 
 
 class MapleRMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
@@ -717,8 +718,9 @@ class MapleDecoderLayer(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
             )
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         # self.input_layernorm = MapleRMSNormHuggingFace(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
@@ -753,19 +755,17 @@ class MapleDecoderLayer(nn.Module):
         # non comms path
         # input layernorm  (mirrors HF: residual = x; x = input_layernorm(x))
         residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
-        # hidden_states_2 = self.input_layernorm2(hidden_states)
-
+        # hidden_states = self.input_layernorm(residual)
 
         # comms path
-        # hidden_states, residual = (
-        #     self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
-        #         hidden_states,
-        #         residual,
-        #         forward_batch,
-        #         captured_last_layer_outputs=captured_last_layer_outputs,
-        #     )
-        # )
+        hidden_states, residual = (
+            self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
+                hidden_states,
+                residual,
+                forward_batch,
+                captured_last_layer_outputs=captured_last_layer_outputs,
+            )
+        )
         _sgl_dbg("post_input_norm", hidden_states)
 
         # attention
