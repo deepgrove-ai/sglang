@@ -733,6 +733,67 @@ class MapleDecoderLayer(nn.Module):
             is_last_layer=(self.layer_id == self.config.num_hidden_layers - 1),
         )
 
+    # def forward(  # single-GPU simplified forward (pre-sums residual before prepare_attn)
+    #     self,
+    #     positions: torch.Tensor,
+    #     hidden_states: torch.Tensor,
+    #     forward_batch: ForwardBatch,
+    #     residual: Optional[torch.Tensor],
+    #     captured_last_layer_outputs: Optional[List[torch.Tensor]] = None,
+    #     position_embeddings=None,
+    # ) -> Tuple[torch.Tensor, torch.Tensor]:
+    #     _SGL_LAYER[0] = self.layer_id
+    #
+    #     # Fold the deferred residual from the previous layer (communicator did this
+    #     # in prepare_attn). Dump it as post_residual for layer N-1 to match HF keys.
+    #     if residual is not None:
+    #         hidden_states = hidden_states + residual
+    #         _SGL_LAYER[0] = self.layer_id - 1
+    #         _sgl_dbg("post_residual", hidden_states + residual)
+    #         _SGL_LAYER[0] = self.layer_id
+    #
+    #     # non comms path
+    #     # input layernorm  (mirrors HF: residual = x; x = input_layernorm(x))
+    #     residual = hidden_states
+    #     # hidden_states = self.input_layernorm(residual)
+    #
+    #     # comms path
+    #     hidden_states, residual = (
+    #         self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
+    #             hidden_states,
+    #             residual,
+    #             forward_batch,
+    #             captured_last_layer_outputs=captured_last_layer_outputs,
+    #         )
+    #     )
+    #     _sgl_dbg("post_input_norm", hidden_states)
+    #
+    #     # attention
+    #     if hidden_states.shape[0] != 0:
+    #         hidden_states = self.self_attn(
+    #             positions=positions,
+    #             hidden_states=hidden_states,
+    #             forward_batch=forward_batch,
+    #             position_embeddings=position_embeddings,
+    #         )
+    #     _sgl_dbg("post_attn", hidden_states)
+    #
+    #     # post-attention residual add + layernorm
+    #     # (mirrors HF: x = residual + attn_out; residual = x; x = post_attn_ln(x))
+    #     hidden_states = hidden_states + residual
+    #     residual = hidden_states
+    #     hidden_states = self.post_attention_layernorm(hidden_states)
+    #     _sgl_dbg("post_post_attn_norm", hidden_states)
+    #
+    #     # MLP — no allreduce/reduce-scatter on single GPU
+    #     hidden_states = self.mlp(hidden_states, forward_batch, False, False)
+    #     _sgl_dbg("post_mlp", hidden_states)
+    #
+    #     # Return with deferred residual: the post_residual fold (mlp_out + residual)
+    #     # is done either by the next layer's fold above, or by the final MapleRMSNorm
+    #     # when called as self.norm(hidden_states, residual).
+    #     return hidden_states, residual
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -744,20 +805,6 @@ class MapleDecoderLayer(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         _SGL_LAYER[0] = self.layer_id
 
-        # Fold the deferred residual from the previous layer (communicator did this
-        # in prepare_attn). Dump it as post_residual for layer N-1 to match HF keys.
-        if residual is not None:
-            hidden_states = hidden_states + residual
-            _SGL_LAYER[0] = self.layer_id - 1
-            _sgl_dbg("post_residual", hidden_states + residual)
-            _SGL_LAYER[0] = self.layer_id
-
-        # non comms path
-        # input layernorm  (mirrors HF: residual = x; x = input_layernorm(x))
-        residual = hidden_states
-        # hidden_states = self.input_layernorm(residual)
-
-        # comms path
         hidden_states, residual = (
             self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
                 hidden_states,
@@ -768,7 +815,6 @@ class MapleDecoderLayer(nn.Module):
         )
         _sgl_dbg("post_input_norm", hidden_states)
 
-        # attention
         if hidden_states.shape[0] != 0:
             hidden_states = self.self_attn(
                 positions=positions,
@@ -778,20 +824,18 @@ class MapleDecoderLayer(nn.Module):
             )
         _sgl_dbg("post_attn", hidden_states)
 
-        # post-attention residual add + layernorm
-        # (mirrors HF: x = residual + attn_out; residual = x; x = post_attn_ln(x))
-        hidden_states = hidden_states + residual
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states, residual = self.layer_communicator.prepare_mlp(
+            hidden_states, residual, forward_batch
+        )
         _sgl_dbg("post_post_attn_norm", hidden_states)
 
-        # MLP — no allreduce/reduce-scatter on single GPU
         hidden_states = self.mlp(hidden_states, forward_batch, False, False)
         _sgl_dbg("post_mlp", hidden_states)
 
-        # Return with deferred residual: the post_residual fold (mlp_out + residual)
-        # is done either by the next layer's fold above, or by the final MapleRMSNorm
-        # when called as self.norm(hidden_states, residual).
+        hidden_states, residual = self.layer_communicator.postprocess_layer(
+            hidden_states, residual, forward_batch
+        )
+
         return hidden_states, residual
 
     def op_comm_prepare_attn(
