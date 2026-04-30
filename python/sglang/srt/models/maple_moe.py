@@ -410,6 +410,20 @@ class MapleSparseMoeBlock(nn.Module):
     def op_output(self, state):
         state.hidden_states_mlp_output = state.pop("hidden_states_after_combine")
 
+# class MapleRMSNormHuggingFace(nn.Module):
+#     def __init__(self, hidden_size, eps=1e-6):
+#         super().__init__()
+#         self.weight = nn.Parameter(torch.ones(hidden_size))
+#         self.variance_epsilon = eps
+
+#     def forward(self, hidden_states):
+#         input_dtype = hidden_states.dtype
+#         hidden_states = hidden_states.to(torch.float32)
+#         variance = hidden_states.pow(2).mean(-1, keepdim=True)
+#         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+#         o = self.weight.to(torch.float32) * hidden_states
+#         return o.to(input_dtype) 
+
 class MapleRMSNormHuggingFace(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
         super().__init__()
@@ -421,8 +435,9 @@ class MapleRMSNormHuggingFace(nn.Module):
         hidden_states = hidden_states.to(torch.float32)
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        o = self.weight.to(torch.float32) * hidden_states
-        return o.to(input_dtype) 
+        weight_float = self.weight.float()
+        res =  weight_float * hidden_states
+        return res.to(input_dtype)
 
 class MapleRMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
@@ -538,8 +553,8 @@ class MapleAttention(nn.Module):
             sliding_window_size=(self.sliding_window_size if use_sliding_window else -1),
         )
 
-        self.q_norm = MapleRMSNorm(self.head_dim, eps=rms_norm_eps)
-        self.k_norm = MapleRMSNorm(self.head_dim, eps=rms_norm_eps)
+        self.q_norm = MapleRMSNormHuggingFace(self.head_dim, eps=rms_norm_eps)
+        self.k_norm = MapleRMSNormHuggingFace(self.head_dim, eps=rms_norm_eps)
         self.alt_stream = alt_stream
 
     def _apply_qk_norm(
@@ -718,10 +733,10 @@ class MapleDecoderLayer(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
             )
-        # self.input_layernorm = MapleRMSNormHuggingFace(config.hidden_size, eps=config.rms_norm_eps)
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = MapleRMSNormHuggingFace(config.hidden_size, eps=config.rms_norm_eps)
+        # self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-        self.post_attention_layernorm = RMSNorm(
+        self.post_attention_layernorm = MapleRMSNormHuggingFace(
             config.hidden_size, eps=config.rms_norm_eps
         )
 

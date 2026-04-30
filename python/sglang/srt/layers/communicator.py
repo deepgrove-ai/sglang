@@ -566,10 +566,11 @@ class CommunicateWithAllReduceAndLayerNormFn:
                     hidden_states, residual
                 )
             else:
-                hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+                orig_dtype = hidden_states.dtype
+                hidden_states = tensor_model_parallel_all_reduce(hidden_states.float())
                 if context.cache is not None:
                     _ = prepare_weight_cache(hidden_states, context.cache)
-                hidden_states = hidden_states + residual
+                hidden_states = (hidden_states.float() + residual.float()).to(orig_dtype)
                 residual = hidden_states
                 hidden_states = layernorm(hidden_states)
         return hidden_states, residual
