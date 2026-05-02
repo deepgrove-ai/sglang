@@ -127,6 +127,8 @@ ATTENTION_BACKEND_CHOICES = [
     "intel_amx",
     "ascend",
     "intel_xpu",
+    # Maple comparison
+    "maple_fa",
 ]
 
 LORA_BACKEND_CHOICES = ["triton", "csgmv"]

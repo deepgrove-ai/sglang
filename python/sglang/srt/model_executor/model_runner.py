@@ -2054,28 +2054,60 @@ class ModelRunner:
     def update_decode_attn_backend(self, stream_idx: int):
         self.decode_attn_backend = self.decode_attn_backend_group[stream_idx]
 
+    def _print_forward_batch(self, tag: str, forward_batch: ForwardBatch):
+        def fmt(v):
+            if isinstance(v, torch.Tensor):
+                return f"Tensor(shape={list(v.shape)}, dtype={v.dtype}, device={v.device}, values={v})"
+            return repr(v)
+        lines = [f">>> [{tag}] ForwardBatch attributes:"]
+        for field in forward_batch.__dataclass_fields__:
+            val = getattr(forward_batch, field, "<missing>")
+            # Skip large objects that aren't informative as raw repr
+            if field in ("req_to_token_pool", "token_to_kv_pool", "attn_backend", "sampling_info"):
+                lines.append(f"    {field}: {type(val).__name__}")
+            else:
+                lines.append(f"    {field}: {fmt(val)}")
+        print("\n".join(lines), flush=True)
+
     def forward_decode(
         self,
         forward_batch: ForwardBatch,
         skip_attn_backend_init: bool = False,
         pp_proxy_tensors=None,
     ) -> LogitsProcessorOutput:
+        # print(f">>> [forward_decode] ENTERED skip_attn_backend_init={skip_attn_backend_init}", flush=True)
+        self._print_forward_batch("forward_decode", forward_batch)
+        # print(f">>> [forward_decode] input_ids shape={forward_batch.input_ids.shape} dtype={forward_batch.input_ids.dtype}", flush=True)
+        # print(f">>> [forward_decode] input_ids={forward_batch.input_ids}", flush=True)
+        # print(f">>> [forward_decode] positions shape={forward_batch.positions.shape} dtype={forward_batch.positions.dtype}", flush=True)
+        # print(f">>> [forward_decode] positions={forward_batch.positions}", flush=True)
+        # print(f">>> [forward_decode] seq_lens={forward_batch.seq_lens}", flush=True)
+        # print(f">>> [forward_decode] num_reqs={forward_batch.batch_size} forward_mode={forward_batch.forward_mode}", flush=True)
+        # print(f">>> [forward_decode] pp_proxy_tensors={pp_proxy_tensors is not None} support_pp={self.support_pp}", flush=True)
+
         if not skip_attn_backend_init:
             if self.server_args.enable_pdmux:
+                # print(f">>> [forward_decode] calling decode_attn_backend.init_forward_metadata (pdmux) batch_size={forward_batch.batch_size} seq_lens={forward_batch.seq_lens}", flush=True)
                 self.decode_attn_backend.init_forward_metadata(forward_batch)
                 forward_batch.attn_backend = self.decode_attn_backend
+                # print(f">>> [forward_decode] init_forward_metadata done", flush=True)
             else:
+                # print(f">>> [forward_decode] calling attn_backend.init_forward_metadata backend={type(self.attn_backend).__name__} batch_size={forward_batch.batch_size} seq_lens={forward_batch.seq_lens}", flush=True)
                 self.attn_backend.init_forward_metadata(forward_batch)
-        # FIXME: add pp_proxy_tensors arg to all models
+                # print(f">>> [forward_decode] init_forward_metadata done", flush=True)
+
         kwargs = {}
         if self.support_pp:
             kwargs["pp_proxy_tensors"] = pp_proxy_tensors
-        return self.model.forward(
+        # print(f">>> [forward_decode] calling model.forward kwargs_keys={list(kwargs.keys())}", flush=True)
+        ret = self.model.forward(
             forward_batch.input_ids,
             forward_batch.positions,
             forward_batch,
             **kwargs,
         )
+        # print(f">>> [forward_decode] model.forward returned type={type(ret).__name__}", flush=True)
+        return ret
 
     def forward_extend(
         self,
@@ -2083,8 +2115,22 @@ class ModelRunner:
         skip_attn_backend_init: bool = False,
         pp_proxy_tensors=None,
     ) -> LogitsProcessorOutput:
+        # print(f">>> [forward_extend] ENTERED skip_attn_backend_init={skip_attn_backend_init}", flush=True)
+        self._print_forward_batch("forward_extend", forward_batch)
+        # print(f">>> [forward_extend] input_ids shape={forward_batch.input_ids.shape} dtype={forward_batch.input_ids.dtype}", flush=True)
+        # print(f">>> [forward_extend] input_ids={forward_batch.input_ids}", flush=True)
+        # print(f">>> [forward_extend] positions shape={forward_batch.positions.shape} dtype={forward_batch.positions.dtype}", flush=True)
+        # print(f">>> [forward_extend] positions={forward_batch.positions}", flush=True)
+        # print(f">>> [forward_extend] seq_lens={forward_batch.seq_lens}", flush=True)
+        # print(f">>> [forward_extend] num_reqs={forward_batch.batch_size} forward_mode={forward_batch.forward_mode}", flush=True)
+        # print(f">>> [forward_extend] is_generation={self.is_generation} support_pp={self.support_pp}", flush=True)
+        # print(f">>> [forward_extend] input_embeds present={forward_batch.input_embeds is not None}", flush=True)
+        # print(f">>> [forward_extend] pp_proxy_tensors={pp_proxy_tensors is not None}", flush=True)
+
         if not skip_attn_backend_init:
+            # print(f">>> [forward_extend] calling attn_backend.init_forward_metadata backend={type(self.attn_backend).__name__} batch_size={forward_batch.batch_size} seq_lens={forward_batch.seq_lens} extend_prefix_lens={forward_batch.extend_prefix_lens} extend_seq_lens={forward_batch.extend_seq_lens}", flush=True)
             self.attn_backend.init_forward_metadata(forward_batch)
+            # print(f">>> [forward_extend] init_forward_metadata done", flush=True)
 
         kwargs = {}
         if self.support_pp:
@@ -2093,17 +2139,22 @@ class ModelRunner:
             kwargs["input_embeds"] = forward_batch.input_embeds.bfloat16()
         if not self.is_generation:
             kwargs["get_embedding"] = True
+        # print(f">>> [forward_extend] kwargs_keys={list(kwargs.keys())}", flush=True)
 
         if self.piecewise_cuda_graph_runner is not None:
             if self.piecewise_cuda_graph_runner.can_run(forward_batch):
+                # print(">>> [forward_extend] using piecewise_cuda_graph_runner.replay", flush=True)
                 return self.piecewise_cuda_graph_runner.replay(forward_batch, **kwargs)
 
-        return self.model.forward(
+        # print(">>> [forward_extend] calling model.forward", flush=True)
+        ret = self.model.forward(
             forward_batch.input_ids,
             forward_batch.positions,
             forward_batch,
             **kwargs,
         )
+        # print(f">>> [forward_extend] model.forward returned type={type(ret).__name__}", flush=True)
+        return ret
 
     def forward_idle(
         self, forward_batch: ForwardBatch, pp_proxy_tensors=None

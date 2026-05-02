@@ -227,3 +227,10 @@ def create_intel_xpu_backend(runner):
     from sglang.srt.layers.attention.xpu_backend import XPUAttentionBackend
 
     return XPUAttentionBackend(runner)
+
+
+@register_attention_backend("maple_fa")
+def create_maple_fa_backend(runner):
+    from sglang.srt.models.maple_fa.backend import MapleFABackend
+
+    return MapleFABackend(runner)

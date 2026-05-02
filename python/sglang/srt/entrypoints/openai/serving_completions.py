@@ -340,17 +340,25 @@ class OpenAIServingCompletion(OpenAIServingBase):
         raw_request: Request,
     ) -> Union[CompletionResponse, ErrorResponse, ORJSONResponse]:
         """Handle non-streaming completion request"""
+        # print(">>> ENTERED _handle_non_streaming_request", flush=True)
         try:
+            print("Tokenizer manager generating request", flush=True)
             generator = self.tokenizer_manager.generate_request(
                 adapted_request, raw_request
             )
             ret = await generator.__anext__()
+            # print(">>> GOT ret FROM generator", flush=True)
         except ValueError as e:
+            # print(f">>> ValueError: {e}", flush=True)
             return self.create_error_response(str(e))
+        except Exception as e:
+            # print(f">>> UNEXPECTED exception: {type(e).__name__}: {e}", flush=True)
+            raise
 
         if not isinstance(ret, list):
             ret = [ret]
 
+        print(f"handle non streaming req {request} {ret}", flush=True)
         response = self._build_completion_response(
             request,
             ret,

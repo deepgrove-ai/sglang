@@ -1,5 +1,7 @@
 python -m sglang.launch_server   --model-path /scratch/ansh/models/maple_reference_model  --host 0.0.0.0   --port 30000   --mem-fraction-static 0.7   --trust-remote-code
 
+python -m sglang.launch_server   --model-path /scratch/ansh/models/maple_reference_model  --host 0.0.0.0   --port 30000   --mem-fraction-static 0.7   --trust-remote-code --disable-cuda-graph --disable-radix-cache --disable-hybrid-swa-memory --attention-backend fa3 --skip-server-warmup --tp 1  2>&1 | tee out_sglang_logs.log
+
 export SGLANG_TORCH_PROFILER_DIR=/scratch/ansh/profiles/sglang
 mkdir -p /scratch/ansh/profiles/sglang
 
@@ -34,6 +36,7 @@ python -m sglang.bench_serving \
   --num-prompts 20 \
   --profile
 
+python compare_inference.py
 
 python compare_tensors.py --plot --plot-out kl_plot.png --rtol 0.01 --atol 0.01 --tokenizer /scratch/ansh/models/maple_reference_model  | tee out_comp_with_plots.log
 

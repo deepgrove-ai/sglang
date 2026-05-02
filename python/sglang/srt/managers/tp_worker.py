@@ -234,6 +234,21 @@ class TpModelWorker(BaseTpWorker):
             is_draft_model=is_draft_worker,
         )
 
+        # print(
+        #     f">>> [TpModelWorker.__init__] creating ModelRunner with args:\n"
+        #     f"      model_config={self.model_config}\n"
+        #     f"      mem_fraction_static={server_args.mem_fraction_static}\n"
+        #     f"      gpu_id={gpu_id}\n"
+        #     f"      tp_rank={tp_rank}  tp_size={server_args.tp_size}\n"
+        #     f"      moe_ep_rank={moe_ep_rank}  moe_ep_size={server_args.ep_size}\n"
+        #     f"      pp_rank={pp_rank}  pp_size={server_args.pp_size}\n"
+        #     f"      nccl_port={nccl_port}\n"
+        #     f"      dp_rank={dp_rank}\n"
+        #     f"      is_draft_worker={is_draft_worker}\n"
+        #     f"      req_to_token_pool={req_to_token_pool}\n"
+        #     f"      token_to_kv_pool_allocator={token_to_kv_pool_allocator}",
+        #     flush=True,
+        # )
         self._model_runner = ModelRunner(
             model_config=self.model_config,
             mem_fraction_static=server_args.mem_fraction_static,
@@ -349,18 +364,22 @@ class TpModelWorker(BaseTpWorker):
     ) -> GenerationBatchResult:
         # FIXME(lsyin): maybe remove skip_attn_backend_init in forward_batch_generation,
         #               which requires preparing replay to always be in this function
+        # print(f">>> [forward_batch_generation] ENTERED is_verify={is_verify} skip_attn_backend_init={skip_attn_backend_init}", flush=True)
 
         if model_worker_batch is not None:
             # update the consumer index of hicache to the running batch
             self.set_hicache_consumer(model_worker_batch.hicache_consumer_index)
-
+            # print(f">>> [forward_batch_generation] building ForwardBatch: forward_mode={model_worker_batch.forward_mode} num_seqs={len(model_worker_batch.seq_lens)} seq_lens={model_worker_batch.seq_lens} is_prefill_only={model_worker_batch.is_prefill_only}", flush=True)
             forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
+            # print(f">>> [forward_batch_generation] ForwardBatch built: forward_mode={forward_batch.forward_mode} can_run_dp_cuda_graph={forward_batch.can_run_dp_cuda_graph}", flush=True)
         else:
             # FIXME(lsyin): unify the interface of forward_batch
             assert forward_batch is not None
+            # print(f">>> [forward_batch_generation] reusing provided ForwardBatch: forward_mode={forward_batch.forward_mode}", flush=True)
 
         pp_proxy_tensors = None
         if not self.pp_group.is_first_rank:
+            # print(">>> [forward_batch_generation] non-first PP rank, receiving activations from previous stage", flush=True)
             pp_proxy_tensors = PPProxyTensors(
                 self.pp_group.recv_tensor_dict(
                     all_gather_group=self.get_attention_tp_group()
@@ -368,17 +387,20 @@ class TpModelWorker(BaseTpWorker):
             )
 
         if self.pp_group.is_last_rank:
+            # print(f">>> [forward_batch_generation] last PP rank, calling model_runner.forward (forward_mode={forward_batch.forward_mode})", flush=True)
             logits_output, can_run_cuda_graph = self.model_runner.forward(
                 forward_batch,
                 pp_proxy_tensors=pp_proxy_tensors,
                 skip_attn_backend_init=skip_attn_backend_init,
             )
+            # print(f">>> [forward_batch_generation] model_runner.forward done can_run_cuda_graph={can_run_cuda_graph} next_token_logits.shape={logits_output.next_token_logits.shape if logits_output.next_token_logits is not None else None}", flush=True)
             batch_result = GenerationBatchResult(
                 logits_output=logits_output,
                 can_run_cuda_graph=can_run_cuda_graph,
             )
 
             if is_verify:
+                # print(">>> [forward_batch_generation] is_verify=True, returning logits without sampling", flush=True)
                 # Skip sampling and return logits for target forward
                 return batch_result
 
@@ -387,6 +409,7 @@ class TpModelWorker(BaseTpWorker):
                 and not self.enable_spec
                 and model_worker_batch.sampling_info.grammars is not None
             ):
+                # print(">>> [forward_batch_generation] grammar constraints active, deferring sampling via delay_sample_func", flush=True)
 
                 def sample_batch_func():
                     batch_result.next_token_ids = self.model_runner.sample(
@@ -398,6 +421,7 @@ class TpModelWorker(BaseTpWorker):
                 return batch_result
 
             if model_worker_batch.is_prefill_only:
+                # print(">>> [forward_batch_generation] prefill-only request, skipping sampling, returning dummy token ids", flush=True)
                 # For prefill-only requests, create dummy token IDs on CPU
                 # The size should match the batch size (number of sequences), not total tokens
                 batch_result.next_token_ids = torch.zeros(
@@ -414,12 +438,15 @@ class TpModelWorker(BaseTpWorker):
                         logits_output, model_worker_batch
                     )
             else:
+                # print(">>> [forward_batch_generation] sampling next token ids", flush=True)
                 batch_result.next_token_ids = self.model_runner.sample(
                     logits_output, forward_batch
                 )
+                # print(f">>> [forward_batch_generation] sampled next_token_ids={batch_result.next_token_ids}", flush=True)
 
             return batch_result
         else:
+            # print(f">>> [forward_batch_generation] non-last PP rank, running forward and passing activations to next stage", flush=True)
             pp_proxy_tensors, can_run_cuda_graph = self.model_runner.forward(
                 forward_batch,
                 pp_proxy_tensors=pp_proxy_tensors,

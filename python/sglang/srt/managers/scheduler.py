@@ -965,6 +965,7 @@ class Scheduler(
             self.cur_batch = batch
 
             if batch:
+                print("GOT BATCH", batch, flush=True)
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
             else:
@@ -987,6 +988,7 @@ class Scheduler(
 
             batch_result = None
             if batch:
+                print("GOT BATCH", batch, flush=True)
                 batch_result = self.run_batch(batch)
                 self.result_queue.append((batch.copy(), batch_result))
 
@@ -1946,6 +1948,7 @@ class Scheduler(
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         """Run a batch."""
         self.forward_ct += 1
+        # print(f">>> [run_batch] ENTERED forward_ct={self.forward_ct} forward_mode={batch.forward_mode} num_reqs={len(batch.reqs)} is_generation={self.is_generation}", flush=True)
 
         # Whether to run the profiler
         self._profile_batch_predicate(batch)
@@ -1966,6 +1969,7 @@ class Scheduler(
             if self.enable_overlap or self.spec_algorithm.is_none():
                 # FIXME(lsyin): remove this if and finally unify the abstraction
                 batch_or_worker_batch = batch.get_model_worker_batch()
+            # print(f">>> [run_batch] enable_overlap={self.enable_overlap} enable_pdmux={self.enable_pdmux}", flush=True)
 
             if self.enable_overlap:
                 # FIXME: remove this assert
@@ -1980,13 +1984,16 @@ class Scheduler(
 
                 bs = len(model_worker_batch.seq_lens)
                 future_indices = self.future_map.alloc_future_indices(bs)
+                # print(f">>> [run_batch] overlap path: bs={bs} seq_lens={model_worker_batch.seq_lens}", flush=True)
 
                 with self.forward_stream_ctx:
                     self.forward_stream.wait_stream(self.default_stream)
                     self.future_map.resolve_future(model_worker_batch)
+                    # print(">>> [run_batch] launching forward_batch_generation (overlap)", flush=True)
                     batch_result = self.model_worker.forward_batch_generation(
                         model_worker_batch
                     )
+                    # print(f">>> [run_batch] forward_batch_generation returned delay_sample_func={batch_result.delay_sample_func is not None}", flush=True)
                     # FIXME(lsyin): maybe move this to forward_batch_generation
                     batch_result.copy_done = torch.get_device_module(
                         self.device
@@ -1994,11 +2001,14 @@ class Scheduler(
                     if batch_result.delay_sample_func is None:
                         self.future_map.store_to_map(future_indices, batch_result)
                         batch_result.copy_to_cpu()
+                        # print(">>> [run_batch] copy_to_cpu() queued (async D->H)", flush=True)
                     else:
                         batch_result.future_indices = future_indices
+                        # print(">>> [run_batch] delay_sample_func path, skipping copy_to_cpu", flush=True)
 
                 # FIXME(lsyin): move this assignment elsewhere
                 future_indices_or_next_token_ids = -future_indices.indices
+                # print(f">>> [run_batch] is_v2_eagle={batch.is_v2_eagle}", flush=True)
 
                 if batch.is_v2_eagle:
                     # FIXME(lsyin): tmp code for eagle v2
@@ -2018,14 +2028,17 @@ class Scheduler(
                     # Current implementation strictly synchronizes the seq_lens
                     batch.seq_lens = batch_result.next_draft_input.new_seq_lens
             elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
+                # print(">>> [run_batch] pdmux split-prefill path", flush=True)
                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)
                 future_indices_or_next_token_ids = batch_result.next_token_ids
             else:
+                # print(">>> [run_batch] synchronous forward path", flush=True)
                 batch_result = self.model_worker.forward_batch_generation(
                     batch_or_worker_batch
                 )
                 future_indices_or_next_token_ids = batch_result.next_token_ids
                 self.update_cache_from_scheduler(batch, batch_result)
+                # print(f">>> [run_batch] sync forward done next_token_ids={batch_result.next_token_ids}", flush=True)
 
             # NOTE: future_indices_or_next_token_ids is used in ScheduleBatch,
             #       which can probably be replaced by future_indices later [TODO(lsyin)].
@@ -2054,6 +2067,7 @@ class Scheduler(
             )
             ret = batch_result
         else:  # embedding or reward model
+            # print(">>> [run_batch] embedding/reward path", flush=True)
             model_worker_batch = batch.get_model_worker_batch()
             embeddings = self.tp_worker.forward_batch_embedding(model_worker_batch)
             ret = EmbeddingBatchResult(embeddings=embeddings)
@@ -2064,6 +2078,7 @@ class Scheduler(
             for req in batch.reqs:
                 req.time_stats.prefill_end_time = current_time
 
+        # print(f">>> [run_batch] RETURNING ret={type(ret).__name__}", flush=True)
         return ret
 
     def launch_batch_sample_if_needed(

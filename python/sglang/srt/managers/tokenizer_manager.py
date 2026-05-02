@@ -407,9 +407,11 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         request: Optional[fastapi.Request] = None,
     ):
+        # print(">>> [generate_request] ENTERED", flush=True)
         created_time = time.time()
         self.auto_create_handle_loop()
         obj.normalize_batch_and_arguments()
+        # print(f">>> [generate_request] normalized obj, is_single={obj.is_single}", flush=True)
 
         if request and "trace_context" in request.headers:
             trace_set_remote_propagate_context(request.headers["trace_context"])
@@ -426,24 +428,36 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 f"Receive: obj={dataclass_to_string_truncated(obj, max_length, skip_names=skip_names)}"
             )
 
+        # print(">>> [generate_request] waiting for pause_cond", flush=True)
         async with self.is_pause_cond:
             await self.is_pause_cond.wait_for(lambda: not self.is_pause)
+        # print(">>> [generate_request] past pause_cond", flush=True)
 
         async with self.model_update_lock.reader_lock:
+            # print(">>> [generate_request] acquired model_update_lock", flush=True)
             if self.server_args.enable_lora and obj.lora_path:
                 # Look up the LoRA ID from the registry and start tracking ongoing LoRA requests.
                 obj.lora_id = await self.lora_registry.acquire(obj.lora_path)
 
             if obj.is_single:
+                # print(">>> [generate_request] tokenizing single request", flush=True)
                 tokenized_obj = await self._tokenize_one_request(obj)
+                # print(f">>> [generate_request] tokenized, input_len={len(tokenized_obj.input_ids)}, toks={tokenized_obj}", flush=True)
                 state = self._send_one_request(obj, tokenized_obj, created_time)
+                # print(">>> [generate_request] sent to scheduler, waiting for response", flush=True)
                 async for response in self._wait_one_response(obj, state, request):
+                    # print(f">>> [generate_request] yielding response: {type(response).__name__}", flush=True)
                     yield response
+                # print(">>> [generate_request] _wait_one_response exhausted", flush=True)
             else:
+                # print(">>> [generate_request] handling batch request", flush=True)
                 async for response in self._handle_batch_request(
                     obj, request, created_time
                 ):
+                    # print(f">>> [generate_request] yielding batch response: {type(response).__name__}", flush=True)
                     yield response
+                # print(">>> [generate_request] batch request exhausted", flush=True)
+        # print(">>> [generate_request] DONE", flush=True)
 
     def _detect_input_format(
         self, texts: Union[str, List[str]], is_cross_encoder: bool

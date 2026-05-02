@@ -256,21 +256,44 @@ def plot_tokens(hf, sgl, step_keys, plot_out, tokenizer=None):
 
 
 # Exported so plot_range.py can import it without re-running main()
+# Numbers reflect forward-pass order within a step.
+# embed / causal_mask / rope_* are model-level (layer 00) and sort before layer checkpoints.
+# q_post_rope / k_post_rope only appear for sliding_attention layers.
 _CHECKPOINT_ORDER_DEF = {
-    "embed":                -1,
-    "post_input_norm":       0,
-    "q":                     1,
-    "k":                     2,
-    "v":                     3,
-    "attn_probs":            4,
-    "attn_pre_o":            5,
-    "o_proj":                6,
-    "post_attn":             7,
-    "post_post_attn_norm":   8,
-    "post_mlp":              9,
-    "post_residual":        10,
-    "final_norm":           11,
-    "logits":               12,
+    "embed":                  -5,
+    "causal_mask":            -4,
+    "rope_cos":               -3,
+    "rope_sin":               -2,
+    "layer_in":               -1,
+    "post_input_norm":         0,
+    "q_proj":                  1,
+    "k_proj":                  2,
+    "v_proj":                  3,
+    "q_post_norm":             4,
+    "k_post_norm":             5,
+    "q_post_rope":             6,
+    "k_post_rope":             7,
+    "q":                       8,
+    "k":                       9,
+    "v":                      10,
+    "attn_probs":             11,
+    "attn_pre_o":             12,
+    "o_proj":                 13,
+    "post_attn":              14,
+    "post_attn_residual":     15,
+    "post_post_attn_norm":    16,
+    "router_logits":          17,
+    "router_probs":           18,
+    # expert{i}_in  (sorted tokens per expert)  — dynamic, sub-sorted within 18 by expert index
+    # expert{i}_out (per-expert FFN output)      — dynamic, sub-sorted within 18 by expert index
+    "expert_weighted":        19,  # topk weights * expert outputs, before sum
+    "ffn_out":                20,
+    "post_mlp":               21,
+    "post_ffn_residual":      22,
+    "layer_out":              23,
+    "final_norm":             24,
+    "output_logits":          25,
+    "output_probs":           26,
 }
 
 
@@ -310,12 +333,16 @@ def main():
 
     # ── sort key helpers ──────────────────────────────────────────────────────
     _CHECKPOINT_ORDER = _CHECKPOINT_ORDER_DEF
-    _LOGIT_RE = re.compile(r"^s\d{3}_logits$")
+    _LOGIT_RE = re.compile(r"^s\d{3}_output_logits$")
+
+    _EXPERT_RE = re.compile(r"^expert(\d+)_(in|out)$")
 
     def _sort_key(k):
         # Formats:
-        #   s{step}_l{layer}_{name}   — per-layer checkpoints
-        #   s{step}_logits            — final logit dump
+        #   s{step}_l{layer}_{name}        — per-layer checkpoints
+        #   s{step}_l{layer}_expert{i}_in  — per-expert input
+        #   s{step}_l{layer}_expert{i}_out — per-expert output
+        #   s{step}_output_logits          — final logit dump
         parts = k.split("_", 2)
         step = int(parts[0][1:])
         if len(parts) >= 2 and parts[1].startswith("l") and parts[1][1:].isdigit():
@@ -324,14 +351,18 @@ def main():
         else:
             layer = 999
             name  = "_".join(parts[1:])
-        return (step, layer, _CHECKPOINT_ORDER.get(name, 99), name)
+        m = _EXPERT_RE.match(name)
+        if m:
+            # sort between router_probs (18) and expert_weighted (19) by expert index
+            sub = int(m.group(1)) * 2 + (1 if m.group(2) == "in" else 2)
+            return (step, layer, 18, sub, name)
+        return (step, layer, _CHECKPOINT_ORDER.get(name, 99), 0, name)
 
     hf_keys  = sorted(hf.keys(),  key=_sort_key)
     sgl_keys = sorted(sgl.keys(), key=_sort_key)
 
-    # Separate logit keys from hidden-state keys for independent handling
-    hf_hidden  = [k for k in hf_keys  if not _LOGIT_RE.match(k)]
-    sgl_hidden = [k for k in sgl_keys if not _LOGIT_RE.match(k)]
+    hf_hidden  = hf_keys
+    sgl_hidden = sgl_keys
     hf_logit   = {k for k in hf_keys  if _LOGIT_RE.match(k)}
     sgl_logit  = {k for k in sgl_keys if _LOGIT_RE.match(k)}
 
@@ -373,7 +404,6 @@ def main():
             stage = "_".join(parts[1:])
 
         if source != "common":
-            # Can't compute a diff — use tensor norm so the key still appears on plots.
             t = hf[key].float() if source == "hf_only" else sgl[key].float()
             if t.numel() > 0:
                 diff_data.append({
@@ -381,6 +411,8 @@ def main():
                     "stage": stage, "mean_diff": t.abs().mean().item(),
                     "key": key, "source": source,
                 })
+            label = "HF only " if source == "hf_only" else "SGL only"
+            print(f"  [{label}] {key:<40s}  norm={t.abs().mean().item():.4e}")
             continue
 
         h = hf[key].float()
@@ -397,9 +429,10 @@ def main():
                 status = "OK"
             else:
                 max_diff = abs_diff.max().item()
+                std_diff = abs_diff.std().item()
                 num_bad = (abs_diff > args.atol + args.rtol * s.abs()).sum().item()
                 status = (f"MISMATCH  max_abs={max_diff:.4e}  mean_abs={mean_diff:.4e}"
-                          f"  bad_elements={num_bad}/{h.numel()}")
+                          f"  std_abs={std_diff:.4e}  bad_elements={num_bad}/{h.numel()}")
             diff_data.append({
                 "x_pos": x_pos, "step": step_num, "layer": layer_num,
                 "stage": stage, "mean_diff": mean_diff,
@@ -433,7 +466,7 @@ def main():
     # ── logit KL summary + plot ───────────────────────────────────────────────
     common_logit = sorted(hf_logit & sgl_logit)
     if not common_logit:
-        print("\n[INFO] No logit keys found (s{step}_logits). Models need logit dumps.")
+        print("\n[INFO] No logit keys found (s{step}_output_logits). Models need logit dumps.")
     else:
         print(f"\n{'='*60}")
         print(f"  Logit keys: {common_logit}")
