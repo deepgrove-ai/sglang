@@ -26,6 +26,7 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead, VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.maple_fa.fa3_utils import flash_attention_forward as fa3_flash_attention_forward
 
 logger = logging.getLogger(__name__)
 
@@ -358,12 +359,70 @@ class MapleAttention(nn.Module):
         _sgl_dbg("k", k.reshape(num_tokens, -1))
         _sgl_dbg("v", v.reshape(num_tokens, -1))
 
-        # ── Attention (extend: standard flash_attn via MapleFABackend; decode: RadixAttention) ──
-        q_flat = q.reshape(num_tokens, -1)
-        k_flat = k.reshape(num_tokens, -1)
-        v_flat = v.reshape(num_tokens, -1)
+        # ── Attention — bypass RadixAttention, call flash_attention_forward identically to HF ──
+        # q/k/v are [num_tokens, n_heads, head_dim]; write K/V to pool then compute attention.
 
-        attn_output = self.attn(q_flat, k_flat, v_flat, forward_batch)
+        # Write K/V to pool (pool stores [pool_size, n_kv_heads, head_dim])
+        forward_batch.token_to_kv_pool.set_kv_buffer(
+            self.attn, forward_batch.out_cache_loc,
+            k.contiguous(), v.contiguous(),
+            self.attn.k_scale, self.attn.v_scale,
+        )
+
+        sliding_window = self.sliding_window  # None for full-attention layers
+
+        if forward_batch.forward_mode.is_decode():
+            # One new query token per sequence. Gather full K/V history from pool per sequence.
+            # q[i]: [n_heads, D] → unsqueeze → [1, n_heads, 1, D] = [B, H, S, D] for flash_attention_forward
+            # k_pool[tokens]: [kv_len, H_k, D] → permute → [1, H_k, kv_len, D]
+            k_pool = forward_batch.token_to_kv_pool.get_key_buffer(self.layer_idx)
+            v_pool = forward_batch.token_to_kv_pool.get_value_buffer(self.layer_idx)
+            req_to_token = forward_batch.req_to_token_pool.req_to_token
+            req_pool_indices = forward_batch.req_pool_indices
+            seq_lens = forward_batch.seq_lens
+
+            outputs = []
+            for i in range(num_tokens):  # num_tokens == batch_size during decode
+                kv_len = int(seq_lens[i])
+                tokens = req_to_token[int(req_pool_indices[i]), :kv_len]
+                q_i = q[i].unsqueeze(0).unsqueeze(2)                  # [1, n_heads, 1, D]
+                k_i = k_pool[tokens].unsqueeze(0).permute(0, 2, 1, 3) # [1, H_k, kv_len, D]
+                v_i = v_pool[tokens].unsqueeze(0).permute(0, 2, 1, 3) # [1, H_k, kv_len, D]
+                out_i, _ = fa3_flash_attention_forward(
+                    self, q_i, k_i, v_i,
+                    attention_mask=None,
+                    scaling=self.scaling,
+                    sliding_window=sliding_window,
+                )
+                outputs.append(out_i.view(self.num_heads * self.head_dim))
+            attn_output = torch.stack(outputs)  # [batch_size, num_heads * head_dim]
+
+        else:
+            # Extend (prefill): flat [num_tokens, H, D] → [1, H, num_tokens, D] = [B, H, S, D].
+            # Pass cu_seqlens via kwargs to trigger the varlen branch inside _flash_attention_forward,
+            # identical to HF's path after _upad_input strips padding.
+            extend_seq_lens = forward_batch.extend_seq_lens
+            cu_seqlens = F.pad(extend_seq_lens.cumsum(0, dtype=torch.int32), (1, 0))
+            max_seqlen = int(extend_seq_lens.max())
+            dummy_pos = torch.zeros(1, dtype=torch.long, device=q.device)
+
+            q3 = q.view(1, num_tokens, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
+            k3 = k.view(1, num_tokens, self.num_key_value_heads, self.head_dim).transpose(1, 2).contiguous()
+            v3 = v.view(1, num_tokens, self.num_key_value_heads, self.head_dim).transpose(1, 2).contiguous()
+
+            out, _ = fa3_flash_attention_forward(
+                self, q3, k3, v3,
+                attention_mask=None,
+                scaling=self.scaling,
+                sliding_window=sliding_window,
+                position_ids=dummy_pos,
+                max_length_q=max_seqlen,
+                max_length_k=max_seqlen,
+                cu_seq_lens_q=cu_seqlens,
+                cu_seq_lens_k=cu_seqlens,
+            )
+            # out: [1, num_tokens, n_heads, head_dim]
+            attn_output = out.reshape(num_tokens, self.num_heads * self.head_dim)
         _sgl_dbg("attn_pre_o", attn_output)
 
         # ── Output projection (identical to HF) ───────────────────────────────

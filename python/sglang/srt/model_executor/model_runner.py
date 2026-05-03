@@ -2076,7 +2076,7 @@ class ModelRunner:
         pp_proxy_tensors=None,
     ) -> LogitsProcessorOutput:
         # print(f">>> [forward_decode] ENTERED skip_attn_backend_init={skip_attn_backend_init}", flush=True)
-        self._print_forward_batch("forward_decode", forward_batch)
+        # self._print_forward_batch("forward_decode", forward_batch)
         # print(f">>> [forward_decode] input_ids shape={forward_batch.input_ids.shape} dtype={forward_batch.input_ids.dtype}", flush=True)
         # print(f">>> [forward_decode] input_ids={forward_batch.input_ids}", flush=True)
         # print(f">>> [forward_decode] positions shape={forward_batch.positions.shape} dtype={forward_batch.positions.dtype}", flush=True)
@@ -2116,7 +2116,7 @@ class ModelRunner:
         pp_proxy_tensors=None,
     ) -> LogitsProcessorOutput:
         # print(f">>> [forward_extend] ENTERED skip_attn_backend_init={skip_attn_backend_init}", flush=True)
-        self._print_forward_batch("forward_extend", forward_batch)
+        # self._print_forward_batch("forward_extend", forward_batch)
         # print(f">>> [forward_extend] input_ids shape={forward_batch.input_ids.shape} dtype={forward_batch.input_ids.dtype}", flush=True)
         # print(f">>> [forward_extend] input_ids={forward_batch.input_ids}", flush=True)
         # print(f">>> [forward_extend] positions shape={forward_batch.positions.shape} dtype={forward_batch.positions.dtype}", flush=True)
