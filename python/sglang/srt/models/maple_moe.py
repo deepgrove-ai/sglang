@@ -326,12 +326,13 @@ class MapleAttention(nn.Module):
         # ── QKV (identical fused computation as HF) ───────────────────────────
         qkv_weight = torch.cat([self.q_proj.weight, self.k_proj.weight, self.v_proj.weight], dim=0)
         out_qkv = F.linear(hidden_states, qkv_weight)
-
-        # split into per-head tensors: (num_tokens, num_heads, head_dim)
+        cos, sin, _ = position_embeddings
         qkv = out_qkv.view(num_tokens, self.num_heads + 2 * self.num_key_value_heads, self.head_dim)
+
         q, k, v = qkv.split(
             [self.num_heads, self.num_key_value_heads, self.num_key_value_heads], dim=-2
         )
+        # print(q.shape, k.shape, v.shape)
 
         # ── raw projection outputs (before norm / RoPE) ───────────────────────
         _sgl_dbg("q_proj", q.reshape(num_tokens, -1))
@@ -346,7 +347,6 @@ class MapleAttention(nn.Module):
 
         # ── RoPE — only for sliding_attention layers (identical to HF) ────────
         if self.sliding_window is not None and position_embeddings is not None:
-            cos, sin, _ = position_embeddings
             cos = cos.squeeze(0)   # (num_tokens, head_dim)
             sin = sin.squeeze(0)
             q, k = apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1)
@@ -362,6 +362,7 @@ class MapleAttention(nn.Module):
         q_flat = q.reshape(num_tokens, -1)
         k_flat = k.reshape(num_tokens, -1)
         v_flat = v.reshape(num_tokens, -1)
+
         attn_output = self.attn(q_flat, k_flat, v_flat, forward_batch)
         _sgl_dbg("attn_pre_o", attn_output)
 
