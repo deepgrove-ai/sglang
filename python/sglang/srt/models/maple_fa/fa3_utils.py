@@ -1,6 +1,6 @@
 import inspect
 import os
-from typing import Optional, Tuple, TypedDict
+from typing import Optional, TypedDict
 
 import torch
 import torch.nn.functional as F
@@ -204,68 +204,3 @@ class FlashAttentionKwargs(TypedDict, total=False):
     cu_seq_lens_k: Optional[torch.LongTensor]
     max_length_q: Optional[int]
     max_length_k: Optional[int]
-
-
-_use_top_left_mask = False
-
-
-def flash_attention_forward(
-    module: torch.nn.Module,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    attention_mask: Optional[torch.Tensor],
-    dropout: float = 0.0,
-    scaling: Optional[float] = None,
-    sliding_window: Optional[int] = None,
-    softcap: Optional[float] = None,
-    **kwargs,
-) -> Tuple[torch.Tensor, None]:
-    # Inputs arrive as (B, n_heads, S, D); transpose to (B, S, n_heads, D) for flash_attn.
-    query = query.transpose(1, 2)
-    key = key.transpose(1, 2)
-    value = value.transpose(1, 2)
-    seq_len = query.shape[1]
-
-    target_dtype = None
-    if query.dtype == torch.float32:
-        if torch.is_autocast_enabled():
-            target_dtype = torch.get_autocast_gpu_dtype()
-        elif hasattr(module.config, "_pre_quantization_dtype"):
-            target_dtype = module.config._pre_quantization_dtype
-        else:
-            target_dtype = next(layer for layer in module.modules() if isinstance(layer, torch.nn.Linear)).weight.dtype
-
-    kwargs.pop("is_causal", None)
-
-    _fa_kwargs = dict(
-        is_causal=module.is_causal,
-        dropout=dropout,
-        softmax_scale=scaling,
-        sliding_window=sliding_window,
-        softcap=softcap,
-        use_top_left_mask=_use_top_left_mask,
-        target_dtype=target_dtype,
-        **kwargs,
-    )
-
-    if attention_mask is not None and seq_len == 1:
-        seqlens = attention_mask.sum(dim=-1, dtype=torch.int32)
-        outputs = []
-        for b in range(query.shape[0]):
-            valid_len = int(seqlens[b].item())
-            outputs.append(_flash_attention_forward(
-                query[b : b + 1],
-                key[b : b + 1, -valid_len:],
-                value[b : b + 1, -valid_len:],
-                None,
-                query_length=1,
-                **_fa_kwargs,
-            ))
-        attn_output = torch.cat(outputs, dim=0)
-    else:
-        attn_output = _flash_attention_forward(
-            query, key, value, attention_mask, query_length=seq_len, **_fa_kwargs
-        )
-
-    return attn_output, None

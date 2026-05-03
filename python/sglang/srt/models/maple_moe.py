@@ -26,7 +26,7 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead, VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.models.maple_fa.fa3_utils import flash_attention_forward as fa3_flash_attention_forward
+from sglang.srt.models.maple_fa.fa3 import flash_attention_forward
 
 logger = logging.getLogger(__name__)
 
@@ -221,11 +221,11 @@ class MapleSparseMoeBlock(nn.Module):
 
         bsz, seq_len, h = hidden_states.shape
         topk_idx, topk_weight, _router_logits = self.gate(hidden_states)
-        _sgl_dbg("router_logits", _router_logits)
-        _sgl_dbg("router_probs", topk_weight)
+        # _sgl_dbg("router_logits", _router_logits)
+        # _sgl_dbg("router_probs", topk_weight)
         hidden_states = hidden_states.view(-1, h)
         y = self.moe_infer(hidden_states, topk_idx, topk_weight).view(bsz, seq_len, h)
-        _sgl_dbg("ffn_out", y.reshape(-1, y.shape[-1]))
+        # _sgl_dbg("ffn_out", y.reshape(-1, y.shape[-1]))
 
         if is_2d:
             y = y.squeeze(0)
@@ -241,18 +241,18 @@ class MapleSparseMoeBlock(nn.Module):
         tokens_per_expert = tokens_per_expert.cpu().numpy()
         outputs = []
         start_idx = 0
-        _pfx = f"s{_SGL_STEP[0]:03d}_l{_SGL_LAYER[0]:02d}" if _LOGIT_DEBUG else None
+        # _pfx = f"s{_SGL_STEP[0]:03d}_l{_SGL_LAYER[0]:02d}" if _LOGIT_DEBUG else None
         for i, num_tokens in enumerate(tokens_per_expert):
             end_idx = start_idx + num_tokens
             if num_tokens == 0:
                 continue
             expert = self.experts[i]
             tokens_for_this_expert = sorted_tokens[start_idx:end_idx]
-            if _LOGIT_DEBUG:
-                _SGL_DBG[f"{_pfx}_expert{i:03d}_in"] = tokens_for_this_expert.detach().cpu().float().clone()
+            # if _LOGIT_DEBUG:
+            #     _SGL_DBG[f"{_pfx}_expert{i:03d}_in"] = tokens_for_this_expert.detach().cpu().float().clone()
             expert_out = expert(tokens_for_this_expert)
-            if _LOGIT_DEBUG:
-                _SGL_DBG[f"{_pfx}_expert{i:03d}_out"] = expert_out.detach().cpu().float().clone()
+            # if _LOGIT_DEBUG:
+            #     _SGL_DBG[f"{_pfx}_expert{i:03d}_out"] = expert_out.detach().cpu().float().clone()
             outputs.append(expert_out.to(x.device))
             start_idx = end_idx
 
@@ -264,8 +264,8 @@ class MapleSparseMoeBlock(nn.Module):
             .type(topk_weight.dtype)
             .mul_(topk_weight.unsqueeze(dim=-1))
         )
-        if _LOGIT_DEBUG:
-            _SGL_DBG[f"{_pfx}_expert_weighted"] = weighted.detach().cpu().float().clone()
+        # if _LOGIT_DEBUG:
+        #     _SGL_DBG[f"{_pfx}_expert_weighted"] = weighted.detach().cpu().float().clone()
         final_out = weighted.sum(dim=1).type(new_x.dtype)
         return final_out
 
@@ -330,104 +330,103 @@ class MapleAttention(nn.Module):
         cos, sin, _ = position_embeddings
         qkv = out_qkv.view(num_tokens, self.num_heads + 2 * self.num_key_value_heads, self.head_dim)
 
-        q, k, v = qkv.split(
+        query_states, key_states, value_states = qkv.split(
             [self.num_heads, self.num_key_value_heads, self.num_key_value_heads], dim=-2
         )
-        # print(q.shape, k.shape, v.shape)
-
-        # ── raw projection outputs (before norm / RoPE) ───────────────────────
-        _sgl_dbg("q_proj", q.reshape(num_tokens, -1))
-        _sgl_dbg("k_proj", k.reshape(num_tokens, -1))
-        _sgl_dbg("v_proj", v.reshape(num_tokens, -1))
 
         # ── Q/K norm (per-head, identical to HF) ──────────────────────────────
-        q = self.q_norm(q)
-        k = self.k_norm(k)
-        _sgl_dbg("q_post_norm", q.reshape(num_tokens, -1))
-        _sgl_dbg("k_post_norm", k.reshape(num_tokens, -1))
+        query_states = self.q_norm(query_states)
+        key_states = self.k_norm(key_states)
+        # _sgl_dbg("q_post_norm", query_states.reshape(num_tokens, -1))
+        # _sgl_dbg("k_post_norm", key_states.reshape(num_tokens, -1))
 
         # ── RoPE — only for sliding_attention layers (identical to HF) ────────
         if self.sliding_window is not None and position_embeddings is not None:
-            cos = cos.squeeze(0)   # (num_tokens, head_dim)
+            cos = cos.squeeze(0)
             sin = sin.squeeze(0)
-            q, k = apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1)
-            _sgl_dbg("q_post_rope", q.reshape(num_tokens, -1))
-            _sgl_dbg("k_post_rope", k.reshape(num_tokens, -1))
+            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, unsqueeze_dim=1)
+            # _sgl_dbg("q_post_rope", query_states.reshape(num_tokens, -1))
+            # _sgl_dbg("k_post_rope", key_states.reshape(num_tokens, -1))
 
-        # ── Debug dumps ────────────────────────────────────────────────────────
-        _sgl_dbg("q", q.reshape(num_tokens, -1))
-        _sgl_dbg("k", k.reshape(num_tokens, -1))
-        _sgl_dbg("v", v.reshape(num_tokens, -1))
+        # _sgl_dbg("q", query_states.reshape(num_tokens, -1))
+        # _sgl_dbg("k", key_states.reshape(num_tokens, -1))
+        # _sgl_dbg("v", value_states.reshape(num_tokens, -1))
 
-        # ── Attention — bypass RadixAttention, call flash_attention_forward identically to HF ──
-        # q/k/v are [num_tokens, n_heads, head_dim]; write K/V to pool then compute attention.
+        # ── Attention — write K/V to pool, then prepare tensors for flash_attention_forward ──
+        # query/key/value_states: [num_tokens, n_heads, head_dim]
 
-        # Write K/V to pool (pool stores [pool_size, n_kv_heads, head_dim])
+        # Write new K/V to pool (pool stores [pool_size, n_kv_heads, head_dim])
         forward_batch.token_to_kv_pool.set_kv_buffer(
             self.attn, forward_batch.out_cache_loc,
-            k.contiguous(), v.contiguous(),
+            key_states.contiguous(), value_states.contiguous(),
             self.attn.k_scale, self.attn.v_scale,
         )
 
-        sliding_window = self.sliding_window  # None for full-attention layers
-
+        # Decode: load the full KV history (including the token just written) from the
+        # pool into left-padded [B, H, max_kv_len, D] tensors + build attention_mask.
+        # flash_attention_forward's decode loop will slice key[b, -valid_len:] to drop padding.
+        # Extend: reshape packed tokens into [1, H, num_tokens, D] and pass varlen cu_seqlens.
+        attention_mask = None
+        fa_kwargs: dict = {}
         if forward_batch.forward_mode.is_decode():
-            # One new query token per sequence. Gather full K/V history from pool per sequence.
-            # q[i]: [n_heads, D] → unsqueeze → [1, n_heads, 1, D] = [B, H, S, D] for flash_attention_forward
-            # k_pool[tokens]: [kv_len, H_k, D] → permute → [1, H_k, kv_len, D]
-            k_pool = forward_batch.token_to_kv_pool.get_key_buffer(self.layer_idx)
-            v_pool = forward_batch.token_to_kv_pool.get_value_buffer(self.layer_idx)
+            key_cache = forward_batch.token_to_kv_pool.get_key_buffer(self.layer_idx)
+            value_cache = forward_batch.token_to_kv_pool.get_value_buffer(self.layer_idx)
             req_to_token = forward_batch.req_to_token_pool.req_to_token
             req_pool_indices = forward_batch.req_pool_indices
             seq_lens = forward_batch.seq_lens
+            max_kv_len = int(seq_lens.max())
 
-            outputs = []
-            for i in range(num_tokens):  # num_tokens == batch_size during decode
+            key_padded = key_cache.new_zeros(num_tokens, max_kv_len, self.num_key_value_heads, self.head_dim)
+            val_padded = value_cache.new_zeros(num_tokens, max_kv_len, self.num_key_value_heads, self.head_dim)
+            attention_mask = torch.zeros(num_tokens, max_kv_len, dtype=torch.int32, device=query_states.device)
+            for i in range(num_tokens):
                 kv_len = int(seq_lens[i])
-                tokens = req_to_token[int(req_pool_indices[i]), :kv_len]
-                q_i = q[i].unsqueeze(0).unsqueeze(2)                  # [1, n_heads, 1, D]
-                k_i = k_pool[tokens].unsqueeze(0).permute(0, 2, 1, 3) # [1, H_k, kv_len, D]
-                v_i = v_pool[tokens].unsqueeze(0).permute(0, 2, 1, 3) # [1, H_k, kv_len, D]
-                out_i, _ = fa3_flash_attention_forward(
-                    self, q_i, k_i, v_i,
-                    attention_mask=None,
-                    scaling=self.scaling,
-                    sliding_window=sliding_window,
-                )
-                outputs.append(out_i.view(self.num_heads * self.head_dim))
-            attn_output = torch.stack(outputs)  # [batch_size, num_heads * head_dim]
+                token_indices = req_to_token[int(req_pool_indices[i]), :kv_len]
+                key_padded[i, max_kv_len - kv_len:] = key_cache[token_indices]
+                val_padded[i, max_kv_len - kv_len:] = value_cache[token_indices]
+                attention_mask[i, max_kv_len - kv_len:] = 1
 
+            query_states = query_states.unsqueeze(2)            # [B, H_q, 1,          D]
+            key_states   = key_padded.transpose(1, 2)           # [B, H_k, max_kv_len, D]
+            value_states = val_padded.transpose(1, 2)
         else:
-            # Extend (prefill): flat [num_tokens, H, D] → [1, H, num_tokens, D] = [B, H, S, D].
-            # Pass cu_seqlens via kwargs to trigger the varlen branch inside _flash_attention_forward,
-            # identical to HF's path after _upad_input strips padding.
             extend_seq_lens = forward_batch.extend_seq_lens
             cu_seqlens = F.pad(extend_seq_lens.cumsum(0, dtype=torch.int32), (1, 0))
             max_seqlen = int(extend_seq_lens.max())
-            dummy_pos = torch.zeros(1, dtype=torch.long, device=q.device)
 
-            q3 = q.view(1, num_tokens, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
-            k3 = k.view(1, num_tokens, self.num_key_value_heads, self.head_dim).transpose(1, 2).contiguous()
-            v3 = v.view(1, num_tokens, self.num_key_value_heads, self.head_dim).transpose(1, 2).contiguous()
-
-            out, _ = fa3_flash_attention_forward(
-                self, q3, k3, v3,
-                attention_mask=None,
-                scaling=self.scaling,
-                sliding_window=sliding_window,
-                position_ids=dummy_pos,
+            query_states = query_states.view(1, num_tokens, self.num_heads,           self.head_dim).transpose(1, 2).contiguous()
+            key_states   = key_states  .view(1, num_tokens, self.num_key_value_heads, self.head_dim).transpose(1, 2).contiguous()
+            value_states = value_states.view(1, num_tokens, self.num_key_value_heads, self.head_dim).transpose(1, 2).contiguous()
+            fa_kwargs = dict(
+                position_ids=torch.zeros(1, dtype=torch.long, device=query_states.device),
                 max_length_q=max_seqlen,
                 max_length_k=max_seqlen,
                 cu_seq_lens_q=cu_seqlens,
                 cu_seq_lens_k=cu_seqlens,
             )
-            # out: [1, num_tokens, n_heads, head_dim]
-            attn_output = out.reshape(num_tokens, self.num_heads * self.head_dim)
-        _sgl_dbg("attn_pre_o", attn_output)
+
+        # with torch.no_grad():
+        #     _scale  = self.head_dim ** -0.5
+        #     _q_last = query_states[:, :, -1:, :]
+        #     _ngrp   = self.num_heads // self.num_key_value_heads
+        #     _k_exp  = key_states.repeat_interleave(_ngrp, dim=1)
+        #     _scores = torch.matmul(_q_last.float(), _k_exp.float().transpose(-1, -2)) * _scale
+        #     _aprobs = torch.softmax(_scores, dim=-1)[0, :, 0, :].mean(0)
+        # _sgl_dbg("attn_probs", _aprobs.unsqueeze(0))
+
+        attn_output, _ = flash_attention_forward(
+            self, query_states, key_states, value_states,
+            attention_mask=attention_mask,
+            scaling=self.scaling,
+            sliding_window=self.sliding_window,
+            **fa_kwargs,
+        )
+        attn_output = attn_output.reshape(num_tokens, self.num_heads * self.head_dim)
+        # _sgl_dbg("attn_pre_o", attn_output)
 
         # ── Output projection (identical to HF) ───────────────────────────────
         attn_output = F.linear(attn_output, self.o_proj.weight)
-        _sgl_dbg("o_proj", attn_output)
+        # _sgl_dbg("o_proj", attn_output)
 
         return attn_output
 
@@ -455,31 +454,29 @@ class MapleDecoderLayer(nn.Module):
     ) -> torch.Tensor:
         _SGL_LAYER[0] = self.layer_idx
         initial_dtype = hidden_states.dtype
-        _sgl_dbg("layer_in", hidden_states)
 
         # ── Attention block (mirrors HF exactly) ──────────────────────────────
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        _sgl_dbg("post_input_norm", hidden_states)
+        # _sgl_dbg("post_input_norm", hidden_states)
 
         hidden_states = self.self_attn(positions, hidden_states, forward_batch, position_embeddings)
-        _sgl_dbg("post_attn", hidden_states)
+        # _sgl_dbg("post_attn", hidden_states)
         # hidden_states = residual + hidden_states.to(residual.device)
         hidden_states = (residual.to(torch.float32) + hidden_states.to(torch.float32)).to(initial_dtype)
-        _sgl_dbg("post_attn_residual", hidden_states)
+        # _sgl_dbg("post_attn_residual", hidden_states)
 
         # ── MLP block (mirrors HF exactly) ────────────────────────────────────
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        _sgl_dbg("post_post_attn_norm", hidden_states)
+        # _sgl_dbg("post_post_attn_norm", hidden_states)
 
         hidden_states = self.mlp(hidden_states)
-        _sgl_dbg("post_mlp", hidden_states)
+        # _sgl_dbg("post_mlp", hidden_states)
 
         # hidden_states = residual + hidden_states.to(residual.device)
         hidden_states = (residual.to(torch.float32) + hidden_states.to(torch.float32)).to(initial_dtype)
-        _sgl_dbg("post_ffn_residual", hidden_states)
-        _sgl_dbg("layer_out", hidden_states)
+        # _sgl_dbg("post_ffn_residual", hidden_states)
 
         return hidden_states
 
@@ -517,20 +514,21 @@ class MapleModel(nn.Module):
             hidden_states = input_embeds
 
         _SGL_LAYER[0] = 0
-        _sgl_dbg("embed", hidden_states)
+        # _sgl_dbg("embed", hidden_states)
+        # _sgl_dbg("causal_mask", torch.zeros(1, 1, device=hidden_states.device))
 
         # Compute RoPE cos/sin once; sliding-window layers apply it, NoPe layers ignore it.
         # positions is (num_tokens,); rotary_emb expects (batch, seq) → unsqueeze to (1, T).
         position_embeddings = self.rotary_emb(hidden_states, positions.unsqueeze(0))
-        _sgl_dbg("rope_cos", position_embeddings[0].reshape(-1, position_embeddings[0].shape[-1]))
-        _sgl_dbg("rope_sin", position_embeddings[1].reshape(-1, position_embeddings[1].shape[-1]))
+        # _sgl_dbg("rope_cos", position_embeddings[0].reshape(-1, position_embeddings[0].shape[-1]))
+        # _sgl_dbg("rope_sin", position_embeddings[1].reshape(-1, position_embeddings[1].shape[-1]))
 
         for layer in self.layers:
             hidden_states = layer(positions, hidden_states, forward_batch, position_embeddings)
 
         hidden_states = self.norm(hidden_states)
         _SGL_LAYER[0] = 99
-        _sgl_dbg("final_norm", hidden_states)
+        # _sgl_dbg("final_norm", hidden_states)
 
         return hidden_states
 

@@ -227,13 +227,11 @@ def flash_attention_forward(
     softcap: Optional[float] = None,
     **kwargs,
 ) -> Tuple[torch.Tensor, None]:
-    # Contract matches veomni.models.transformers.qwen3_moe.fa3: Q/K/V are (B, S, H, D); see MapleAttention.
-    seq_len = query.shape[1]
-
-    # FA2 uses non-transposed inputs
+    # Inputs arrive as (B, n_heads, S, D) from MapleAttention; transpose to (B, S, n_heads, D) for flash_attn.
     query = query.transpose(1, 2)
     key = key.transpose(1, 2)
     value = value.transpose(1, 2)
+    seq_len = query.shape[1]
 
     # In PEFT, usually we cast the layer norms in float32 for training stability reasons
     # therefore the input hidden states gets silently casted in float32. Hence, we need
@@ -253,12 +251,7 @@ def flash_attention_forward(
     # FA2 always relies on the value set in the module, so remove it if present in kwargs to avoid passing it twice
     kwargs.pop("is_causal", None)
 
-    attn_output = _flash_attention_forward(
-        query,
-        key,
-        value,
-        attention_mask,
-        query_length=seq_len,
+    _fa_kwargs = dict(
         is_causal=module.is_causal,
         dropout=dropout,
         softmax_scale=scaling,
@@ -268,5 +261,27 @@ def flash_attention_forward(
         target_dtype=target_dtype,
         **kwargs,
     )
+
+    if attention_mask is not None and seq_len == 1:
+        # FA3 varlen is incompatible with decode (seq_len=1, large K). Process
+        # each sequence independently, slicing K/V to valid tokens so padding
+        # is excluded without going through flash_attn_varlen_func.
+        seqlens = attention_mask.sum(dim=-1, dtype=torch.int32)
+        outputs = []
+        for b in range(query.shape[0]):
+            valid_len = int(seqlens[b].item())
+            outputs.append(_flash_attention_forward(
+                query[b : b + 1],
+                key[b : b + 1, -valid_len:],
+                value[b : b + 1, -valid_len:],
+                None,
+                query_length=1,
+                **_fa_kwargs,
+            ))
+        attn_output = torch.cat(outputs, dim=0)
+    else:
+        attn_output = _flash_attention_forward(
+            query, key, value, attention_mask, query_length=seq_len, **_fa_kwargs
+        )
 
     return attn_output, None
