@@ -272,8 +272,8 @@ def flash_attention_forward(
             valid_len = int(seqlens[b].item())
             outputs.append(_flash_attention_forward(
                 query[b : b + 1],
-                key[b : b + 1, -valid_len:],
-                value[b : b + 1, -valid_len:],
+                key[b : b + 1, :valid_len],
+                value[b : b + 1, :valid_len],
                 None,
                 query_length=1,
                 **_fa_kwargs,

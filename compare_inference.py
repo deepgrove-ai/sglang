@@ -17,7 +17,7 @@ PROMPT = "The capital of France is"
 PROMPTS = [
     "What's your name",
     "My name is",
-    "I love candy"
+    "I love candy at"
 ]
 MAX_NEW_TOKENS = 128
 

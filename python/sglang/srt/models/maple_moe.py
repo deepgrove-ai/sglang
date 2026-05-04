@@ -241,18 +241,13 @@ class MapleSparseMoeBlock(nn.Module):
         tokens_per_expert = tokens_per_expert.cpu().numpy()
         outputs = []
         start_idx = 0
-        # _pfx = f"s{_SGL_STEP[0]:03d}_l{_SGL_LAYER[0]:02d}" if _LOGIT_DEBUG else None
         for i, num_tokens in enumerate(tokens_per_expert):
             end_idx = start_idx + num_tokens
             if num_tokens == 0:
                 continue
             expert = self.experts[i]
             tokens_for_this_expert = sorted_tokens[start_idx:end_idx]
-            # if _LOGIT_DEBUG:
-            #     _SGL_DBG[f"{_pfx}_expert{i:03d}_in"] = tokens_for_this_expert.detach().cpu().float().clone()
             expert_out = expert(tokens_for_this_expert)
-            # if _LOGIT_DEBUG:
-            #     _SGL_DBG[f"{_pfx}_expert{i:03d}_out"] = expert_out.detach().cpu().float().clone()
             outputs.append(expert_out.to(x.device))
             start_idx = end_idx
 
@@ -264,8 +259,6 @@ class MapleSparseMoeBlock(nn.Module):
             .type(topk_weight.dtype)
             .mul_(topk_weight.unsqueeze(dim=-1))
         )
-        # if _LOGIT_DEBUG:
-        #     _SGL_DBG[f"{_pfx}_expert_weighted"] = weighted.detach().cpu().float().clone()
         final_out = weighted.sum(dim=1).type(new_x.dtype)
         return final_out
 
@@ -374,17 +367,14 @@ class MapleAttention(nn.Module):
             req_to_token = forward_batch.req_to_token_pool.req_to_token
             req_pool_indices = forward_batch.req_pool_indices
             seq_lens = forward_batch.seq_lens
-            max_kv_len = int(seq_lens.max())
 
-            key_padded = key_cache.new_zeros(num_tokens, max_kv_len, self.num_key_value_heads, self.head_dim)
-            val_padded = value_cache.new_zeros(num_tokens, max_kv_len, self.num_key_value_heads, self.head_dim)
-            attention_mask = torch.zeros(num_tokens, max_kv_len, dtype=torch.int32, device=query_states.device)
-            for i in range(num_tokens):
-                kv_len = int(seq_lens[i])
-                token_indices = req_to_token[int(req_pool_indices[i]), :kv_len]
-                key_padded[i, max_kv_len - kv_len:] = key_cache[token_indices]
-                val_padded[i, max_kv_len - kv_len:] = value_cache[token_indices]
-                attention_mask[i, max_kv_len - kv_len:] = 1
+            max_kv_len = self.config.max_kv_len
+
+            token_indices = req_to_token[req_pool_indices]                              # (B, max_kv_len)
+            key_padded = key_cache[token_indices]                                        # (B, max_kv_len, H_k, D)
+            val_padded = value_cache[token_indices]                                      # (B, max_kv_len, H_k, D)
+            positions = torch.arange(max_kv_len, device=query_states.device).unsqueeze(0)  # (1, max_kv_len)
+            attention_mask = (positions < seq_lens.unsqueeze(1)).to(torch.int32)        # (B, max_kv_len)
 
             query_states = query_states.unsqueeze(2)            # [B, H_q, 1,          D]
             key_states   = key_padded.transpose(1, 2)           # [B, H_k, max_kv_len, D]

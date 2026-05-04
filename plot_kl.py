@@ -68,7 +68,7 @@ def get_hf_data(model_path: str, prompts: list[str], max_new_tokens: int):
     batch_size = len(prompts)
     generated_ids = out.sequences[:, prompt_len:].tolist()
 
-    all_probs, all_lps = [], []
+    all_probs, all_lps, all_gen_ids = [], [], []
     for b in range(batch_size):
         probs_b, lps_b = [], []
         for t, score in enumerate(out.scores):
@@ -78,21 +78,22 @@ def get_hf_data(model_path: str, prompts: list[str], max_new_tokens: int):
             lps_b.append(lp[generated_ids[b][t]].item())
         all_probs.append(probs_b)
         all_lps.append(lps_b)
+        all_gen_ids.append(generated_ids[b])
 
-    return all_probs, all_lps, tok
+    return all_probs, all_lps, all_gen_ids, tok
 
 
-def get_sglang_data(model_path: str, prompt: str, max_new_tokens: int, top_k: int):
-    client = openai.Client(base_url="http://127.0.0.1:30000/v1", api_key="None")
+def get_sglang_data(model_path: str, prompts: list[str], max_new_tokens: int, top_k: int):
+    client = openai.Client(base_url="http://127.0.0.1:30000/v1", api_key="None", timeout=7200)
     resp = client.completions.create(
         model=model_path,
-        prompt=prompt,
+        prompt=prompts,
         temperature=0,
         max_tokens=max_new_tokens,
         logprobs=top_k,
     )
-    lp = resp.choices[0].logprobs
-    return lp.top_logprobs, lp.token_logprobs
+    # choices are returned in prompt order
+    return [(c.logprobs.top_logprobs, c.logprobs.token_logprobs) for c in resp.choices]
 
 
 def kl_over_topk(p_full: torch.Tensor, top_logprobs: dict, tokenizer) -> float:
@@ -143,16 +144,15 @@ if __name__ == "__main__":
     for i, p in enumerate(prompts):
         print(f"  [{i}] {p!r}")
 
-    print(f"\nRunning HF (batch={len(prompts)})...")
-    hf_probs, hf_lps, tokenizer = get_hf_data(MODEL_PATH, prompts, args.max_new_tokens)
-    print(f"  {len(hf_probs[0])} steps")
 
-    print("\nQuerying SGLang...")
-    sgl_data = []
-    for i, prompt in enumerate(prompts):
-        top, lps = get_sglang_data(MODEL_PATH, prompt, args.max_new_tokens, TOP_K_LOGPROBS)
-        sgl_data.append((top, lps))
+    print("\nQuerying SGLang (batch)...")
+    sgl_data = get_sglang_data(MODEL_PATH, prompts, args.max_new_tokens, TOP_K_LOGPROBS)
+    for i, (top, _) in enumerate(sgl_data):
         print(f"  [{i}] {len(top)} steps")
+        
+    print(f"\nRunning HF (batch={len(prompts)})...")
+    hf_probs, hf_lps, hf_gen_ids, tokenizer = get_hf_data(MODEL_PATH, prompts, args.max_new_tokens)
+    print(f"  {len(hf_probs[0])} steps")
 
     # ── Summary + plot ────────────────────────────────────────────────────────
     n_seq = len(prompts)
@@ -171,13 +171,27 @@ if __name__ == "__main__":
         mean_kl = sum(valid_kl) / len(valid_kl) if valid_kl else float("nan")
         max_kl = max(valid_kl) if valid_kl else float("nan")
         max_kl_step = kl_vals.index(max_kl) if valid_kl else -1
-        print(f"[{b}] steps={n}  mean_kl={mean_kl:.6f}  max_kl={max_kl:.6f} @ step {max_kl_step}")
-        print(f"     mean_lp_diff={sum(lp_diff)/len(lp_diff):.6f}  max_abs_lp_diff={max(abs(d) for d in lp_diff):.6f}")
+        # top-1 match: compare HF greedy token vs SGLang's argmax at each step
+        sgl_top1_ids = [
+            tokenizer.convert_tokens_to_ids(max(sgl_top[i], key=sgl_top[i].get))
+            for i in steps
+        ]
+        matches = [hf_gen_ids[b][i] == sgl_top1_ids[i] for i in range(n)]
+        match_rate = sum(matches) / len(matches)
+        first_mismatch = next((i for i, m in enumerate(matches) if not m), -1)
+
+        stats_line = (
+            f"steps={n}  mean_kl={mean_kl:.6f}  max_kl={max_kl:.6f} @ step {max_kl_step}"
+            f"     mean_lp_diff={sum(lp_diff)/len(lp_diff):.6f}  max_abs_lp_diff={max(abs(d) for d in lp_diff):.6f}"
+            f"     top1_match={match_rate:.1%}  first_mismatch={first_mismatch}"
+        )
+        print(f"[{b}] {stats_line}")
 
         ax1, ax2 = axes[b]
+
         ax1.plot(steps, kl_vals, marker="o", markersize=2, linewidth=1)
         ax1.set_ylabel("KL(HF ∥ SGLang)")
-        ax1.set_title(f"[{b}] {prompts[b][:50]!r}")
+        ax1.set_title(f"[{b}] {prompts[b][:50]!r}\n{stats_line}", fontsize=8, loc="left")
 
         ax2.plot(steps, lp_diff, marker="o", markersize=2, linewidth=1, color="tab:orange")
         ax2.axhline(0, color="gray", linewidth=0.8, linestyle="--")
