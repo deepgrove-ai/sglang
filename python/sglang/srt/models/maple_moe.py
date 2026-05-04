@@ -370,7 +370,7 @@ class MapleAttention(nn.Module):
 
             max_kv_len = self.config.max_kv_len
 
-            token_indices = req_to_token[req_pool_indices]                              # (B, max_kv_len)
+            token_indices = req_to_token[req_pool_indices, :max_kv_len]                  # (B, max_kv_len)
             key_padded = key_cache[token_indices]                                        # (B, max_kv_len, H_k, D)
             val_padded = value_cache[token_indices]                                      # (B, max_kv_len, H_k, D)
             positions = torch.arange(max_kv_len, device=query_states.device).unsqueeze(0)  # (1, max_kv_len)
