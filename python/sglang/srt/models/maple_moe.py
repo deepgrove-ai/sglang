@@ -219,6 +219,7 @@ class MapleSparseMoeBlockOld(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # SGLang: hidden_states is (num_tokens, hidden_size); add fake batch dim to match HF.
+        print("running old moe experts")
         is_2d = hidden_states.dim() == 2
         if is_2d:
             hidden_states = hidden_states.unsqueeze(0)
@@ -296,21 +297,14 @@ class MapleSparseMoeBlock(nn.Module):
         )
         self.gate = MapleGate(config)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # SGLang: hidden_states is (num_tokens, hidden_size); add fake batch dim to match HF.
-        is_2d = hidden_states.dim() == 2
-        if is_2d:
-            hidden_states = hidden_states.unsqueeze(0)
-
-        bsz, seq_len, h = hidden_states.shape
-        topk_idx, topk_weight, router_logits = self.gate(hidden_states)
-
+    @torch.no_grad()
+    def moe_infer(self, x, topk_ids, topk_weight, router_logits):
         # match old impl
-        hidden_states = hidden_states.view(-1, h)
+        hidden_states = x
         topk_output = StandardTopKOutput(
             topk_weights=topk_weight, 
             # torch.ones_like(topk_weight),
-            topk_ids=topk_idx.to(torch.int32), 
+            topk_ids=topk_ids.to(torch.int32), 
             router_logits=router_logits
         )
 
@@ -324,21 +318,36 @@ class MapleSparseMoeBlock(nn.Module):
         
         ## run grouped gemm
         combine_input = self.experts.run_moe_core(dispatch_output=dispatch_output)
-        expert_outs = combine_input.hidden_states  # (T, K, H)
+        expert_outs = combine_input.hidden_states  
+        print("expert outs", expert_outs.shape)
 
-
-        y = (expert_outs.float()
-            .mul_(topk_weight.unsqueeze(-1))
-            .sum(dim=1)
-            .to(hidden_states.dtype)
+        weighted = (
+            expert_outs.type(topk_weight.dtype)
+            .mul_(topk_weight.unsqueeze(dim=-1))
         )
+        final_out = weighted.sum(dim=-1).type(hidden_states.dtype)
+        return final_out
 
-        print("y shape", y.shape)
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # SGLang: hidden_states is (num_tokens, hidden_size); add fake batch dim to match HF.
+        print("running fused moe experts")
+        is_2d = hidden_states.dim() == 2
+        if is_2d:
+            hidden_states = hidden_states.unsqueeze(0)
+            # print("post unsqueeze", hidden_states)
+
+        bsz, seq_len, h = hidden_states.shape
+        topk_idx, topk_weight, _router_logits = self.gate(hidden_states)
+        # _sgl_dbg("router_logits", _router_logits)
+        # _sgl_dbg("router_probs", topk_weight)
+        hidden_states = hidden_states.view(-1, h)
+        y = self.moe_infer(hidden_states, topk_idx, topk_weight, _router_logits).view(bsz, seq_len, h)
+        # print("moe shape", y.shape)
+        # _sgl_dbg("ffn_out", y.reshape(-1, y.shape[-1]))
 
         if is_2d:
             y = y.squeeze(0)
-        
-        print("output shape",y.shape)
+        # print("returning", y.shape)
         return y
 
 
