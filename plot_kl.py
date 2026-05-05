@@ -49,7 +49,7 @@ def get_hf_data(model_path: str, prompts: list[str], max_new_tokens: int):
         tok.pad_token = tok.eos_token
 
     model = AutoModelForCausalLM.from_pretrained(
-        model_path, trust_remote_code=True, torch_dtype=torch.bfloat16, device_map="cuda:2"
+        model_path, trust_remote_code=True, torch_dtype=torch.bfloat16, device_map="cuda:1"
     )
     model.eval()
 
@@ -145,14 +145,15 @@ if __name__ == "__main__":
         print(f"  [{i}] {p!r}")
 
 
-    print("\nQuerying SGLang (batch)...")
-    sgl_data = get_sglang_data(MODEL_PATH, prompts, args.max_new_tokens, TOP_K_LOGPROBS)
-    for i, (top, _) in enumerate(sgl_data):
-        print(f"  [{i}] {len(top)} steps")
         
     print(f"\nRunning HF (batch={len(prompts)})...")
     hf_probs, hf_lps, hf_gen_ids, tokenizer = get_hf_data(MODEL_PATH, prompts, args.max_new_tokens)
     print(f"  {len(hf_probs[0])} steps")
+
+    print("\nQuerying SGLang (batch)...")
+    sgl_data = get_sglang_data(MODEL_PATH, prompts, args.max_new_tokens, TOP_K_LOGPROBS)
+    for i, (top, _) in enumerate(sgl_data):
+        print(f"  [{i}] {len(top)} steps")
 
     # ── Summary + plot ────────────────────────────────────────────────────────
     n_seq = len(prompts)
