@@ -158,10 +158,10 @@ class MapleMLP(nn.Module):
 
     def forward(self, x):
         gate_weight, up_weight, down_weight = self.gate_proj.weight, self.up_proj.weight, self.down_proj.weight
-        return F.linear(
-            self.act_fn(F.linear(x, gate_weight)) * F.linear(x, up_weight),
-            down_weight,
-        )
+        gate = F.linear(x, gate_weight)
+        up = F.linear(x, up_weight)
+        hidden = (self.act_fn(gate.float()) * up.float()).to(x.dtype)
+        return F.linear(hidden, down_weight)
 
 
 class MapleRMSNorm(nn.Module):

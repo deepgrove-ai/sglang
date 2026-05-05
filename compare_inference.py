@@ -59,12 +59,12 @@ def run_sglang(model_path: str, prompts: list[str]) -> list[str]:
 if __name__ == "__main__":
     print(f"Prompts: {PROMPTS}\n")
 
-    print("[HF]")
     hf_outs = run_hf(MODEL_PATH, PROMPTS)
+    print("[HF]")
     for prompt, out in zip(PROMPTS, hf_outs):
         print(f"  {prompt!r} -> {out!r}")
 
-    print("\n[sglang]")
     sglang_outs = run_sglang(MODEL_PATH, PROMPTS)
+    print("\n[sglang]")
     for prompt, out in zip(PROMPTS, sglang_outs):
         print(f"  {prompt!r} -> {out!r}")

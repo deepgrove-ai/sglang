@@ -507,6 +507,7 @@ def fused_experts_impl(
             curr_topk_ids, config["BLOCK_SIZE_M"], E
         )
 
+        # print(f"[MOE W1] A={curr_hidden_states.shape} dtype={curr_hidden_states.dtype} | w1={w1.shape} dtype={w1.dtype} | out={intermediate_cache1.shape} dtype={intermediate_cache1.dtype} | MUL_ROUTED_WEIGHT={apply_router_weight_on_input} top_k={topk_ids.shape[1]} | fp8={use_fp8_w8a8} int8a8={use_int8_w8a8} int8a16={use_int8_w8a16} int4={use_int4_w4a16} | compute_type={compute_type}")
         invoke_fused_moe_kernel(
             curr_hidden_states,
             w1,
@@ -559,15 +560,13 @@ def fused_experts_impl(
         else:
             raise ValueError(f"Unsupported activation: {activation=}")
 
+        _w2_out = (intermediate_cache3 if not no_combine and topk_ids.shape[1] != 1 else out_hidden_states[begin_chunk_idx:end_chunk_idx].unsqueeze(0))
+        # print(f"[MOE W2] A={intermediate_cache2.shape} dtype={intermediate_cache2.dtype} | w2={w2.shape} dtype={w2.dtype} | out={_w2_out.shape} dtype={_w2_out.dtype} | MUL_ROUTED_WEIGHT={not apply_router_weight_on_input} top_k=1 no_combine={no_combine} | weights={curr_topk_weights.dtype} ones={curr_topk_weights.abs().max().item():.4f}")
         invoke_fused_moe_kernel(
             intermediate_cache2,
             w2,
             b2,
-            (
-                intermediate_cache3
-                if not no_combine and topk_ids.shape[1] != 1
-                else out_hidden_states[begin_chunk_idx:end_chunk_idx].unsqueeze(0)
-            ),
+            _w2_out,
             a2_scale,
             w2_scale,
             w2_zp,

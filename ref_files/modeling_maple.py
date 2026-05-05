@@ -176,10 +176,10 @@ class MapleMLP(nn.Module):
 
     def forward(self, x, quantize_inplace_now: bool = False):
         gate_weight, up_weight, down_weight = self.gate_proj.weight, self.up_proj.weight, self.down_proj.weight
-        return torch.nn.functional.linear(
-            self.act_fn(torch.nn.functional.linear(x, gate_weight)) * torch.nn.functional.linear(x, up_weight),
-            down_weight,
-        )
+        gate = F.linear(x, gate_weight)
+        up = F.linear(x, up_weight)
+        hidden = (self.act_fn(gate.float()) * up.float()).to(x.dtype)
+        return F.linear(hidden, down_weight)
 
 
 class MapleRMSNorm(nn.Module):
@@ -213,6 +213,7 @@ class MapleGate(nn.Module):
         import torch.nn.init as init
 
         init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+
 
     def forward(self, hidden_states: torch.Tensor):
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
@@ -281,7 +282,6 @@ class MapleSparseMoeBlock(nn.Module):
         tokens_per_expert = cnts.sum(dim=0)
         idxs = topk_ids.view(-1).argsort()
         sorted_tokens = x[idxs // topk_ids.shape[1]]
-        print(tokens_per_expert.max(), idxs // topk_ids.shape[1])
         tokens_per_expert = tokens_per_expert.cpu().numpy()
         outputs = []
         start_idx = 0
@@ -630,6 +630,7 @@ class MapleModel(MaplePreTrainedModel):
         **kwargs,
     ) -> Union[Tuple, MoeV2ModelOutputWithPast]:
         debug_cache = bool(kwargs.pop("debug_cache", False))
+        print("on", position_ids)
         if debug_cache:
             print(f"Debug cache enabled for call {self._cache_debug_calls}")
         debug_call_id = self._cache_debug_calls

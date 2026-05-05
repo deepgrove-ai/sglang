@@ -238,7 +238,11 @@ class TritonRunnerCore(MoeRunnerCore):
         elif inplace:
             out_hidden_states = hidden_states
         else:
-            out_hidden_states = torch.empty_like(hidden_states)
+            out_hidden_states = torch.empty(
+                (M, w2.shape[1]),
+                device=hidden_states.device,
+                dtype=torch.float32,
+            )
 
         invoke_fused_moe_kernel(
             intermediate_cache2,
@@ -313,6 +317,9 @@ class TritonRunnerCore(MoeRunnerCore):
                 intermediate_cache3.view(*intermediate_cache3.shape),
                 out_hidden_states,
             )
+
+        if not no_combine and not inplace and out_hidden_states.dtype != hidden_states.dtype:
+            out_hidden_states = out_hidden_states.to(hidden_states.dtype)
 
         return TritonRunnerOutput(
             hidden_states=out_hidden_states,
