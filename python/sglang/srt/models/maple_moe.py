@@ -52,6 +52,8 @@ if _LOGIT_DEBUG:
     _atexit.register(_sgl_save)
 # ─────────────────────────────────────────────────────────────────────────────
 
+USE_FUSED_EXPERTS = True
+
 
 # ── identical to modeling_maple.py ───────────────────────────────────────────
 
@@ -202,6 +204,79 @@ class MapleGate(nn.Module):
         return topk_idx, topk_weight, logits
 
 
+class MapleSparseMoeBlockOld(nn.Module):
+    """Unfused MoE block — identical to HF; always uses moe_infer path at inference."""
+
+    def __init__(self, config, layer_id: int) -> None:
+        super().__init__()
+        self.config = config
+        self.num_experts_per_tok = config.num_experts_per_tok
+        self.experts = nn.ModuleList([
+            MapleMLP(config=config, intermediate_size=config.moe_intermediate_size)
+            for _ in range(config.num_experts)
+        ])
+        self.gate = MapleGate(config)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # SGLang: hidden_states is (num_tokens, hidden_size); add fake batch dim to match HF.
+        is_2d = hidden_states.dim() == 2
+        if is_2d:
+            hidden_states = hidden_states.unsqueeze(0)
+            # print("post unsqueeze", hidden_states)
+
+        bsz, seq_len, h = hidden_states.shape
+        topk_idx, topk_weight, _router_logits = self.gate(hidden_states)
+        # _sgl_dbg("router_logits", _router_logits)
+        # _sgl_dbg("router_probs", topk_weight)
+        hidden_states = hidden_states.view(-1, h)
+        y = self.moe_infer(hidden_states, topk_idx, topk_weight).view(bsz, seq_len, h)
+        # print("moe shape", y.shape)
+        # _sgl_dbg("ffn_out", y.reshape(-1, y.shape[-1]))
+
+        if is_2d:
+            y = y.squeeze(0)
+        # print("returning", y.shape)
+        return y
+
+    @torch.no_grad()
+    def moe_infer(self, x, topk_ids, topk_weight):
+        cnts = topk_ids.new_zeros((topk_ids.shape[0], len(self.experts)))
+        cnts.scatter_(1, topk_ids, 1)
+        tokens_per_expert = cnts.sum(dim=0)
+        idxs = topk_ids.view(-1).argsort()
+        sorted_tokens = x[idxs // topk_ids.shape[1]]
+        tokens_per_expert = tokens_per_expert.cpu().numpy()
+        outputs = []
+        start_idx = 0
+        # _pfx = f"s{_SGL_STEP[0]:03d}_l{_SGL_LAYER[0]:02d}" if _LOGIT_DEBUG else None
+        for i, num_tokens in enumerate(tokens_per_expert):
+            end_idx = start_idx + num_tokens
+            if num_tokens == 0:
+                continue
+            expert = self.experts[i]
+            tokens_for_this_expert = sorted_tokens[start_idx:end_idx]
+            # if _LOGIT_DEBUG:
+            #     _SGL_DBG[f"{_pfx}_expert{i:03d}_in"] = tokens_for_this_expert.detach().cpu().float().clone()
+            expert_out = expert(tokens_for_this_expert)
+            # if _LOGIT_DEBUG:
+            #     _SGL_DBG[f"{_pfx}_expert{i:03d}_out"] = expert_out.detach().cpu().float().clone()
+            outputs.append(expert_out.to(x.device))
+            start_idx = end_idx
+
+        outs = torch.cat(outputs, dim=0) if len(outputs) else sorted_tokens.new_empty(0)
+        new_x = torch.empty_like(outs)
+        new_x[idxs] = outs
+        weighted = (
+            new_x.view(*topk_ids.shape, -1)
+            .type(topk_weight.dtype)
+            .mul_(topk_weight.unsqueeze(dim=-1))
+        )
+        # if _LOGIT_DEBUG:
+        #     _SGL_DBG[f"{_pfx}_expert_weighted"] = weighted.detach().cpu().float().clone()
+        final_out = weighted.sum(dim=1).type(new_x.dtype)
+        return final_out
+
+
 class MapleSparseMoeBlock(nn.Module):
     def __init__(self, config, layer_id: int) -> None:
         super().__init__()
@@ -222,30 +297,49 @@ class MapleSparseMoeBlock(nn.Module):
         self.gate = MapleGate(config)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # SGLang: hidden_states is (num_tokens, hidden_size); add fake batch dim to match HF.
+        is_2d = hidden_states.dim() == 2
+        if is_2d:
+            hidden_states = hidden_states.unsqueeze(0)
+
+        bsz, seq_len, h = hidden_states.shape
         topk_idx, topk_weight, router_logits = self.gate(hidden_states)
 
-        # Pass ones so the kernel doesn't scale expert outputs in bf16;
-        # we apply the actual routing weights in fp32 after.
+        # match old impl
+        hidden_states = hidden_states.view(-1, h)
         topk_output = StandardTopKOutput(
-            torch.ones_like(topk_weight),
-            topk_idx.to(torch.int32),
-            router_logits,
+            topk_weights=topk_weight, 
+            # torch.ones_like(topk_weight),
+            topk_ids=topk_idx.to(torch.int32), 
+            router_logits=router_logits
         )
 
-        # Grouped GEMM via triton kernel → (T, K, H) unweighted expert outputs.
+        print("hidden states shapes", hidden_states.shape)
+
+        # split the experts forward pass into dispatch-compute-combine
+        # y = self.experts(hidden_states, topk_output)
         dispatch_output = self.experts.dispatcher.dispatch(
             hidden_states=hidden_states, topk_output=topk_output
         )
+        
+        ## run grouped gemm
         combine_input = self.experts.run_moe_core(dispatch_output=dispatch_output)
         expert_outs = combine_input.hidden_states  # (T, K, H)
 
-        # Weighted sum in fp32 — matches original moe_infer precision exactly.
-        return (
-            expert_outs.float()
+
+        y = (expert_outs.float()
             .mul_(topk_weight.unsqueeze(-1))
             .sum(dim=1)
             .to(hidden_states.dtype)
         )
+
+        print("y shape", y.shape)
+
+        if is_2d:
+            y = y.squeeze(0)
+        
+        print("output shape",y.shape)
+        return y
 
 
 # ── SGLang-adapted attention (same math, RadixAttention for KV cache) ─────────
@@ -345,68 +439,61 @@ class MapleAttention(nn.Module):
         # flash_attention_forward's decode loop will slice key[b, -valid_len:] to drop padding.
         # Extend: reshape packed tokens into [1, H, num_tokens, D] and pass varlen cu_seqlens.
         attention_mask = None
+        fa_kwargs: dict = {}
         if forward_batch.forward_mode.is_decode():
             key_cache = forward_batch.token_to_kv_pool.get_key_buffer(self.layer_idx)
             value_cache = forward_batch.token_to_kv_pool.get_value_buffer(self.layer_idx)
             req_to_token = forward_batch.req_to_token_pool.req_to_token
             req_pool_indices = forward_batch.req_pool_indices
             seq_lens = forward_batch.seq_lens
+            max_kv_len = int(seq_lens.max())
 
-            max_kv_len = self.config.max_kv_len
-            token_indices = req_to_token[req_pool_indices, :max_kv_len]       # (B, max_kv_len)
-            key_padded = key_cache[token_indices]                             # (B, max_kv_len, H_k, D)
-            val_padded = value_cache[token_indices]                           # (B, max_kv_len, H_k, D)
-            kv_positions = torch.arange(max_kv_len, device=query_states.device).unsqueeze(0)
-            attention_mask = (kv_positions < seq_lens.unsqueeze(1)).to(torch.int32)  # (B, max_kv_len)
+            key_padded = key_cache.new_zeros(num_tokens, max_kv_len, self.num_key_value_heads, self.head_dim)
+            val_padded = value_cache.new_zeros(num_tokens, max_kv_len, self.num_key_value_heads, self.head_dim)
+            attention_mask = torch.zeros(num_tokens, max_kv_len, dtype=torch.int32, device=query_states.device)
+            for i in range(num_tokens):
+                kv_len = int(seq_lens[i])
+                token_indices = req_to_token[int(req_pool_indices[i]), :kv_len]
+                key_padded[i, max_kv_len - kv_len:] = key_cache[token_indices]
+                val_padded[i, max_kv_len - kv_len:] = value_cache[token_indices]
+                attention_mask[i, max_kv_len - kv_len:] = 1
 
-            query_states = query_states.unsqueeze(2)        # (B, H_q, 1,          D)
-            key_states   = key_padded.transpose(1, 2)       # (B, H_k, max_kv_len, D)
+            query_states = query_states.unsqueeze(2)            # [B, H_q, 1,          D]
+            key_states   = key_padded.transpose(1, 2)           # [B, H_k, max_kv_len, D]
             value_states = val_padded.transpose(1, 2)
         else:
             extend_seq_lens = forward_batch.extend_seq_lens
+            cu_seqlens = F.pad(extend_seq_lens.cumsum(0, dtype=torch.int32), (1, 0))
+            max_seqlen = int(extend_seq_lens.max())
+
             query_states = query_states.view(1, num_tokens, self.num_heads,           self.head_dim).transpose(1, 2).contiguous()
             key_states   = key_states  .view(1, num_tokens, self.num_key_value_heads, self.head_dim).transpose(1, 2).contiguous()
             value_states = value_states.view(1, num_tokens, self.num_key_value_heads, self.head_dim).transpose(1, 2).contiguous()
+            fa_kwargs = dict(
+                position_ids=torch.zeros(1, dtype=torch.long, device=query_states.device),
+                max_length_q=max_seqlen,
+                max_length_k=max_seqlen,
+                cu_seq_lens_q=cu_seqlens,
+                cu_seq_lens_k=cu_seqlens,
+            )
 
-        n_rep = self.num_heads // self.num_key_value_heads
-        if n_rep > 1:
-            key_states   = key_states.repeat_interleave(n_rep, dim=1)
-            value_states = value_states.repeat_interleave(n_rep, dim=1)
+        # with torch.no_grad():
+        #     _scale  = self.head_dim ** -0.5
+        #     _q_last = query_states[:, :, -1:, :]
+        #     _ngrp   = self.num_heads // self.num_key_value_heads
+        #     _k_exp  = key_states.repeat_interleave(_ngrp, dim=1)
+        #     _scores = torch.matmul(_q_last.float(), _k_exp.float().transpose(-1, -2)) * _scale
+        #     _aprobs = torch.softmax(_scores, dim=-1)[0, :, 0, :].mean(0)
+        # _sgl_dbg("attn_probs", _aprobs.unsqueeze(0))
 
-        if forward_batch.forward_mode.is_decode():
-            # q_pos: absolute position of each query = seq_lens - 1, shape (B, 1, 1, 1)
-            q_pos = (seq_lens - 1).view(num_tokens, 1, 1, 1)
-            k_pos = torch.arange(key_states.shape[2], device=key_states.device).view(1, 1, 1, -1)
-            attn_bias = torch.zeros(num_tokens, 1, 1, key_states.shape[2],
-                                    dtype=query_states.dtype, device=query_states.device)
-            attn_bias.masked_fill_(q_pos < k_pos, float('-inf'))
-            if self.sliding_window is not None:
-                attn_bias.masked_fill_((q_pos - k_pos) >= self.sliding_window, float('-inf'))
-            attn_bias.masked_fill_((attention_mask == 0)[:, None, None, :], float('-inf'))
-        else:
-            # positions: (num_tokens,) absolute position per packed token
-            extend_seq_lens = forward_batch.extend_seq_lens
-            seq_id = torch.repeat_interleave(
-                torch.arange(len(extend_seq_lens), device=positions.device),
-                extend_seq_lens,
-            )  # (num_tokens,) — which sequence each token belongs to
-            q_pos = positions.view(num_tokens, 1)
-            k_pos = positions.view(1, num_tokens)
-            q_seq = seq_id.view(num_tokens, 1)
-            k_seq = seq_id.view(1, num_tokens)
-            attn_bias = torch.zeros(1, 1, num_tokens, num_tokens,
-                                    dtype=query_states.dtype, device=query_states.device)
-            attn_bias.masked_fill_(q_pos < k_pos, float('-inf'))
-            attn_bias.masked_fill_(q_seq != k_seq, float('-inf'))
-            if self.sliding_window is not None:
-                attn_bias.masked_fill_((q_pos - k_pos) >= self.sliding_window, float('-inf'))
-
-        attn_output = F.scaled_dot_product_attention(
-            query_states, key_states, value_states,
-            attn_mask=attn_bias,
-            scale=self.scaling,
+        attn_output, _ = flash_attention_forward(
+            self, query_states, key_states, value_states,
+            attention_mask=attention_mask,
+            scaling=self.scaling,
+            sliding_window=self.sliding_window,
+            **fa_kwargs,
         )
-        attn_output = attn_output.transpose(1, 2).reshape(num_tokens, self.num_heads * self.head_dim)
+        attn_output = attn_output.reshape(num_tokens, self.num_heads * self.head_dim)
         # _sgl_dbg("attn_pre_o", attn_output)
 
         # ── Output projection (identical to HF) ───────────────────────────────
@@ -425,7 +512,13 @@ class MapleDecoderLayer(nn.Module):
         self.layer_idx = layer_idx
 
         self.self_attn = MapleAttention(config=config, layer_idx=layer_idx)
-        self.mlp = MapleSparseMoeBlock(config, layer_id=layer_idx)
+
+
+        self.mlp = None
+        if not USE_FUSED_EXPERTS:
+            self.mlp = MapleSparseMoeBlockOld(config, layer_id=layer_idx)
+        else: 
+            self.mlp = MapleSparseMoeBlock(config, layer_id=layer_idx)
 
         self.input_layernorm = MapleRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = MapleRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -447,6 +540,7 @@ class MapleDecoderLayer(nn.Module):
 
         hidden_states = self.self_attn(positions, hidden_states, forward_batch, position_embeddings)
         # _sgl_dbg("post_attn", hidden_states)
+        # hidden_states = residual + hidden_states.to(residual.device)
         hidden_states = (residual.to(torch.float32) + hidden_states.to(torch.float32)).to(initial_dtype)
         # _sgl_dbg("post_attn_residual", hidden_states)
 
@@ -458,7 +552,8 @@ class MapleDecoderLayer(nn.Module):
         hidden_states = self.mlp(hidden_states)
         # _sgl_dbg("post_mlp", hidden_states)
 
-        hidden_states = (residual.to(torch.float32) + hidden_states.to(torch.float32)).to(initial_dtype).to(residual.device)
+        # hidden_states = residual + hidden_states.to(residual.device)
+        hidden_states = (residual.to(torch.float32) + hidden_states.to(torch.float32)).to(initial_dtype)
         # _sgl_dbg("post_ffn_residual", hidden_states)
 
         return hidden_states
@@ -553,35 +648,46 @@ class MapleForCausalLM(nn.Module):
         return self.logits_processor(input_ids, hidden_states, self.lm_head, forward_batch)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        expert_params_mapping = FusedMoE.make_expert_params_mapping(
-            ckpt_gate_proj_name="gate_proj",
-            ckpt_down_proj_name="down_proj",
-            ckpt_up_proj_name="up_proj",
-            num_experts=self.config.num_experts,
-        )
+
+        if USE_FUSED_EXPERTS:
+            expert_params_mapping = FusedMoE.make_expert_params_mapping(
+                ckpt_gate_proj_name="gate_proj",
+                ckpt_down_proj_name="down_proj",
+                ckpt_up_proj_name="up_proj",
+                num_experts=self.config.num_experts,
+            )
+# 
 
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
 
-            for param_name, weight_name, expert_id, shard_id in expert_params_mapping:
-                if weight_name not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-                if name not in params_dict:
-                    continue
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, name, shard_id=shard_id, expert_id=expert_id)
-                break
-            else:
+            if not USE_FUSED_EXPERTS:
                 if name not in params_dict:
                     logger.debug(f"Skipping {name} — not in model")
                     continue
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
-
+            
+            else: 
+                for param_name, weight_name, expert_id, shard_id in expert_params_mapping:
+                    if weight_name not in name:
+                        continue
+                    name = name.replace(weight_name, param_name)
+                    if name not in params_dict:
+                        continue
+                    param = params_dict[name]
+                    weight_loader = param.weight_loader
+                    weight_loader(param, loaded_weight, name, shard_id=shard_id, expert_id=expert_id)
+                    break
+                else:
+                    if name not in params_dict:
+                        logger.debug(f"Skipping {name} — not in model")
+                        continue
+                    param = params_dict[name]
+                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                    weight_loader(param, loaded_weight)
 
 EntryClass = MapleForCausalLM
