@@ -28,9 +28,12 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead, VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.models.maple_fa.fa3 import flash_attention_forward
+# from sglang.srt.models.maple_fa.fa3 import flash_attention_forward
+from sglang.srt.models.maple_fa.simple_varlen_flash_attention import flash_attention_forward
 
 logger = logging.getLogger(__name__)
+
+torch.backends.cuda.matmul.allow_tf32 = False
 
 # ── debug tensor dumps ────────────────────────────────────────────────────────
 _LOGIT_DEBUG = os.environ.get("LOGIT_DEBUG", "").lower() == "true"

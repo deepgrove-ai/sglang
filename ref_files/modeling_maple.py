@@ -26,7 +26,8 @@ from transformers.utils import logging as hf_logging
 from transformers.utils.import_utils import is_torch_fx_available
 
 from .configuration_maple import MapleConfig
-from .fa3 import flash_attention_forward
+# from .fa3 import flash_attention_forward
+from .simple_varlen_flash_attention import flash_attention_forward
 
 logger = hf_logging.get_logger(__name__)
 _CONFIG_FOR_DOC = "MapleConfig"
