@@ -52,7 +52,7 @@ if _LOGIT_DEBUG:
     _atexit.register(_sgl_save)
 # ─────────────────────────────────────────────────────────────────────────────
 
-USE_FUSED_EXPERTS = True
+USE_FUSED_EXPERTS = True 
 
 
 # ── identical to modeling_maple.py ───────────────────────────────────────────
@@ -322,7 +322,7 @@ class MapleSparseMoeBlock(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # SGLang: hidden_states is (num_tokens, hidden_size); add fake batch dim to match HF.
-        print("running fused moe experts")
+        # print("running fused moe experts")
         is_2d = hidden_states.dim() == 2
         if is_2d:
             hidden_states = hidden_states.unsqueeze(0)

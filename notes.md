@@ -9,6 +9,11 @@ and then to request:
 
 curl -X POST -H 'Content-Type: application/json' "http://0.0.0.0:30000/start_profile" -d '{"num_steps":3}'
 
+curl -s http://127.0.0.1:30000/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "/scratch/ansh/models/maple_reference_model", "prompt": "My name is", "temperature": 0, "max_tokens": 128}'
+
+
 # with torch compile 
 
 python -m sglang.launch_server   --model-path /scratch/ansh/models/maple_reference_model  --host 0.0.0.0   --port 30000   --mem-fraction-static 0.7   --trust-remote-code  --disable-radix-cache --disable-hybrid-swa-memory --attention-backend maple_fa --skip-server-warmup --disable-cuda-graph --enable-torch-compile --tp 1  2>&1 | tee out_sglang_logs.log
