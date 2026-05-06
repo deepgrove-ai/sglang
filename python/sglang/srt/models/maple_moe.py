@@ -389,110 +389,32 @@ class MapleAttention(nn.Module):
     ) -> torch.Tensor:
         num_tokens, _ = hidden_states.shape
 
-        # ── QKV (identical fused computation as HF) ───────────────────────────
         qkv_weight = torch.cat([self.q_proj.weight, self.k_proj.weight, self.v_proj.weight], dim=0)
         out_qkv = F.linear(hidden_states, qkv_weight)
-        cos, sin, _ = position_embeddings
         qkv = out_qkv.view(num_tokens, self.num_heads + 2 * self.num_key_value_heads, self.head_dim)
 
         query_states, key_states, value_states = qkv.split(
             [self.num_heads, self.num_key_value_heads, self.num_key_value_heads], dim=-2
         )
 
-        # ── Q/K norm (per-head, identical to HF) ──────────────────────────────
         query_states = self.q_norm(query_states)
         key_states = self.k_norm(key_states)
-        # _sgl_dbg("q_post_norm", query_states.reshape(num_tokens, -1))
-        # _sgl_dbg("k_post_norm", key_states.reshape(num_tokens, -1))
 
-        # ── RoPE — only for sliding_attention layers (identical to HF) ────────
         if self.sliding_window is not None and position_embeddings is not None:
+            cos, sin, _ = position_embeddings
             cos = cos.squeeze(0)
             sin = sin.squeeze(0)
-            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, unsqueeze_dim=1)
-            # _sgl_dbg("q_post_rope", query_states.reshape(num_tokens, -1))
-            # _sgl_dbg("k_post_rope", key_states.reshape(num_tokens, -1))
-
-        # _sgl_dbg("q", query_states.reshape(num_tokens, -1))
-        # _sgl_dbg("k", key_states.reshape(num_tokens, -1))
-        # _sgl_dbg("v", value_states.reshape(num_tokens, -1))
-
-        # ── Attention — write K/V to pool, then prepare tensors for flash_attention_forward ──
-        # query/key/value_states: [num_tokens, n_heads, head_dim]
-
-        # Write new K/V to pool (pool stores [pool_size, n_kv_heads, head_dim])
-        forward_batch.token_to_kv_pool.set_kv_buffer(
-            self.attn, forward_batch.out_cache_loc,
-            key_states.contiguous(), value_states.contiguous(),
-            self.attn.k_scale, self.attn.v_scale,
-        )
-
-        # Decode: load the full KV history (including the token just written) from the
-        # pool into left-padded [B, H, max_kv_len, D] tensors + build attention_mask.
-        # flash_attention_forward's decode loop will slice key[b, -valid_len:] to drop padding.
-        # Extend: reshape packed tokens into [1, H, num_tokens, D] and pass varlen cu_seqlens.
-        attention_mask = None
-        fa_kwargs: dict = {}
-        if forward_batch.forward_mode.is_decode():
-            key_cache = forward_batch.token_to_kv_pool.get_key_buffer(self.layer_idx)
-            value_cache = forward_batch.token_to_kv_pool.get_value_buffer(self.layer_idx)
-            req_to_token = forward_batch.req_to_token_pool.req_to_token
-            req_pool_indices = forward_batch.req_pool_indices
-            seq_lens = forward_batch.seq_lens
-            max_kv_len = int(seq_lens.max())
-
-            key_padded = key_cache.new_zeros(num_tokens, max_kv_len, self.num_key_value_heads, self.head_dim)
-            val_padded = value_cache.new_zeros(num_tokens, max_kv_len, self.num_key_value_heads, self.head_dim)
-            attention_mask = torch.zeros(num_tokens, max_kv_len, dtype=torch.int32, device=query_states.device)
-            for i in range(num_tokens):
-                kv_len = int(seq_lens[i])
-                token_indices = req_to_token[int(req_pool_indices[i]), :kv_len]
-                key_padded[i, max_kv_len - kv_len:] = key_cache[token_indices]
-                val_padded[i, max_kv_len - kv_len:] = value_cache[token_indices]
-                attention_mask[i, max_kv_len - kv_len:] = 1
-
-            query_states = query_states.unsqueeze(2)            # [B, H_q, 1,          D]
-            key_states   = key_padded.transpose(1, 2)           # [B, H_k, max_kv_len, D]
-            value_states = val_padded.transpose(1, 2)
-        else:
-            extend_seq_lens = forward_batch.extend_seq_lens
-            cu_seqlens = F.pad(extend_seq_lens.cumsum(0, dtype=torch.int32), (1, 0))
-            max_seqlen = int(extend_seq_lens.max())
-
-            query_states = query_states.view(1, num_tokens, self.num_heads,           self.head_dim).transpose(1, 2).contiguous()
-            key_states   = key_states  .view(1, num_tokens, self.num_key_value_heads, self.head_dim).transpose(1, 2).contiguous()
-            value_states = value_states.view(1, num_tokens, self.num_key_value_heads, self.head_dim).transpose(1, 2).contiguous()
-            fa_kwargs = dict(
-                position_ids=torch.zeros(1, dtype=torch.long, device=query_states.device),
-                max_length_q=max_seqlen,
-                max_length_k=max_seqlen,
-                cu_seq_lens_q=cu_seqlens,
-                cu_seq_lens_k=cu_seqlens,
+            query_states, key_states = apply_rotary_pos_emb(
+                query_states, key_states, cos, sin, unsqueeze_dim=1
             )
 
-        # with torch.no_grad():
-        #     _scale  = self.head_dim ** -0.5
-        #     _q_last = query_states[:, :, -1:, :]
-        #     _ngrp   = self.num_heads // self.num_key_value_heads
-        #     _k_exp  = key_states.repeat_interleave(_ngrp, dim=1)
-        #     _scores = torch.matmul(_q_last.float(), _k_exp.float().transpose(-1, -2)) * _scale
-        #     _aprobs = torch.softmax(_scores, dim=-1)[0, :, 0, :].mean(0)
-        # _sgl_dbg("attn_probs", _aprobs.unsqueeze(0))
+        q = query_states.reshape(num_tokens, self.num_heads * self.head_dim)
+        k = key_states.reshape(num_tokens, self.num_key_value_heads * self.head_dim)
+        v = value_states.reshape(num_tokens, self.num_key_value_heads * self.head_dim)
 
-        attn_output, _ = flash_attention_forward(
-            self, query_states, key_states, value_states,
-            attention_mask=attention_mask,
-            scaling=self.scaling,
-            sliding_window=self.sliding_window,
-            **fa_kwargs,
-        )
-        attn_output = attn_output.reshape(num_tokens, self.num_heads * self.head_dim)
-        # _sgl_dbg("attn_pre_o", attn_output)
+        attn_output = self.attn(q, k, v, forward_batch)
 
-        # ── Output projection (identical to HF) ───────────────────────────────
         attn_output = F.linear(attn_output, self.o_proj.weight)
-        # _sgl_dbg("o_proj", attn_output)
-
         return attn_output
 
 
