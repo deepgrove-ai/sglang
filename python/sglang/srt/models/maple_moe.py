@@ -295,33 +295,22 @@ class MapleSparseMoeBlock(nn.Module):
             layer_id=layer_id,
             quant_config=None,
             prefix="experts",
-            no_combine=True,  # return (T, K, H) so we accumulate in fp32
-            inplace=False,    # required when no_combine=True
         )
         self.gate = MapleGate(config)
 
     @torch.no_grad()
     def moe_infer(self, x, topk_ids, topk_weight, router_logits):
-        # match old impl
-        hidden_states = x
-        # Pass ones so the W2 kernel multiplies by 1.0 (no-op); we apply weights
-        # in float32 below to match the old moe_infer precision.
         topk_output = StandardTopKOutput(
-            topk_weights=torch.ones_like(topk_weight),
+            topk_weights=topk_weight,
             topk_ids=topk_ids.to(torch.int32),
-            router_logits=router_logits
+            router_logits=router_logits,
         )
 
         dispatch_output = self.experts.dispatcher.dispatch(
-            hidden_states=hidden_states, topk_output=topk_output
+            hidden_states=x, topk_output=topk_output
         )
         combine_input = self.experts.run_moe_core(dispatch_output=dispatch_output)
-        expert_outs = combine_input.hidden_states  # (T, K, H) in model dtype, unweighted
-
-        # Mirror old moe_infer: cast to float32, multiply, sum, cast back.
-        weighted = expert_outs.to(torch.float32).mul_(topk_weight.unsqueeze(dim=-1))
-        final_out = weighted.sum(dim=1).to(hidden_states.dtype)
-        return final_out
+        return combine_input.hidden_states
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # SGLang: hidden_states is (num_tokens, hidden_size); add fake batch dim to match HF.
