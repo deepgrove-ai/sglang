@@ -22,6 +22,34 @@ if TYPE_CHECKING:
 from sgl_kernel import merge_state_v2
 from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 
+# ── FA3 input/output dump ─────────────────────────────────────────────────────
+import os as _fa_os
+_FA_DUMP = _fa_os.environ.get("FA_DUMP", "") == "1"
+_FA_DUMP_LAYERS = {0, 5}  # layer 0 = sliding, layer 5 = full-attention
+_FA_DUMP_MAX_CALLS = 3    # capture first prefill + first 2 decode steps per layer
+_FA_DUMP_COUNTS: dict = {}
+
+def _fa_dump(tag: str, layer_id: int, payload: dict):
+    if not _FA_DUMP:
+        return
+    if layer_id not in _FA_DUMP_LAYERS:
+        return
+    key = (tag, layer_id)
+    n = _FA_DUMP_COUNTS.get(key, 0)
+    if n >= _FA_DUMP_MAX_CALLS:
+        return
+    _FA_DUMP_COUNTS[key] = n + 1
+    cpu_payload = {}
+    for k, v in payload.items():
+        if isinstance(v, torch.Tensor):
+            cpu_payload[k] = v.detach().cpu()
+        else:
+            cpu_payload[k] = v
+    path = f"/tmp/fa_dump_sglang_{tag}_l{layer_id:02d}_c{n}.pt"
+    torch.save(cpu_payload, path)
+    print(f"[FA_DUMP] saved {path}", flush=True)
+# ─────────────────────────────────────────────────────────────────────────────
+
 
 @dataclass
 class FlashAttentionMetadata:
@@ -774,8 +802,37 @@ class FlashAttentionBackend(AttentionBackend):
                 cu_seqlens_k = metadata.encoder_cu_seqlens_k
                 window_size = (-1, -1)
 
+            _fa_q_in = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+            if _FA_DUMP and layer.layer_id in _FA_DUMP_LAYERS:
+                # gather actual K/V values used (shape (max_seq_len_k, kv_heads, head_dim))
+                _pt = page_table[0]  # batch=1 assumed for single-stream debug
+                _kc_view = key_cache.view(-1, layer.tp_k_head_num, layer.head_dim)
+                _vc_view = value_cache.view(-1, layer.tp_v_head_num, layer.head_dim)
+                _k_gathered = _kc_view[_pt]
+                _v_gathered = _vc_view[_pt]
+                _fa_dump("extend_in", layer.layer_id, {
+                    "q": _fa_q_in,
+                    "k_gathered": _k_gathered,
+                    "v_gathered": _v_gathered,
+                    "page_table": page_table,
+                    "cache_seqlens": cache_seqlens,
+                    "cu_seqlens_q": cu_seqlens_q,
+                    "cu_seqlens_k_new": cu_seqlens_k if not use_local_attn else None,
+                    "max_seqlen_q": max_seqlen_q,
+                    "window_size": window_size,
+                    "softmax_scale": layer.scaling,
+                    "causal": (False if use_cascade_attn else causal),
+                    "softcap": layer.logit_cap,
+                    "num_splits": self.num_splits,
+                    "sliding_window_size": layer.sliding_window_size,
+                    "page_size": self.page_size,
+                    "use_local_attn": use_local_attn,
+                    "tp_q_head_num": layer.tp_q_head_num,
+                    "tp_k_head_num": layer.tp_k_head_num,
+                    "head_dim": layer.head_dim,
+                })
             result = flash_attn_with_kvcache(
-                q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                q=_fa_q_in,
                 k_cache=key_cache,
                 v_cache=value_cache,
                 page_table=page_table,
@@ -793,6 +850,8 @@ class FlashAttentionBackend(AttentionBackend):
                 num_splits=self.num_splits,
                 **kwargs,
             )
+            if _FA_DUMP and layer.layer_id in _FA_DUMP_LAYERS and not use_cascade_attn:
+                _fa_dump("extend_out", layer.layer_id, {"o": result})
 
             if use_cascade_attn:
                 o, softmax_lse, *rest = result
@@ -1104,6 +1163,32 @@ class FlashAttentionBackend(AttentionBackend):
                     -1, layer.tp_q_head_num, layer.head_dim
                 )
 
+                if _FA_DUMP and layer.layer_id in _FA_DUMP_LAYERS:
+                    _pt = page_table[0]
+                    _kc_view = key_cache.view(-1, layer.tp_k_head_num, layer.head_dim)
+                    _vc_view = value_cache.view(-1, layer.tp_v_head_num, layer.head_dim)
+                    _k_gathered = _kc_view[_pt]
+                    _v_gathered = _vc_view[_pt]
+                    _fa_dump("decode_in", layer.layer_id, {
+                        "q": q_reshaped,
+                        "k_gathered": _k_gathered,
+                        "v_gathered": _v_gathered,
+                        "page_table": page_table,
+                        "cache_seqlens": cache_seqlens,
+                        "cu_seqlens_q": metadata.cu_seqlens_q,
+                        "cu_seqlens_k_new": cu_seqlens_k,
+                        "max_seqlen_q": max_seqlen_q,
+                        "window_size": window_size,
+                        "softmax_scale": layer.scaling,
+                        "causal": (False if use_cascade_attn else causal),
+                        "softcap": layer.logit_cap,
+                        "num_splits": self.num_splits,
+                        "sliding_window_size": layer.sliding_window_size,
+                        "page_size": self.page_size,
+                        "tp_q_head_num": layer.tp_q_head_num,
+                        "tp_k_head_num": layer.tp_k_head_num,
+                        "head_dim": layer.head_dim,
+                    })
                 # Default: single-token self-attention
                 result = flash_attn_with_kvcache(
                     q=q_reshaped,
@@ -1124,6 +1209,8 @@ class FlashAttentionBackend(AttentionBackend):
                     num_splits=self.num_splits,
                     **kwargs,
                 )
+                if _FA_DUMP and layer.layer_id in _FA_DUMP_LAYERS and not use_cascade_attn:
+                    _fa_dump("decode_out", layer.layer_id, {"o": result})
                 if use_cascade_attn:
                     o, softmax_lse, *rest = result
                     o_expand, softmax_lse_expand, *rest_expand = (

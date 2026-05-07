@@ -106,6 +106,33 @@ def fa_peft_integration_check(
 
 deterministic_g = os.environ.get("FLASH_ATTENTION_DETERMINISTIC", "0") == "1"
 
+# ── FA3 input/output dump (mirrors flashattention_backend.py) ────────────────
+_FA_DUMP = os.environ.get("FA_DUMP", "") == "1"
+_FA_DUMP_LAYERS = {0, 5}
+_FA_DUMP_MAX_CALLS = 3
+_FA_DUMP_COUNTS: dict = {}
+
+def _fa_dump(tag: str, layer_id: int, payload: dict):
+    if not _FA_DUMP:
+        return
+    if layer_id not in _FA_DUMP_LAYERS:
+        return
+    key = (tag, layer_id)
+    n = _FA_DUMP_COUNTS.get(key, 0)
+    if n >= _FA_DUMP_MAX_CALLS:
+        return
+    _FA_DUMP_COUNTS[key] = n + 1
+    cpu = {}
+    for k, v in payload.items():
+        if isinstance(v, torch.Tensor):
+            cpu[k] = v.detach().cpu()
+        else:
+            cpu[k] = v
+    path = f"/tmp/fa_dump_embedded_{tag}_l{layer_id:02d}_c{n}.pt"
+    torch.save(cpu, path)
+    print(f"[FA_DUMP] saved {path}", flush=True)
+# ─────────────────────────────────────────────────────────────────────────────
+
 
 def _flash_attention_forward(
     query_states: torch.Tensor,
@@ -233,6 +260,28 @@ def flash_attention_forward(
     value = value.transpose(1, 2)
     seq_len = query.shape[1]
 
+    _layer_id = getattr(module, "layer_idx", -1)
+    _is_decode = attention_mask is not None
+    _tag = "decode_in" if _is_decode else "extend_in"
+    if _FA_DUMP and _layer_id in _FA_DUMP_LAYERS:
+        _fa_dump(_tag, _layer_id, {
+            # Q/K/V in (B, T, H, D) layout — FA varlen consumes these
+            "q": query,
+            "k": key,
+            "v": value,
+            "attention_mask": attention_mask,
+            "cu_seq_lens_q": kwargs.get("cu_seq_lens_q", None),
+            "cu_seq_lens_k": kwargs.get("cu_seq_lens_k", None),
+            "max_length_q": kwargs.get("max_length_q", None),
+            "max_length_k": kwargs.get("max_length_k", None),
+            "position_ids": kwargs.get("position_ids", None),
+            "softmax_scale": scaling,
+            "sliding_window": sliding_window,
+            "softcap": softcap,
+            "is_causal": getattr(module, "is_causal", True),
+            "seq_len": seq_len,
+        })
+
     # In PEFT, usually we cast the layer norms in float32 for training stability reasons
     # therefore the input hidden states gets silently casted in float32. Hence, we need
     # cast them back in the correct dtype just to be sure everything works as expected.
@@ -266,5 +315,9 @@ def flash_attention_forward(
         target_dtype=target_dtype,
         **kwargs,
     )
+
+    if _FA_DUMP and _layer_id in _FA_DUMP_LAYERS:
+        _out_tag = "decode_out" if _is_decode else "extend_out"
+        _fa_dump(_out_tag, _layer_id, {"o": attn_output})
 
     return attn_output, None

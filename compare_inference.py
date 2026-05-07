@@ -15,10 +15,8 @@ import torch
 import openai
 
 MODEL_PATH = "/scratch/ansh/models/maple_reference_model"
-MAX_NEW_TOKENS = 128
+MAX_NEW_TOKENS = 1024
 TOP_K_LOGPROBS = 1000
-
-torch.backends.cuda.matmul.allow_tf32 = False
 
 BASE_PROMPTS = [
     "What's your name",
@@ -29,7 +27,7 @@ BASE_PROMPTS = [
     "Papa John's Pizza",
     "After KSI left Diddy's party",
     "9 + 10 = "
-]
+][:3]
 
 
 # ── Prompt helpers ────────────────────────────────────────────────────────────
