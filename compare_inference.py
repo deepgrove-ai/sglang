@@ -87,7 +87,7 @@ def run_hf(
         model_path,
         trust_remote_code=True,
         torch_dtype=torch.bfloat16,
-        device_map="cuda:1",
+        device_map="auto",
     )
     model.eval()
 

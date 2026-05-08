@@ -22,6 +22,11 @@ from transformers.activations import ACT2FN
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 
 from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.linear import (
+    QKVParallelLinear,
+    ReplicatedLinear,
+    RowParallelLinear,
+)
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -29,6 +34,18 @@ from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead, VocabPara
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.maple_fa.fa3 import flash_attention_forward
+from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
+from sglang.srt.distributed import (
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
+)
+from sglang.srt.utils import (
+    add_prefix,
+    is_cuda,
+    is_flashinfer_available,
+    is_non_idle_and_non_empty,
+)
+
 # from sglang.srt.models.maple_fa.simple_varlen_flash_attention import flash_attention_forward
 
 logger = logging.getLogger(__name__)
@@ -55,7 +72,7 @@ if _LOGIT_DEBUG:
     _atexit.register(_sgl_save)
 # ─────────────────────────────────────────────────────────────────────────────
 
-USE_FUSED_EXPERTS = True 
+USE_FUSED_EXPERTS = False 
 
 
 # ── identical to modeling_maple.py ───────────────────────────────────────────
@@ -318,10 +335,16 @@ class MapleSparseMoeBlock(nn.Module):
         combine_input = self.experts.run_moe_core(dispatch_output=dispatch_output)
         expert_outs = combine_input.hidden_states  # (T, K, H) in model dtype, unweighted
 
-        # Mirror old moe_infer: cast to float32, multiply, sum, cast back.
+        # Mirror old moe_infer: cast to float32, multiply, sum. Stay in fp32
+        # through the cross-rank reduce so accumulation is in fp32, then cast back.
         weighted = expert_outs.to(torch.float32).mul_(topk_weight.unsqueeze(dim=-1))
-        final_out = weighted.sum(dim=1).to(hidden_states.dtype)
-        return final_out
+        final_out = weighted.sum(dim=1)
+        # FusedMoE shards experts along the intermediate dim under TP; each rank
+        # produces only its partial sum. Combine across TP ranks (the standard
+        # FusedMoE.combine() path does this for us, but we bypassed it).
+        if get_tensor_model_parallel_world_size() > 1:
+            final_out = tensor_model_parallel_all_reduce(final_out)
+        return final_out.to(hidden_states.dtype)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # SGLang: hidden_states is (num_tokens, hidden_size); add fake batch dim to match HF.
@@ -348,7 +371,8 @@ class MapleSparseMoeBlock(nn.Module):
 
 # ── SGLang-adapted attention (same math, RadixAttention for KV cache) ─────────
 class MapleAttention(nn.Module):
-    def __init__(self, config, layer_idx: int):
+    def __init__(self, config, layer_idx: int, prefix: str = ""):
+        
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
@@ -369,26 +393,61 @@ class MapleAttention(nn.Module):
         self.layer_type = config.layer_types[layer_idx] if hasattr(config, "layer_types") else None
         self.sliding_window = config.sliding_window if self.layer_type == "sliding_attention" else None
 
-        self.q_proj = nn.Linear(config.hidden_size, self.num_heads * self.head_dim, bias=False)
-        self.k_proj = nn.Linear(config.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
-        self.v_proj = nn.Linear(config.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
+        attn_tp_rank = get_attention_tp_rank()
+        attn_tp_size = get_attention_tp_size()
+
+        # Local (per-rank) head counts — QKVParallelLinear returns the local shard.
+        assert self.num_heads % attn_tp_size == 0, (
+            f"num_heads={self.num_heads} not divisible by attn_tp_size={attn_tp_size}"
+        )
+        assert self.num_key_value_heads % attn_tp_size == 0, (
+            f"num_key_value_heads={self.num_key_value_heads} not divisible by attn_tp_size={attn_tp_size}"
+        )
+        self.num_local_heads = self.num_heads // attn_tp_size
+        self.num_local_kv_heads = self.num_key_value_heads // attn_tp_size
+
+        # self.q_proj = nn.Linear(config.hidden_size, self.num_heads * self.head_dim, bias=False)
+        # self.k_proj = nn.Linear(config.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
+        # self.v_proj = nn.Linear(config.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
+
+        self.qkv_proj = QKVParallelLinear(
+            self.hidden_size,
+            self.head_dim,
+            self.num_heads,
+            self.num_key_value_heads,
+            bias=False,
+            tp_rank=attn_tp_rank,
+            tp_size=attn_tp_size,
+            prefix=add_prefix("qkv_proj", prefix),
+        )
 
         self.q_norm = MapleRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = MapleRMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
-        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=config.use_bias)
-
-        # SGLang KV cache manager (replaces HF DynamicCache + flash_attention_forward).
         # Sliding-window layers: pass the window size; NoPe (full-attention) layers: -1.
         sliding_window_size = self.sliding_window if self.sliding_window is not None else -1
         self.attn = RadixAttention(
-            num_heads=self.num_heads,
+            num_heads=self.num_local_heads,
             head_dim=self.head_dim,
             scaling=self.scaling,
-            num_kv_heads=self.num_key_value_heads,
+            num_kv_heads=self.num_local_kv_heads,
             layer_id=layer_idx,
             sliding_window_size=sliding_window_size,
         )
+
+        # self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=config.use_bias)
+        # reduce_results=False so we can do the cross-rank reduce in fp32 (see forward).
+        self.o_proj = RowParallelLinear(
+            self.num_heads  * self.head_dim,
+            self.hidden_size,
+            bias=config.use_bias,
+            tp_rank=attn_tp_rank,
+            tp_size=attn_tp_size,
+            reduce_results=False,
+            prefix=add_prefix("o_proj", prefix),
+        )
+
+        # SGLang KV cache manager (replaces HF DynamicCache + flash_attention_forward).
 
     def forward(
         self,
@@ -399,12 +458,11 @@ class MapleAttention(nn.Module):
     ) -> torch.Tensor:
         num_tokens, _ = hidden_states.shape
 
-        qkv_weight = torch.cat([self.q_proj.weight, self.k_proj.weight, self.v_proj.weight], dim=0)
-        out_qkv = F.linear(hidden_states, qkv_weight)
-        qkv = out_qkv.view(num_tokens, self.num_heads + 2 * self.num_key_value_heads, self.head_dim)
+        out_qkv, _ = self.qkv_proj(hidden_states)
+        qkv = out_qkv.view(num_tokens, self.num_local_heads + 2 * self.num_local_kv_heads, self.head_dim)
 
         query_states, key_states, value_states = qkv.split(
-            [self.num_heads, self.num_key_value_heads, self.num_key_value_heads], dim=-2
+            [self.num_local_heads, self.num_local_kv_heads, self.num_local_kv_heads], dim=-2
         )
 
         query_states = self.q_norm(query_states)
@@ -418,13 +476,18 @@ class MapleAttention(nn.Module):
                 query_states, key_states, cos, sin, unsqueeze_dim=1
             )
 
-        q = query_states.reshape(num_tokens, self.num_heads * self.head_dim)
-        k = key_states.reshape(num_tokens, self.num_key_value_heads * self.head_dim)
-        v = value_states.reshape(num_tokens, self.num_key_value_heads * self.head_dim)
+        q = query_states.reshape(num_tokens, self.num_local_heads * self.head_dim)
+        k = key_states.reshape(num_tokens, self.num_local_kv_heads * self.head_dim)
+        v = value_states.reshape(num_tokens, self.num_local_kv_heads * self.head_dim)
 
         attn_output = self.attn(q, k, v, forward_batch)
 
-        attn_output = F.linear(attn_output, self.o_proj.weight)
+        # RowParallelLinear with reduce_results=False returns the per-rank partial
+        # sum in bf16. Upcast → fp32 cross-rank all-reduce → downcast, so the
+        # accumulation across TP ranks happens in fp32 (matches TP=1 precision).
+        attn_output, _ = self.o_proj(attn_output)
+        if get_tensor_model_parallel_world_size() > 1:
+            attn_output = tensor_model_parallel_all_reduce(attn_output.to(torch.float32)).to(hidden_states.dtype)
         return attn_output
 
 # ── Decoder layer — identical structure to HF, simplified forward ─────────────
@@ -572,6 +635,12 @@ class MapleForCausalLM(nn.Module):
         return self.logits_processor(input_ids, hidden_states, self.lm_head, forward_batch)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        # Map HF-format separate q/k/v projections onto the fused QKVParallelLinear.
+        stacked_params_mapping = [
+            (".qkv_proj", ".q_proj", "q"),
+            (".qkv_proj", ".k_proj", "k"),
+            (".qkv_proj", ".v_proj", "v"),
+        ]
 
         if USE_FUSED_EXPERTS:
             expert_params_mapping = FusedMoE.make_expert_params_mapping(
@@ -580,33 +649,40 @@ class MapleForCausalLM(nn.Module):
                 ckpt_up_proj_name="up_proj",
                 num_experts=self.config.num_experts,
             )
-# 
+        else:
+            expert_params_mapping = []
 
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
 
-            if not USE_FUSED_EXPERTS:
-                if name not in params_dict:
-                    logger.debug(f"Skipping {name} — not in model")
+            # 1) qkv fusion
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                if weight_name not in name:
                     continue
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
-            
-            else: 
+                fused_name = name.replace(weight_name, param_name)
+                if fused_name not in params_dict:
+                    continue
+                param = params_dict[fused_name]
+                param.weight_loader(param, loaded_weight, shard_id)
+                break
+            else:
+                # 2) fused-expert mapping
                 for param_name, weight_name, expert_id, shard_id in expert_params_mapping:
                     if weight_name not in name:
                         continue
-                    name = name.replace(weight_name, param_name)
-                    if name not in params_dict:
+                    mapped_name = name.replace(weight_name, param_name)
+                    if mapped_name not in params_dict:
                         continue
-                    param = params_dict[name]
-                    weight_loader = param.weight_loader
-                    weight_loader(param, loaded_weight, name, shard_id=shard_id, expert_id=expert_id)
+                    param = params_dict[mapped_name]
+                    param.weight_loader(
+                        param, loaded_weight, mapped_name,
+                        shard_id=shard_id, expert_id=expert_id,
+                    )
                     break
                 else:
+                    # 3) fallthrough: load as-is
                     if name not in params_dict:
                         logger.debug(f"Skipping {name} — not in model")
                         continue
