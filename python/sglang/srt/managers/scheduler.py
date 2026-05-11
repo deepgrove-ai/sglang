@@ -965,7 +965,6 @@ class Scheduler(
             self.cur_batch = batch
 
             if batch:
-                print("GOT BATCH", batch, flush=True)
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
             else:
@@ -988,7 +987,6 @@ class Scheduler(
 
             batch_result = None
             if batch:
-                print("GOT BATCH", batch, flush=True)
                 batch_result = self.run_batch(batch)
                 self.result_queue.append((batch.copy(), batch_result))
 

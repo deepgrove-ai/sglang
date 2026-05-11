@@ -72,7 +72,7 @@ if _LOGIT_DEBUG:
     _atexit.register(_sgl_save)
 # ─────────────────────────────────────────────────────────────────────────────
 
-USE_FUSED_EXPERTS = False 
+USE_FUSED_EXPERTS = True
 
 
 # ── identical to modeling_maple.py ───────────────────────────────────────────
