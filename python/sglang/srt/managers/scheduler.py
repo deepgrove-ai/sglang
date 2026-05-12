@@ -35,6 +35,14 @@ from torch.cuda import Stream as CudaStream
 from torch.cuda import StreamContext as CudaStreamContext
 from torch.distributed import barrier
 
+# Router replay: optional capture hook used by slime to record SGLang's MoE
+# top-k decisions and reuse them during training. No-op when slime is not on
+# the path or SLIME_ROUTER_REPLAY_DIR is unset.
+try:
+    from slime.router_replay import sglang_capture as _slime_router_replay
+except ImportError:  # pragma: no cover
+    _slime_router_replay = None
+
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constrained.base_grammar_backend import (
     INVALID_GRAMMAR_OBJ,
@@ -1948,6 +1956,16 @@ class Scheduler(
         self.forward_ct += 1
         # print(f">>> [run_batch] ENTERED forward_ct={self.forward_ct} forward_mode={batch.forward_mode} num_reqs={len(batch.reqs)} is_generation={self.is_generation}", flush=True)
 
+        # Router replay capture (slime): begin context for record_topk. The
+        # matching end_forward fires in process_batch_result, AFTER the sampled
+        # token is appended and req.finished() can return True.
+        if _slime_router_replay is not None:
+            _slime_router_replay.begin_forward(self, batch)
+        return self._run_batch_inner(batch)
+
+    def _run_batch_inner(
+        self, batch: ScheduleBatch
+    ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         # Whether to run the profiler
         self._profile_batch_predicate(batch)
         if self.forward_sleep_time is not None:
@@ -2110,6 +2128,11 @@ class Scheduler(
             if self.enable_overlap:
                 if result.copy_done is not None:
                     result.copy_done.synchronize()
+
+        # Router replay: dump now that sampled tokens are appended and
+        # req.finished() reflects this step's terminations.
+        if _slime_router_replay is not None:
+            _slime_router_replay.end_forward(batch)
 
         self.maybe_send_health_check_signal()
 

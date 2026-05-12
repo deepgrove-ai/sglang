@@ -1,19 +1,18 @@
 # coding=utf-8
-"""Inference-only Maple model — 1-1 port of modeling_maple.py for SGLang.
+"""Inference-only Maple model for SGLang.
 
-SGLang compatibility additions only:
-  - VocabParallelEmbedding for word_embeddings
-  - ParallelLMHead + LogitsProcessor for lm_head / output
-  - RadixAttention replaces HF Cache + flash_attention_forward (same math)
-  - load_weights() for weight-file loading
-All computation (norms, MoE routing, MLP, RoPE, QKV math) is identical to HF.
+SGLang-flavored port of VeOmni's modeling_maple.py:
+  - QKVParallelLinear / RowParallelLinear / VocabParallelEmbedding / ParallelLMHead
+  - FusedMoE (Triton) for the MoE experts
+  - RadixAttention replaces FA3 + DynamicCache
+
+Router replay: ``record_topk`` is called inside the MoE forward so slime
+can dump SGLang's top-k decisions for the trainer to replay.
 """
 
 import logging
 import math
-import os
-import atexit as _atexit
-from typing import Iterable, Optional, Tuple, Union
+from typing import Iterable, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -21,12 +20,16 @@ from torch import nn
 from transformers.activations import ACT2FN
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 
-from sglang.srt.layers.logits_processor import LogitsProcessor
+try:
+    from slime.router_replay import sglang_capture as _slime_router_replay
+except ImportError:  # pragma: no cover
+    _slime_router_replay = None
+
 from sglang.srt.layers.linear import (
     QKVParallelLinear,
-    ReplicatedLinear,
     RowParallelLinear,
 )
+from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -38,91 +41,32 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
-from sglang.srt.utils import (
-    add_prefix,
-    is_cuda,
-    is_flashinfer_available,
-    is_non_idle_and_non_empty,
-)
+from sglang.srt.utils import add_prefix
 
 
 logger = logging.getLogger(__name__)
 
-# torch.backends.cuda.matmul.allow_tf32 = False
-
-# ── debug tensor dumps ────────────────────────────────────────────────────────
-_LOGIT_DEBUG = os.environ.get("LOGIT_DEBUG", "").lower() == "true"
-_SGL_DBG  = {}
-_SGL_STEP = [0]
-_SGL_LAYER = [0]
-
-def _sgl_dbg(name, t):
-    if not _LOGIT_DEBUG:
-        return
-    key = f"s{_SGL_STEP[0]:03d}_l{_SGL_LAYER[0]:02d}_{name}"
-    _SGL_DBG[key] = t.reshape(-1, t.shape[-1])[-1].detach().cpu().to(torch.float32).clone()
-
-def _sgl_save():
-    torch.save(_SGL_DBG, "/tmp/sgl_debug.pt")
-    print(f"[SGL debug] saved {len(_SGL_DBG)} tensors → /tmp/sgl_debug.pt")
-
-if _LOGIT_DEBUG:
-    _atexit.register(_sgl_save)
-# ─────────────────────────────────────────────────────────────────────────────
-
 USE_FUSED_EXPERTS = True
 
 
-# ── identical to modeling_maple.py ───────────────────────────────────────────
+# ── building blocks ──────────────────────────────────────────────────────────
 
 class MapleRotaryEmbedding(nn.Module):
     def __init__(self, config, device=None):
         super().__init__()
         if hasattr(config, "rope_scaling") and config.rope_scaling is not None:
             self.rope_type = config.rope_scaling.get("rope_type", config.rope_scaling.get("type"))
-        else: 
+        else:
             self.rope_type = "default"
-
         self.max_seq_len_cached = config.max_position_embeddings
         self.original_max_seq_len = config.max_position_embeddings
 
         self.config = config
-        
         self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
 
         inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self.original_inv_freq = self.inv_freq
-
-    @staticmethod
-    def compute_default_rope_parameters(
-        config,
-        device: Optional["torch.device"] = None,
-        seq_len: int | None = None,
-    ) -> tuple["torch.Tensor", float]:
-        """
-        Computes the inverse frequencies according to the original RoPE implementation
-        Args:
-            config ([`~transformers.PreTrainedConfig`]):
-                The model configuration.
-            device (`torch.device`):
-                The device to use for initialization of the inverse frequencies.
-            seq_len (`int`, *optional*):
-                The current sequence length. Unused for this type of RoPE.
-        Returns:
-            Tuple of (`torch.Tensor`, `float`), containing the inverse frequencies for the RoPE embeddings and the
-            post-processing scaling factor applied to the computed cos/sin (unused in this type of RoPE).
-        """
-        base = getattr(config, "rope_theta")
-        dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
-
-        attention_factor = 1.0  # Unused in this type of RoPE
-
-        # Compute the inverse frequencies
-        inv_freq = 1.0 / (
-            base ** (torch.arange(0, dim, 2, dtype=torch.int64).to(device=device, dtype=torch.float) / dim)
-        )
-        return inv_freq, attention_factor
 
     @torch.no_grad()
     @dynamic_rope_update
@@ -170,16 +114,15 @@ class MapleMLP(nn.Module):
         self.intermediate_size = intermediate_size
 
         self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.up_proj   = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):
-        gate_weight, up_weight, down_weight = self.gate_proj.weight, self.up_proj.weight, self.down_proj.weight
-        gate = F.linear(x, gate_weight)
-        up = F.linear(x, up_weight)
+        gate = F.linear(x, self.gate_proj.weight)
+        up = F.linear(x, self.up_proj.weight)
         hidden = (self.act_fn(gate.float()) * up.float()).to(x.dtype)
-        return F.linear(hidden, down_weight)
+        return F.linear(hidden, self.down_proj.weight)
 
 
 class MapleRMSNorm(nn.Module):
@@ -193,9 +136,7 @@ class MapleRMSNorm(nn.Module):
         hidden_states = hidden_states.to(torch.float32)
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        weight_float = self.weight.float()
-        res = weight_float * hidden_states
-        return res.to(input_dtype)
+        return (self.weight.float() * hidden_states).to(input_dtype)
 
 
 class MapleGate(nn.Module):
@@ -222,12 +163,15 @@ class MapleGate(nn.Module):
         return topk_idx, topk_weight, logits
 
 
+# ── MoE: Python-reference path (used when USE_FUSED_EXPERTS=False) ───────────
+
 class MapleSparseMoeBlockOld(nn.Module):
-    """Unfused MoE block — identical to HF; always uses moe_infer path at inference."""
+    """Unfused MoE block — identical math to HF; loops over experts in Python."""
 
     def __init__(self, config, layer_id: int) -> None:
         super().__init__()
         self.config = config
+        self.layer_id = layer_id  # exposed for router_replay capture
         self.num_experts_per_tok = config.num_experts_per_tok
         self.experts = nn.ModuleList([
             MapleMLP(config=config, intermediate_size=config.moe_intermediate_size)
@@ -236,25 +180,19 @@ class MapleSparseMoeBlockOld(nn.Module):
         self.gate = MapleGate(config)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # SGLang: hidden_states is (num_tokens, hidden_size); add fake batch dim to match HF.
-        print("running old moe experts")
         is_2d = hidden_states.dim() == 2
         if is_2d:
             hidden_states = hidden_states.unsqueeze(0)
-            # print("post unsqueeze", hidden_states)
-
         bsz, seq_len, h = hidden_states.shape
+
         topk_idx, topk_weight, _router_logits = self.gate(hidden_states)
-        # _sgl_dbg("router_logits", _router_logits)
-        # _sgl_dbg("router_probs", topk_weight)
+        if _slime_router_replay is not None:
+            _slime_router_replay.record_topk(self.layer_id, topk_idx, topk_weight)
+
         hidden_states = hidden_states.view(-1, h)
         y = self.moe_infer(hidden_states, topk_idx, topk_weight).view(bsz, seq_len, h)
-        # print("moe shape", y.shape)
-        # _sgl_dbg("ffn_out", y.reshape(-1, y.shape[-1]))
-
         if is_2d:
             y = y.squeeze(0)
-        # print("returning", y.shape)
         return y
 
     @torch.no_grad()
@@ -267,18 +205,13 @@ class MapleSparseMoeBlockOld(nn.Module):
         tokens_per_expert = tokens_per_expert.cpu().numpy()
         outputs = []
         start_idx = 0
-        # _pfx = f"s{_SGL_STEP[0]:03d}_l{_SGL_LAYER[0]:02d}" if _LOGIT_DEBUG else None
         for i, num_tokens in enumerate(tokens_per_expert):
             end_idx = start_idx + num_tokens
             if num_tokens == 0:
                 continue
             expert = self.experts[i]
             tokens_for_this_expert = sorted_tokens[start_idx:end_idx]
-            # if _LOGIT_DEBUG:
-            #     _SGL_DBG[f"{_pfx}_expert{i:03d}_in"] = tokens_for_this_expert.detach().cpu().float().clone()
             expert_out = expert(tokens_for_this_expert)
-            # if _LOGIT_DEBUG:
-            #     _SGL_DBG[f"{_pfx}_expert{i:03d}_out"] = expert_out.detach().cpu().float().clone()
             outputs.append(expert_out.to(x.device))
             start_idx = end_idx
 
@@ -290,16 +223,17 @@ class MapleSparseMoeBlockOld(nn.Module):
             .type(topk_weight.dtype)
             .mul_(topk_weight.unsqueeze(dim=-1))
         )
-        # if _LOGIT_DEBUG:
-        #     _SGL_DBG[f"{_pfx}_expert_weighted"] = weighted.detach().cpu().float().clone()
         final_out = weighted.sum(dim=1).type(new_x.dtype)
         return final_out
 
+
+# ── MoE: FusedMoE (Triton) path — the default ────────────────────────────────
 
 class MapleSparseMoeBlock(nn.Module):
     def __init__(self, config, layer_id: int) -> None:
         super().__init__()
         self.config = config
+        self.layer_id = layer_id  # exposed for router_replay capture
         self.num_experts_per_tok = config.num_experts_per_tok
 
         self.experts = FusedMoE(
@@ -310,21 +244,21 @@ class MapleSparseMoeBlock(nn.Module):
             layer_id=layer_id,
             quant_config=None,
             prefix="experts",
-            no_combine=True,  # return (T, K, H) so we accumulate in fp32
+            no_combine=True,  # return (T, K, H) so we accumulate in fp32 ourselves
             inplace=False,    # required when no_combine=True
         )
         self.gate = MapleGate(config)
 
     @torch.no_grad()
     def moe_infer(self, x, topk_ids, topk_weight, router_logits):
-        # match old impl
         hidden_states = x
-        # Pass ones so the W2 kernel multiplies by 1.0 (no-op); we apply weights
-        # in float32 below to match the old moe_infer precision.
+        # Pass ones so the W2 kernel multiplies by 1.0 (no-op); apply the
+        # actual weights below in fp32 to match the reference moe_infer's
+        # accumulation precision.
         topk_output = StandardTopKOutput(
             topk_weights=torch.ones_like(topk_weight),
             topk_ids=topk_ids.to(torch.int32),
-            router_logits=router_logits
+            router_logits=router_logits,
         )
 
         dispatch_output = self.experts.dispatcher.dispatch(
@@ -333,44 +267,33 @@ class MapleSparseMoeBlock(nn.Module):
         combine_input = self.experts.run_moe_core(dispatch_output=dispatch_output)
         expert_outs = combine_input.hidden_states  # (T, K, H) in model dtype, unweighted
 
-        # Mirror old moe_infer: cast to float32, multiply, sum. Stay in fp32
-        # through the cross-rank reduce so accumulation is in fp32, then cast back.
         weighted = expert_outs.to(torch.float32).mul_(topk_weight.unsqueeze(dim=-1))
         final_out = weighted.sum(dim=1)
-        # FusedMoE shards experts along the intermediate dim under TP; each rank
-        # produces only its partial sum. Combine across TP ranks (the standard
-        # FusedMoE.combine() path does this for us, but we bypassed it).
         if get_tensor_model_parallel_world_size() > 1:
             final_out = tensor_model_parallel_all_reduce(final_out)
         return final_out.to(hidden_states.dtype)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # SGLang: hidden_states is (num_tokens, hidden_size); add fake batch dim to match HF.
-        # print("running fused moe experts")
         is_2d = hidden_states.dim() == 2
         if is_2d:
             hidden_states = hidden_states.unsqueeze(0)
-            # print("post unsqueeze", hidden_states)
-
         bsz, seq_len, h = hidden_states.shape
-        topk_idx, topk_weight, _router_logits = self.gate(hidden_states)
-        # _sgl_dbg("router_logits", _router_logits)
-        # _sgl_dbg("router_probs", topk_weight)
-        hidden_states = hidden_states.view(-1, h)
-        y = self.moe_infer(hidden_states, topk_idx, topk_weight, _router_logits).view(bsz, seq_len, h)
-        # print("moe shape", y.shape)
-        # _sgl_dbg("ffn_out", y.reshape(-1, y.shape[-1]))
 
+        topk_idx, topk_weight, router_logits = self.gate(hidden_states)
+        if _slime_router_replay is not None:
+            _slime_router_replay.record_topk(self.layer_id, topk_idx, topk_weight)
+
+        hidden_states = hidden_states.view(-1, h)
+        y = self.moe_infer(hidden_states, topk_idx, topk_weight, router_logits).view(bsz, seq_len, h)
         if is_2d:
             y = y.squeeze(0)
-        # print("returning", y.shape)
         return y
 
 
-# ── SGLang-adapted attention (same math, RadixAttention for KV cache) ─────────
+# ── attention (RadixAttention is the only inference-specific substitution) ────
+
 class MapleAttention(nn.Module):
     def __init__(self, config, layer_idx: int, prefix: str = ""):
-        
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
@@ -394,7 +317,6 @@ class MapleAttention(nn.Module):
         attn_tp_rank = get_attention_tp_rank()
         attn_tp_size = get_attention_tp_size()
 
-        # Local (per-rank) head counts — QKVParallelLinear returns the local shard.
         assert self.num_heads % attn_tp_size == 0, (
             f"num_heads={self.num_heads} not divisible by attn_tp_size={attn_tp_size}"
         )
@@ -403,10 +325,6 @@ class MapleAttention(nn.Module):
         )
         self.num_local_heads = self.num_heads // attn_tp_size
         self.num_local_kv_heads = self.num_key_value_heads // attn_tp_size
-
-        # self.q_proj = nn.Linear(config.hidden_size, self.num_heads * self.head_dim, bias=False)
-        # self.k_proj = nn.Linear(config.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
-        # self.v_proj = nn.Linear(config.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
 
         self.qkv_proj = QKVParallelLinear(
             self.hidden_size,
@@ -422,7 +340,6 @@ class MapleAttention(nn.Module):
         self.q_norm = MapleRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = MapleRMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
-        # Sliding-window layers: pass the window size; NoPe (full-attention) layers: -1.
         sliding_window_size = self.sliding_window if self.sliding_window is not None else -1
         self.attn = RadixAttention(
             num_heads=self.num_local_heads,
@@ -433,10 +350,9 @@ class MapleAttention(nn.Module):
             sliding_window_size=sliding_window_size,
         )
 
-        # self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=config.use_bias)
-        # reduce_results=False so we can do the cross-rank reduce in fp32 (see forward).
+        # reduce_results=False so we can do the cross-rank all-reduce in fp32 below.
         self.o_proj = RowParallelLinear(
-            self.num_heads  * self.head_dim,
+            self.num_heads * self.head_dim,
             self.hidden_size,
             bias=config.use_bias,
             tp_rank=attn_tp_rank,
@@ -445,8 +361,6 @@ class MapleAttention(nn.Module):
             prefix=add_prefix("o_proj", prefix),
         )
 
-        # SGLang KV cache manager (replaces HF DynamicCache + flash_attention_forward).
-
     def forward(
         self,
         positions: torch.Tensor,
@@ -454,7 +368,7 @@ class MapleAttention(nn.Module):
         forward_batch: ForwardBatch,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
-        num_tokens, _ = hidden_states.shape
+        num_tokens = hidden_states.shape[0]
 
         out_qkv, _ = self.qkv_proj(hidden_states)
         qkv = out_qkv.view(num_tokens, self.num_local_heads + 2 * self.num_local_kv_heads, self.head_dim)
@@ -480,15 +394,13 @@ class MapleAttention(nn.Module):
 
         attn_output = self.attn(q, k, v, forward_batch)
 
-        # RowParallelLinear with reduce_results=False returns the per-rank partial
-        # sum in bf16. Upcast → fp32 cross-rank all-reduce → downcast, so the
-        # accumulation across TP ranks happens in fp32 (matches TP=1 precision).
         attn_output, _ = self.o_proj(attn_output)
         if get_tensor_model_parallel_world_size() > 1:
             attn_output = tensor_model_parallel_all_reduce(attn_output.to(torch.float32)).to(hidden_states.dtype)
         return attn_output
 
-# ── Decoder layer — identical structure to HF, simplified forward ─────────────
+
+# ── decoder layer ─────────────────────────────────────────────────────────────
 
 class MapleDecoderLayer(nn.Module):
     def __init__(self, config, layer_idx: int):
@@ -498,12 +410,10 @@ class MapleDecoderLayer(nn.Module):
 
         self.self_attn = MapleAttention(config=config, layer_idx=layer_idx)
 
-
-        self.mlp = None
-        if not USE_FUSED_EXPERTS:
-            self.mlp = MapleSparseMoeBlockOld(config, layer_id=layer_idx)
-        else: 
+        if USE_FUSED_EXPERTS:
             self.mlp = MapleSparseMoeBlock(config, layer_id=layer_idx)
+        else:
+            self.mlp = MapleSparseMoeBlockOld(config, layer_id=layer_idx)
 
         self.input_layernorm = MapleRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = MapleRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -515,36 +425,22 @@ class MapleDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
-        _SGL_LAYER[0] = self.layer_idx
         initial_dtype = hidden_states.dtype
 
-        # ── Attention block (mirrors HF exactly) ──────────────────────────────
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        # _sgl_dbg("post_input_norm", hidden_states)
-
         hidden_states = self.self_attn(positions, hidden_states, forward_batch, position_embeddings)
-        # _sgl_dbg("post_attn", hidden_states)
-        # hidden_states = residual + hidden_states.to(residual.device)
         hidden_states = (residual.to(torch.float32) + hidden_states.to(torch.float32)).to(initial_dtype)
-        # _sgl_dbg("post_attn_residual", hidden_states)
 
-        # ── MLP block (mirrors HF exactly) ────────────────────────────────────
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        # _sgl_dbg("post_post_attn_norm", hidden_states)
-
         hidden_states = self.mlp(hidden_states)
-        # _sgl_dbg("post_mlp", hidden_states)
-
-        # hidden_states = residual + hidden_states.to(residual.device)
         hidden_states = (residual.to(torch.float32) + hidden_states.to(torch.float32)).to(initial_dtype)
-        # _sgl_dbg("post_ffn_residual", hidden_states)
 
         return hidden_states
 
 
-# ── Model backbone ────────────────────────────────────────────────────────────
+# ── backbone ──────────────────────────────────────────────────────────────────
 
 class MapleModel(nn.Module):
     def __init__(self, config):
@@ -553,7 +449,7 @@ class MapleModel(nn.Module):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
-        # VocabParallelEmbedding is weight-compatible with nn.Embedding; same weight name.
+        # VocabParallelEmbedding is weight-compatible with nn.Embedding.
         self.word_embeddings = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
 
         self.layers = nn.ModuleList([
@@ -576,27 +472,17 @@ class MapleModel(nn.Module):
         else:
             hidden_states = input_embeds
 
-        _SGL_LAYER[0] = 0
-        # _sgl_dbg("embed", hidden_states)
-        # _sgl_dbg("causal_mask", torch.zeros(1, 1, device=hidden_states.device))
-
-        # Compute RoPE cos/sin once; sliding-window layers apply it, NoPe layers ignore it.
-        # positions is (num_tokens,); rotary_emb expects (batch, seq) → unsqueeze to (1, T).
+        # positions: (num_tokens,) → rotary_emb expects (B, T)
         position_embeddings = self.rotary_emb(hidden_states, positions.unsqueeze(0))
-        # _sgl_dbg("rope_cos", position_embeddings[0].reshape(-1, position_embeddings[0].shape[-1]))
-        # _sgl_dbg("rope_sin", position_embeddings[1].reshape(-1, position_embeddings[1].shape[-1]))
 
         for layer in self.layers:
             hidden_states = layer(positions, hidden_states, forward_batch, position_embeddings)
 
         hidden_states = self.norm(hidden_states)
-        _SGL_LAYER[0] = 99
-        # _sgl_dbg("final_norm", hidden_states)
-
         return hidden_states
 
 
-# ── Causal LM head ────────────────────────────────────────────────────────────
+# ── causal LM head ────────────────────────────────────────────────────────────
 
 class MapleForCausalLM(nn.Module):
     fall_back_to_pt_during_load = False
@@ -622,14 +508,6 @@ class MapleForCausalLM(nn.Module):
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
-        if _LOGIT_DEBUG:
-            _step = _SGL_STEP[0]
-            _lm_out = torch.nn.functional.linear(hidden_states, self.lm_head.weight).float()
-            _lm_2d = _lm_out.reshape(-1, _lm_out.shape[-1]).detach().cpu()
-            _SGL_DBG[f"s{_step:03d}_output_logits"] = _lm_2d.clone()
-            _SGL_DBG[f"s{_step:03d}_output_probs"] = torch.softmax(_lm_2d[-1], dim=-1).clone()
-            _SGL_STEP[0] += 1
-            torch.save(_SGL_DBG, "/tmp/sgl_debug.pt")
         return self.logits_processor(input_ids, hidden_states, self.lm_head, forward_batch)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
@@ -640,15 +518,12 @@ class MapleForCausalLM(nn.Module):
             (".qkv_proj", ".v_proj", "v"),
         ]
 
-        if USE_FUSED_EXPERTS:
-            expert_params_mapping = FusedMoE.make_expert_params_mapping(
-                ckpt_gate_proj_name="gate_proj",
-                ckpt_down_proj_name="down_proj",
-                ckpt_up_proj_name="up_proj",
-                num_experts=self.config.num_experts,
-            )
-        else:
-            expert_params_mapping = []
+        expert_params_mapping = FusedMoE.make_expert_params_mapping(
+            ckpt_gate_proj_name="gate_proj",
+            ckpt_down_proj_name="down_proj",
+            ckpt_up_proj_name="up_proj",
+            num_experts=self.config.num_experts,
+        )
 
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
@@ -680,12 +555,13 @@ class MapleForCausalLM(nn.Module):
                     )
                     break
                 else:
-                    # 3) fallthrough: load as-is
+                    # 3) fallthrough
                     if name not in params_dict:
                         logger.debug(f"Skipping {name} — not in model")
                         continue
                     param = params_dict[name]
                     weight_loader = getattr(param, "weight_loader", default_weight_loader)
                     weight_loader(param, loaded_weight)
+
 
 EntryClass = MapleForCausalLM
