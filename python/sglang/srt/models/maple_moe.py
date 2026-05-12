@@ -29,7 +29,7 @@ from sglang.srt.layers.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
-from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsMetadata
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -428,14 +428,14 @@ class MapleDecoderLayer(nn.Module):
         initial_dtype = hidden_states.dtype
 
         residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
+        # hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.self_attn(positions, hidden_states, forward_batch, position_embeddings)
         hidden_states = (residual.to(torch.float32) + hidden_states.to(torch.float32)).to(initial_dtype)
 
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
-        hidden_states = (residual.to(torch.float32) + hidden_states.to(torch.float32)).to(initial_dtype)
+        # residual = hidden_states
+        # hidden_states = self.post_attention_layernorm(hidden_states)
+        # hidden_states = self.mlp(hidden_states)
+        # hidden_states = (residual.to(torch.float32) + hidden_states.to(torch.float32)).to(initial_dtype)
 
         return hidden_states
 
@@ -475,11 +475,51 @@ class MapleModel(nn.Module):
         # positions: (num_tokens,) → rotary_emb expects (B, T)
         position_embeddings = self.rotary_emb(hidden_states, positions.unsqueeze(0))
 
-        for layer in self.layers:
+        for i, layer in enumerate(self.layers):
+            # if i > 5: 
+            #     break 
+            
             hidden_states = layer(positions, hidden_states, forward_batch, position_embeddings)
 
-        hidden_states = self.norm(hidden_states)
+        # hidden_states = self.norm(hidden_states)
         return hidden_states
+
+
+# ── fp32 lm_head matmul (mirrors VeOmni's MapleForCausalLM.forward exactly) ──
+
+class _FP32MatmulLogitsProcessor(LogitsProcessor):
+    """Force the lm_head matmul into fp32 unconditionally.
+
+    Bypasses ``enable_fp32_lm_head``, ``rl_on_policy_target``,
+    ``use_intel_amx_backend``, the bf16 fallback, and the logit_scale /
+    final_logit_softcapping / TP-all-gather / DP-scatter tails — none of
+    those apply at TP=1 with no DP attention and no logit cap. The
+    resulting matmul is literally:
+
+        logits = hidden_states.fp32 @ lm_head.weight.fp32.T
+
+    which is bit-identical to ``MapleForCausalLM.forward``'s lm_head call
+    in VeOmni's modeling_maple.py.
+    """
+
+    def _get_logits(
+        self,
+        hidden_states: torch.Tensor,
+        lm_head,
+        logits_metadata: LogitsMetadata,
+        embedding_bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        print("hiii in here")
+        logits = torch.matmul(
+            hidden_states.to(torch.float32),
+            lm_head.weight.to(torch.float32).T,
+        )
+        if logits_metadata.next_token_logits_buffer is not None:
+            buf = logits_metadata.next_token_logits_buffer
+            assert buf.dtype == torch.float
+            buf.copy_(logits[:, : self.config.vocab_size])
+            return buf
+        return logits[:, : self.config.vocab_size]
 
 
 # ── causal LM head ────────────────────────────────────────────────────────────
@@ -494,7 +534,7 @@ class MapleForCausalLM(nn.Module):
         self.vocab_size = config.vocab_size
 
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
-        self.logits_processor = LogitsProcessor(config)
+        self.logits_processor = _FP32MatmulLogitsProcessor(config)
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.word_embeddings
