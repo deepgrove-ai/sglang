@@ -432,10 +432,10 @@ class MapleDecoderLayer(nn.Module):
         hidden_states = self.self_attn(positions, hidden_states, forward_batch, position_embeddings)
         hidden_states = (residual.to(torch.float32) + hidden_states.to(torch.float32)).to(initial_dtype)
 
-        # residual = hidden_states
+        residual = hidden_states
         # hidden_states = self.post_attention_layernorm(hidden_states)
         # hidden_states = self.mlp(hidden_states)
-        # hidden_states = (residual.to(torch.float32) + hidden_states.to(torch.float32)).to(initial_dtype)
+        hidden_states = (residual.to(torch.float32) + hidden_states.to(torch.float32)).to(initial_dtype)
 
         return hidden_states
 
@@ -481,7 +481,7 @@ class MapleModel(nn.Module):
             
             hidden_states = layer(positions, hidden_states, forward_batch, position_embeddings)
 
-        # hidden_states = self.norm(hidden_states)
+        hidden_states = self.norm(hidden_states)
         return hidden_states
 
 
