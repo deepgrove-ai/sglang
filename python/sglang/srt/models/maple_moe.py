@@ -426,14 +426,14 @@ class MapleDecoderLayer(nn.Module):
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
         initial_dtype = hidden_states.dtype
-
         residual = hidden_states
         # hidden_states = self.input_layernorm(hidden_states)
+
         hidden_states = self.self_attn(positions, hidden_states, forward_batch, position_embeddings)
         hidden_states = (residual.to(torch.float32) + hidden_states.to(torch.float32)).to(initial_dtype)
 
         residual = hidden_states
-        # hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.post_attention_layernorm(hidden_states)
         # hidden_states = self.mlp(hidden_states)
         hidden_states = (residual.to(torch.float32) + hidden_states.to(torch.float32)).to(initial_dtype)
 
