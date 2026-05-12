@@ -434,7 +434,7 @@ class MapleDecoderLayer(nn.Module):
 
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        # hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp(hidden_states)
         hidden_states = (residual.to(torch.float32) + hidden_states.to(torch.float32)).to(initial_dtype)
 
         return hidden_states
