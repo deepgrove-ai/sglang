@@ -12,6 +12,7 @@ can dump SGLang's top-k decisions for the trainer to replay.
 
 import logging
 import math
+import re
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -24,6 +25,12 @@ try:
     from slime.router_replay import sglang_capture as _slime_router_replay
 except ImportError:  # pragma: no cover
     _slime_router_replay = None
+
+# sonicmoe MoE kernel — same kernel ve's trainer uses. Required for bit-exact
+# MoE output parity between ve↔sgl; FusedMoE (the default sgl path) diverges
+# from sonicmoe at small post-norm input magnitudes.
+from sonicmoe.functional import moe_TC_softmax_topk_layer
+from sonicmoe.enums import ActivationType
 
 from sglang.srt.layers.linear import (
     QKVParallelLinear,
@@ -47,6 +54,96 @@ from sglang.srt.utils import add_prefix
 logger = logging.getLogger(__name__)
 
 USE_FUSED_EXPERTS = True
+# Use sonicmoe (ve trainer's MoE kernel) instead of FusedMoE for bit-exact
+# parity at small post-norm input magnitudes. Assumes TP=1 (no expert
+# sharding across ranks) — sonicmoe doesn't implement TP shards here.
+USE_SONIC_MOE = True
+
+# Dump-hooks no-op unless MAPLE_DUMP_HIDDEN=1 — keeps training runs from
+# producing millions of .pt files. Set MAPLE_DUMP_HIDDEN=1 for diagnostic
+# scripts like compare_full_stack.py.
+import os as _early_os
+_DUMP_HIDDEN_ENABLED = _early_os.environ.get("MAPLE_DUMP_HIDDEN", "0") == "1"
+# NaN detection between decoder substeps. Off by default — each check forces
+# a GPU sync. Enable with MAPLE_NAN_CHECK=1 for diagnostics.
+_NAN_CHECK_ENABLED = _early_os.environ.get("MAPLE_NAN_CHECK", "0") == "1"
+
+
+def _nan_check(hidden_states: torch.Tensor, layer_idx: int, tag: str) -> None:
+    """If hidden_states contains a NaN/Inf, print a one-line summary including
+    layer, tag, shape, and counts. No-op unless MAPLE_NAN_CHECK=1."""
+    if not _NAN_CHECK_ENABLED:
+        return
+    nan_count = int(torch.isnan(hidden_states).sum())
+    inf_count = int(torch.isinf(hidden_states).sum())
+    if nan_count or inf_count:
+        print(
+            f"[NAN-CHECK] sgl L{layer_idx:02d} tag={tag} "
+            f"shape={tuple(hidden_states.shape)} dtype={hidden_states.dtype} "
+            f"nan={nan_count} inf={inf_count}",
+            flush=True,
+        )
+
+# Dump pre/post input_layernorm hidden_states for every call to ./dumps/sgl/
+# (overridable via MAPLE_SGL_DUMP_DIR). Filenames are
+# rank{R}_L{layer_idx:02d}_call{N:04d}_{pre,post}.pt — N increments per
+# (layer, label, rank). Rank prefix prevents TP/multi-worker race conditions.
+import os as _os
+import threading as _threading
+_SGL_DUMP_DIR = _os.environ.get(
+    "MAPLE_SGL_DUMP_DIR", _os.path.join(_os.getcwd(), "dumps", "sgl")
+)
+_SGL_DUMP_COUNTERS: dict = {}
+_SGL_WEIGHT_DUMPED: set = set()
+_SGL_DUMP_LOCK = _threading.Lock()
+
+def _sgl_resolve_rank() -> int:
+    try:
+        import torch.distributed as _dist
+        if _dist.is_available() and _dist.is_initialized():
+            return _dist.get_rank()
+    except Exception:
+        pass
+    return _os.getpid()
+
+def _sgl_dump_hidden(hidden_states, layer_idx: int, tag: str) -> None:
+    """Dump a per-call hidden_states tensor. See ve modeling_maple.py for the
+    matching contract — filenames and counter semantics are identical so the
+    analysis scripts can pair ve↔sgl by (layer, tag, shape).
+    No-op unless MAPLE_DUMP_HIDDEN=1."""
+    if not _DUMP_HIDDEN_ENABLED:
+        return
+    _os.makedirs(_SGL_DUMP_DIR, exist_ok=True)
+    rank = _sgl_resolve_rank()
+    with _SGL_DUMP_LOCK:
+        key = (rank, layer_idx, tag)
+        n = _SGL_DUMP_COUNTERS.get(key, 0)
+        fname = _os.path.join(
+            _SGL_DUMP_DIR,
+            f"rank{rank}_L{layer_idx:02d}_call{n:04d}_{tag}.pt",
+        )
+        torch.save(hidden_states.detach().to("cpu"), fname)
+        _SGL_DUMP_COUNTERS[key] = n + 1
+
+def _sgl_dump_weight(weight, layer_idx: int, tag: str) -> None:
+    """Dump a parameter tensor once per (rank, layer, tag).
+    No-op unless MAPLE_DUMP_HIDDEN=1."""
+    if not _DUMP_HIDDEN_ENABLED:
+        return
+    rank = _sgl_resolve_rank()
+    key = (rank, layer_idx, tag)
+    if key in _SGL_WEIGHT_DUMPED:
+        return
+    _os.makedirs(_SGL_DUMP_DIR, exist_ok=True)
+    with _SGL_DUMP_LOCK:
+        if key in _SGL_WEIGHT_DUMPED:
+            return
+        fname = _os.path.join(
+            _SGL_DUMP_DIR,
+            f"rank{rank}_L{layer_idx:02d}_call0000_{tag}.pt",
+        )
+        torch.save(weight.detach().to("cpu"), fname)
+        _SGL_WEIGHT_DUMPED.add(key)
 
 
 # ── building blocks ──────────────────────────────────────────────────────────
@@ -126,17 +223,22 @@ class MapleMLP(nn.Module):
 
 
 class MapleRMSNorm(nn.Module):
-    def __init__(self, hidden_size, eps=1e-6):
+    def __init__(self, hidden_size, eps=1e-6, _fp64=False):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
+        # Diagnostic: compute in fp64 to mask any fp32 reduction-order drift
+        # from CUDA kernel dispatch differences (2D vs 3D inputs, eager vs
+        # inductor). Toggled on for input_layernorm only.
+        self._fp64 = _fp64
 
     def forward(self, hidden_states):
         input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
+        compute_dtype = torch.float64 if self._fp64 else torch.float32
+        hidden_states = hidden_states.to(compute_dtype)
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        return (self.weight.float() * hidden_states).to(input_dtype)
+        return (self.weight.to(compute_dtype) * hidden_states).to(input_dtype)
 
 
 class MapleGate(nn.Module):
@@ -290,6 +392,101 @@ class MapleSparseMoeBlock(nn.Module):
         return y
 
 
+# ── MoE: sonicmoe path (matches ve's trainer kernel exactly) ─────────────────
+
+class MapleSonicMoeExperts(nn.Module):
+    """Holds the fused expert weights consumed by moe_TC_softmax_topk_layer.
+
+    Layout matches ve's MapleSonicMoeExperts:
+      gate_up_proj : (E, 2*I, H) with gate row at 2*i and up row at 2*i+1
+      down_proj    : (E, H, I)
+    Permutation to (2I, H, E) / (H, I, E) happens at call time.
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        self.gate_up_proj = nn.Parameter(
+            torch.empty(config.num_experts, 2 * config.moe_intermediate_size, config.hidden_size)
+        )
+        self.down_proj = nn.Parameter(
+            torch.empty(config.num_experts, config.hidden_size, config.moe_intermediate_size)
+        )
+
+
+class MapleSparseMoeBlockSonic(nn.Module):
+    """sgl MoE block that calls the same sonicmoe kernel ve's trainer uses.
+
+    Routing is captured for slime router_replay via a separate gate forward
+    so the recorded topk matches what sonicmoe will internally pick.
+    """
+
+    def __init__(self, config, layer_id: int) -> None:
+        super().__init__()
+        self.config = config
+        self.layer_id = layer_id
+        self.num_experts = config.num_experts
+        self.top_k = config.num_experts_per_tok
+        self.experts = MapleSonicMoeExperts(config)
+        self.gate = MapleGate(config)
+        # NOTE: do NOT capture the stream at __init__. sgl runs forwards on
+        # internal scheduler streams that differ from whatever was current
+        # during engine startup, and sonicmoe launching on the wrong stream
+        # reads stale memory → NaN. Read current_stream() per-forward instead.
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        is_2d = hidden_states.dim() == 2
+        if is_2d:
+            hidden_states = hidden_states.unsqueeze(0)
+        bsz, seq_len, h = hidden_states.shape
+        hidden_states = hidden_states.view(-1, h)
+
+        # Let sonicmoe compute the gate internally in bf16 — the same CUDA
+        # kernel runs on both sgl and ve, so internal-routing is bit-identical
+        # across processes. Only override via `mod` when slime router_replay is
+        # active, in which case sgl runs a manual fp32 gate (so it can record
+        # the routes it actually used) and ve replays those exact routes.
+        replay_active = (
+            _slime_router_replay is not None
+            and _slime_router_replay.enabled()
+        )
+
+        mod = None
+        if replay_active:
+            topk_idx, topk_w, router_logits = self.gate(hidden_states)
+            _slime_router_replay.record_topk(self.layer_id, topk_idx, topk_w)
+
+            def _gate_mod(_x):
+                return topk_idx, topk_w, router_logits
+
+            mod = _gate_mod
+
+        # Dynamic stream capture — matches whichever stream sgl is using
+        # for this layer's forward.
+        stream_id = torch.cuda.current_stream().cuda_stream
+
+        y, _router_logits, _expert_freq = moe_TC_softmax_topk_layer(
+            hidden_states,
+            self.gate.weight,
+            self.experts.gate_up_proj.permute(1, 2, 0),
+            None,                               # b1
+            self.experts.down_proj.permute(1, 2, 0),
+            None,                               # b2
+            self.top_k,
+            stream_id,
+            ActivationType.SWIGLU,
+            False,                              # is_inference_mode_enabled
+            bias=None,
+            scaling_factor=1.0,
+            norm_topk=True,
+            mod=mod,
+        )
+
+        y = y.view(bsz, seq_len, h)
+        if is_2d:
+            y = y.squeeze(0)
+        return y
+
+
 # ── attention (RadixAttention is the only inference-specific substitution) ────
 
 class MapleAttention(nn.Module):
@@ -410,12 +607,14 @@ class MapleDecoderLayer(nn.Module):
 
         self.self_attn = MapleAttention(config=config, layer_idx=layer_idx)
 
-        if USE_FUSED_EXPERTS:
+        if USE_SONIC_MOE:
+            self.mlp = MapleSparseMoeBlockSonic(config, layer_id=layer_idx)
+        elif USE_FUSED_EXPERTS:
             self.mlp = MapleSparseMoeBlock(config, layer_id=layer_idx)
         else:
             self.mlp = MapleSparseMoeBlockOld(config, layer_id=layer_idx)
 
-        self.input_layernorm = MapleRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = MapleRMSNorm(config.hidden_size, eps=config.rms_norm_eps, _fp64=True)
         self.post_attention_layernorm = MapleRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
@@ -427,15 +626,44 @@ class MapleDecoderLayer(nn.Module):
     ) -> torch.Tensor:
         initial_dtype = hidden_states.dtype
         residual = hidden_states
-        # hidden_states = self.input_layernorm(hidden_states)
+        # one-shot dtype probe: mirror image of the ve probe to confirm
+        # whether input_layernorm.weight matches across sides.
+        if not getattr(MapleDecoderLayer, "_dtype_logged", False) and self.layer_idx == 0:
+            with open("/tmp/sgl_dtype_probe.log", "a") as _f:
+                _f.write(
+                    f"[sgl L0] input_layernorm.weight.dtype={self.input_layernorm.weight.dtype} "
+                    f"post_attention_layernorm.weight.dtype={self.post_attention_layernorm.weight.dtype} "
+                    f"hidden_states.dtype={hidden_states.dtype}\n"
+                )
+            MapleDecoderLayer._dtype_logged = True
+        # Dumps + NaN checks at the same 6 tagged points per layer.
+        _sgl_dump_weight(self.input_layernorm.weight, self.layer_idx, "input_layernorm_weight")
+        _sgl_dump_hidden(hidden_states, self.layer_idx, "before_input_norm")
+        _nan_check(hidden_states, self.layer_idx, "before_input_norm")
+
+        hidden_states = self.input_layernorm(hidden_states)
+        _sgl_dump_hidden(hidden_states, self.layer_idx, "after_input_norm")
+        _nan_check(hidden_states, self.layer_idx, "after_input_norm")
 
         hidden_states = self.self_attn(positions, hidden_states, forward_batch, position_embeddings)
+        _nan_check(hidden_states, self.layer_idx, "attn_out_only")
         hidden_states = (residual.to(torch.float32) + hidden_states.to(torch.float32)).to(initial_dtype)
+        _sgl_dump_hidden(hidden_states, self.layer_idx, "after_attn")
+        _nan_check(hidden_states, self.layer_idx, "after_attn")
 
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
+        _sgl_dump_hidden(hidden_states, self.layer_idx, "after_post_attn_norm")
+        _nan_check(hidden_states, self.layer_idx, "after_post_attn_norm")
+
         hidden_states = self.mlp(hidden_states)
+        # mlp output BEFORE the residual add — isolates MoE kernel vs add.
+        _sgl_dump_hidden(hidden_states, self.layer_idx, "after_mlp_only")
+        _nan_check(hidden_states, self.layer_idx, "after_mlp_only")
+
         hidden_states = (residual.to(torch.float32) + hidden_states.to(torch.float32)).to(initial_dtype)
+        _sgl_dump_hidden(hidden_states, self.layer_idx, "after_moe")
+        _nan_check(hidden_states, self.layer_idx, "after_moe")
 
         return hidden_states
 
@@ -550,6 +778,37 @@ class MapleForCausalLM(nn.Module):
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
         return self.logits_processor(input_ids, hidden_states, self.lm_head, forward_batch)
 
+    # Regex for per-expert HF tensor names that we fuse into the sonic layout.
+    _SONIC_EXPERT_RE = re.compile(
+        r"^model\.layers\.(\d+)\.mlp\.experts\.(\d+)\."
+        r"(gate_proj|up_proj|down_proj)\.weight$"
+    )
+
+    def _load_sonic_expert(self, params_dict, name, loaded_weight) -> bool:
+        """If `name` is a per-expert HF tensor, pack it into the sonic
+        gate_up_proj / down_proj layout and return True. Otherwise return
+        False so the caller can try the next loader path.
+        """
+        m = self._SONIC_EXPERT_RE.match(name)
+        if m is None:
+            return False
+        layer = int(m.group(1))
+        eid = int(m.group(2))
+        proj = m.group(3)
+        if proj == "down_proj":
+            target = f"model.layers.{layer}.mlp.experts.down_proj"
+            param = params_dict[target]
+            # down_proj shape (E, H, I), loaded_weight shape (H, I).
+            param.data[eid].copy_(loaded_weight)
+        else:
+            target = f"model.layers.{layer}.mlp.experts.gate_up_proj"
+            param = params_dict[target]
+            # gate_up_proj shape (E, 2*I, H): gate at 2*i, up at 2*i+1.
+            # loaded_weight shape (I, H).
+            offset = 0 if proj == "gate_proj" else 1
+            param.data[eid, offset::2, :].copy_(loaded_weight)
+        return True
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         # Map HF-format separate q/k/v projections onto the fused QKVParallelLinear.
         stacked_params_mapping = [
@@ -558,11 +817,16 @@ class MapleForCausalLM(nn.Module):
             (".qkv_proj", ".v_proj", "v"),
         ]
 
-        expert_params_mapping = FusedMoE.make_expert_params_mapping(
-            ckpt_gate_proj_name="gate_proj",
-            ckpt_down_proj_name="down_proj",
-            ckpt_up_proj_name="up_proj",
-            num_experts=self.config.num_experts,
+        # FusedMoE mapping only used when USE_SONIC_MOE is False.
+        expert_params_mapping = (
+            []
+            if USE_SONIC_MOE
+            else FusedMoE.make_expert_params_mapping(
+                ckpt_gate_proj_name="gate_proj",
+                ckpt_down_proj_name="down_proj",
+                ckpt_up_proj_name="up_proj",
+                num_experts=self.config.num_experts,
+            )
         )
 
         params_dict = dict(self.named_parameters())
@@ -581,7 +845,13 @@ class MapleForCausalLM(nn.Module):
                 param.weight_loader(param, loaded_weight, shard_id)
                 break
             else:
-                # 2) fused-expert mapping
+                # 2) sonic expert fusion (only matches if USE_SONIC_MOE=True
+                # since the target tensor names exist only in that case).
+                if USE_SONIC_MOE and self._load_sonic_expert(
+                    params_dict, name, loaded_weight
+                ):
+                    continue
+                # 3) FusedMoE expert mapping (USE_SONIC_MOE=False path)
                 for param_name, weight_name, expert_id, shard_id in expert_params_mapping:
                     if weight_name not in name:
                         continue
@@ -595,7 +865,7 @@ class MapleForCausalLM(nn.Module):
                     )
                     break
                 else:
-                    # 3) fallthrough
+                    # 4) fallthrough — plain copy via weight_loader.
                     if name not in params_dict:
                         logger.debug(f"Skipping {name} — not in model")
                         continue
