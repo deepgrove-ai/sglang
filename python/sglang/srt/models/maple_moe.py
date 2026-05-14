@@ -57,7 +57,7 @@ USE_FUSED_EXPERTS = True
 # Use sonicmoe (ve trainer's MoE kernel) instead of FusedMoE for bit-exact
 # parity at small post-norm input magnitudes. Assumes TP=1 (no expert
 # sharding across ranks) — sonicmoe doesn't implement TP shards here.
-USE_SONIC_MOE = True
+USE_SONIC_MOE = False
 
 # Dump-hooks no-op unless MAPLE_DUMP_HIDDEN=1 — keeps training runs from
 # producing millions of .pt files. Set MAPLE_DUMP_HIDDEN=1 for diagnostic
@@ -442,23 +442,26 @@ class MapleSparseMoeBlockSonic(nn.Module):
 
         # Let sonicmoe compute the gate internally in bf16 — the same CUDA
         # kernel runs on both sgl and ve, so internal-routing is bit-identical
-        # across processes. Only override via `mod` when slime router_replay is
-        # active, in which case sgl runs a manual fp32 gate (so it can record
-        # the routes it actually used) and ve replays those exact routes.
+        # across processes. When slime router_replay is active, run the gate
+        # in Python (so we can record what it picked) and hand sonicmoe the
+        # routing decisions back as tensors. The tensor-handoff path replaces
+        # the older ``mod=callable`` route, which forced a Python callback
+        # inside the kernel and prevented CUDA graph capture.
         replay_active = (
             _slime_router_replay is not None
             and _slime_router_replay.enabled()
         )
 
-        mod = None
+        topk_idx_override = None
+        topk_w_override = None
+        router_logits_override = None
         if replay_active:
-            topk_idx, topk_w, router_logits = self.gate(hidden_states)
-            _slime_router_replay.record_topk(self.layer_id, topk_idx, topk_w)
-
-            def _gate_mod(_x):
-                return topk_idx, topk_w, router_logits
-
-            mod = _gate_mod
+            topk_idx_override, topk_w_override, router_logits_override = self.gate(
+                hidden_states
+            )
+            _slime_router_replay.record_topk(
+                self.layer_id, topk_idx_override, topk_w_override
+            )
 
         # Dynamic stream capture — matches whichever stream sgl is using
         # for this layer's forward.
@@ -478,7 +481,9 @@ class MapleSparseMoeBlockSonic(nn.Module):
             bias=None,
             scaling_factor=1.0,
             norm_topk=True,
-            mod=mod,
+            topk_indices_override=topk_idx_override,
+            topk_scores_override=topk_w_override,
+            router_logits_override=router_logits_override,
         )
 
         y = y.view(bsz, seq_len, h)
