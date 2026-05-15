@@ -46,6 +46,7 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
 from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.utils import add_prefix
@@ -725,14 +726,19 @@ class _FP32MatmulLogitsProcessor(LogitsProcessor):
 
     Bypasses ``enable_fp32_lm_head``, ``rl_on_policy_target``,
     ``use_intel_amx_backend``, the bf16 fallback, and the logit_scale /
-    final_logit_softcapping / TP-all-gather / DP-scatter tails — none of
-    those apply at TP=1 with no DP attention and no logit cap. The
-    resulting matmul is literally:
+    final_logit_softcapping / DP-scatter tails. The resulting matmul is:
 
-        logits = hidden_states.fp32 @ lm_head.weight.fp32.T
+        local_logits = hidden_states.fp32 @ lm_head.weight.fp32.T
+        logits       = all_gather(local_logits)  # only when TP>1
 
     which is bit-identical to ``MapleForCausalLM.forward``'s lm_head call
-    in VeOmni's modeling_maple.py.
+    in VeOmni's modeling_maple.py. At TP=1 the all-gather is a no-op; at
+    TP>1 ``lm_head.weight`` is column-sharded along the vocab dim by
+    ``ParallelLMHead``, so each rank computes a vocab-slice of the logits
+    and we gather them along ``dim=-1`` to reconstitute the full
+    ``[num_tokens, vocab_size]`` tensor before the buffer copy. NCCL
+    preserves fp32 across the gather, so the fp32-parity property holds at
+    any TP.
     """
 
     def _get_logits(
@@ -742,11 +748,21 @@ class _FP32MatmulLogitsProcessor(LogitsProcessor):
         logits_metadata: LogitsMetadata,
         embedding_bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        print("hiii in here")
-        logits = torch.matmul(
+        # Per-rank shard matmul. With ParallelLMHead column-sharded along
+        # vocab, ``lm_head.weight`` is ``[vocab_size // TP, hidden]`` on each
+        # rank — except possibly on the last rank if vocab_size doesn't
+        # divide evenly, in which case ParallelLMHead pads internally.
+        local_logits = torch.matmul(
             hidden_states.to(torch.float32),
             lm_head.weight.to(torch.float32).T,
         )
+        if get_tensor_model_parallel_world_size() > 1:
+            # All-gather along the vocab dim. Result shape:
+            # ``[num_tokens, padded_vocab_size]`` where padded_vocab_size
+            # equals ``(vocab_size // TP) * TP`` and is >= self.config.vocab_size.
+            logits = tensor_model_parallel_all_gather(local_logits, dim=-1)
+        else:
+            logits = local_logits
         if logits_metadata.next_token_logits_buffer is not None:
             buf = logits_metadata.next_token_logits_buffer
             assert buf.dtype == torch.float
