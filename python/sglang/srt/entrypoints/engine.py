@@ -46,6 +46,7 @@ from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
     EmbeddingReqInput,
     GenerateReqInput,
+    GetWeightHashesReqInput,
     GetWeightsByNameReqInput,
     InitWeightsUpdateGroupReqInput,
     LoadLoRAAdapterReqInput,
@@ -532,6 +533,18 @@ class Engine(EngineBase):
         obj = GetWeightsByNameReqInput(name=name, truncate_size=truncate_size)
         return self.loop.run_until_complete(
             self.tokenizer_manager.get_weights_by_name(obj, None)
+        )
+
+    def get_weight_hashes(self, name_filter: Optional[List[str]] = None):
+        """SHA256 of every parameter in the running model's state_dict.
+
+        Returns a list (one entry per DP rank) of dicts:
+            {"hashes": {state_dict_key: sha256_hex},
+             "metadata": {state_dict_key: (dtype_str, shape_tuple)}}
+        """
+        obj = GetWeightHashesReqInput(name_filter=name_filter)
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.get_weight_hashes(obj)
         )
 
     def load_lora_adapter(self, lora_name: str, lora_path: str, pinned: bool = False):

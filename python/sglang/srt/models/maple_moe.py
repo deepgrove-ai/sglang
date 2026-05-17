@@ -621,7 +621,7 @@ class MapleDecoderLayer(nn.Module):
             self.mlp = MapleSparseMoeBlockOld(config, layer_id=layer_idx)
 
         self.input_layernorm = MapleRMSNorm(config.hidden_size, eps=config.rms_norm_eps, _fp64=True)
-        self.post_attention_layernorm = MapleRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = MapleRMSNorm(config.hidden_size, eps=config.rms_norm_eps, _fp64=True)
 
     def forward(
         self,
