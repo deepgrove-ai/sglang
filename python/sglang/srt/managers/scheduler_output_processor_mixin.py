@@ -142,11 +142,15 @@ class SchedulerOutputProcessorMixin:
                         req.return_hidden_states
                         and logits_output.hidden_states is not None
                     ):
+                        # Slice this forward pass's rows, not the full input
+                        # length: under chunked prefill the final chunk only
+                        # carries ``extend_input_len_per_req[i]`` rows.
+                        extend_input_len = extend_input_len_per_req[i]
                         req.hidden_states.append(
                             logits_output.hidden_states[
                                 hidden_state_offset : (
                                     hidden_state_offset := hidden_state_offset
-                                    + len(req.origin_input_ids)
+                                    + extend_input_len
                                 )
                             ]
                             .cpu()
@@ -201,6 +205,27 @@ class SchedulerOutputProcessorMixin:
                                     last_prefill_chunk=False,
                                 )
                             logprob_pt += num_input_logprobs
+
+                    # Accumulate hidden states from this prefill chunk so the
+                    # full prefill is recoverable after the request finishes.
+                    # Without this, only the final chunk's hidden states are
+                    # captured (in the ``is_chunked <= 0`` branch above).
+                    if (
+                        req.return_hidden_states
+                        and logits_output.hidden_states is not None
+                    ):
+                        extend_input_len = extend_input_len_per_req[i]
+                        req.hidden_states.append(
+                            logits_output.hidden_states[
+                                hidden_state_offset : (
+                                    hidden_state_offset := hidden_state_offset
+                                    + extend_input_len
+                                )
+                            ]
+                            .cpu()
+                            .clone()
+                            .tolist()
+                        )
 
                     trace_slice(
                         RequestStage.PREFILL_CHUNKED_FORWARD,
