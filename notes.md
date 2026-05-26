@@ -34,8 +34,6 @@ CUDA_VISIBLE_DEVICES=0 python -m sglang.launch_server   --model-path /scratch/an
 CUDA_VISIBLE_DEVICES=0 python -m sglang.launch_server   --model-path /scratch/ansh/models/maple_reference_model   --host 0.0.0.0 --port 30000 --mem-fraction-static 0.7 --trust-remote-code --attention-backend fa3 --tp 1 --cuda-graph-max-bs 16  --watchdog-timeout 3600 2>&1 | tee out_sglang_logs.log
 
 
-CUDA_VISIBLE_DEVICES=0 python -m sglang.launch_server   --model-path /scratch/ansh/models/maple_reference_model   --host 0.0.0.0 --port 30000 --mem-fraction-static 0.7 --trust-remote-code --attention-backend fa3 --tp 1 --disable-cuda-graph  --watchdog-timeout 3600 2>&1 | tee out_sglang_logs.log
-
 # with torch compile 
 
 python -m sglang.launch_server   --model-path /scratch/ansh/models/maple_reference_model  --host 0.0.0.0   --port 30000   --mem-fraction-static 0.7   --trust-remote-code  --disable-radix-cache --disable-hybrid-swa-memory --attention-backend maple_fa --skip-server-warmup --disable-cuda-graph --enable-torch-compile --tp 1  2>&1 | tee out_sglang_logs.log
