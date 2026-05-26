@@ -673,7 +673,6 @@ def invoke_fused_moe_kernel(
     else:
         even_Ks = False
 
-    # print(f"  [invoke] A={A.shape}{A.dtype} B={B.shape}{B.dtype} C={C.shape}{C.dtype} | MUL_ROUTED_WEIGHT={mul_routed_weight} top_k={top_k} | fp8={use_fp8_w8a8} i8a8={use_int8_w8a8} i8a16={use_int8_w8a16} i4={use_int4_w4a16} | tma=({a_use_tma},{b_use_tma}) sorted={c_sorted} num_valid={topk_ids.numel()}")
     if (
         (use_int8_w8a16 or use_int4_w4a16)
         and block_shape is not None
@@ -722,7 +721,6 @@ def invoke_fused_moe_kernel(
         )
 
     else:
-        # print(f"  [invoke] → fused_moe_kernel (a_tma={a_use_tma}, b_tma={b_use_tma})")
         if a_use_tma or b_use_tma:
             # TMA descriptors require a global memory allocation
             def alloc_fn(size: int, alignment: int, stream: Optional[int]):
@@ -745,7 +743,6 @@ def invoke_fused_moe_kernel(
         else:
             b_desc = None
 
-        # print("launching fused moe at L749")
         fused_moe_kernel[grid](
             A,
             a_desc,
