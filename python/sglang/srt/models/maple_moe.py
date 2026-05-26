@@ -28,9 +28,14 @@ except ImportError:  # pragma: no cover
 
 # sonicmoe MoE kernel — same kernel ve's trainer uses. Required for bit-exact
 # MoE output parity between ve↔sgl; FusedMoE (the default sgl path) diverges
-# from sonicmoe at small post-norm input magnitudes.
-from sonicmoe.functional import moe_TC_softmax_topk_layer
-from sonicmoe.enums import ActivationType
+# from sonicmoe at small post-norm input magnitudes. Optional unless
+# USE_SONIC_MOE=True (default path uses FusedMoE and does not need sonicmoe).
+try:
+    from sonicmoe.functional import moe_TC_softmax_topk_layer
+    from sonicmoe.enums import ActivationType
+except ImportError:  # pragma: no cover
+    moe_TC_softmax_topk_layer = None
+    ActivationType = None
 
 from sglang.srt.layers.linear import (
     QKVParallelLinear,
@@ -59,8 +64,13 @@ USE_FUSED_EXPERTS = True
 # parity at small post-norm input magnitudes. Assumes TP=1 (no expert
 # sharding across ranks) — sonicmoe doesn't implement TP shards here.
 USE_SONIC_MOE = False
-#hard coding clamp limit
+USE_SWIGLU_CLAMP = True
 MAPLE_SWIGLU_CLAMP_LIMIT = 7.0
+
+
+def _use_swiglu_clamp(config) -> bool:
+    return bool(getattr(config, "use_swiglu_clamp", USE_SWIGLU_CLAMP))
+
 
 # Dump-hooks no-op unless MAPLE_DUMP_HIDDEN=1 — keeps training runs from
 # producing millions of .pt files. Set MAPLE_DUMP_HIDDEN=1 for diagnostic
@@ -221,12 +231,14 @@ class MapleMLP(nn.Module):
     def forward(self, x):
         gate = F.linear(x, self.gate_proj.weight)
         up = F.linear(x, self.up_proj.weight)
-        hidden = (
-            self.act_fn(torch.clamp(gate, max=MAPLE_SWIGLU_CLAMP_LIMIT).float())
-            * torch.clamp(
+        gate = gate.float()
+        up = up.float()
+        if _use_swiglu_clamp(self.config):
+            gate = torch.clamp(gate, max=MAPLE_SWIGLU_CLAMP_LIMIT)
+            up = torch.clamp(
                 up, min=-MAPLE_SWIGLU_CLAMP_LIMIT, max=MAPLE_SWIGLU_CLAMP_LIMIT
-            ).float()
-        ).to(x.dtype)
+            )
+        hidden = (self.act_fn(gate) * up).to(x.dtype)
         return F.linear(hidden, self.down_proj.weight)
 
 
@@ -355,7 +367,9 @@ class MapleSparseMoeBlock(nn.Module):
             quant_config=None,
             prefix="experts",
             activation=config.hidden_act,
-            gemm1_clamp_limit=MAPLE_SWIGLU_CLAMP_LIMIT,
+            gemm1_clamp_limit=(
+                MAPLE_SWIGLU_CLAMP_LIMIT if _use_swiglu_clamp(config) else None
+            ),
             no_combine=True,  # return (T, K, H) so we accumulate in fp32 ourselves
             inplace=False,    # required when no_combine=True
         )
@@ -623,6 +637,11 @@ class MapleDecoderLayer(nn.Module):
         self.self_attn = MapleAttention(config=config, layer_idx=layer_idx)
 
         if USE_SONIC_MOE:
+            if moe_TC_softmax_topk_layer is None:
+                raise ImportError(
+                    "USE_SONIC_MOE=True requires the sonicmoe package. "
+                    "Install from mono/repos/sonic-moe, or set USE_SONIC_MOE=False."
+                )
             self.mlp = MapleSparseMoeBlockSonic(config, layer_id=layer_idx)
         elif USE_FUSED_EXPERTS:
             self.mlp = MapleSparseMoeBlock(config, layer_id=layer_idx)
@@ -862,6 +881,29 @@ class MapleForCausalLM(nn.Module):
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
+                continue
+            if name.endswith(".mlp.gate.expert_bias"):
+                continue
+
+            bailing_v2_mapping = (
+                (".self_attn.qkv_proj", ".attention.query_key_value"),
+                (".self_attn.o_proj", ".attention.dense"),
+                (".self_attn.q_norm", ".attention.query_layernorm"),
+                (".self_attn.k_norm", ".attention.key_layernorm"),
+            )
+            loaded_bailing_v2_weight = False
+            for param_name, weight_name in bailing_v2_mapping:
+                if weight_name not in name:
+                    continue
+                mapped_name = name.replace(weight_name, param_name)
+                if mapped_name not in params_dict:
+                    continue
+                param = params_dict[mapped_name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
+                loaded_bailing_v2_weight = True
+                break
+            if loaded_bailing_v2_weight:
                 continue
 
             # 1) qkv fusion

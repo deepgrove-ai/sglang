@@ -346,7 +346,8 @@ def moe_sum_reduce_torch_compile(x, out, routed_scaling_factor):
 
 @torch.compile
 def swiglu_with_alpha_and_limit(x, gemm1_alpha, gemm1_limit):
-    gate, up = x[..., ::2], x[..., 1::2]
+    d = x.shape[-1] // 2
+    gate, up = x[..., :d], x[..., d:]
     gate = gate.clamp(min=None, max=gemm1_limit)
     up = up.clamp(min=-gemm1_limit, max=gemm1_limit)
     return gate * torch.sigmoid(gate * gemm1_alpha) * (up + 1)
@@ -354,7 +355,8 @@ def swiglu_with_alpha_and_limit(x, gemm1_alpha, gemm1_limit):
 
 @torch.compile
 def swiglu_with_limit(x, gemm1_limit):
-    gate, up = x[..., ::2], x[..., 1::2]
+    d = x.shape[-1] // 2
+    gate, up = x[..., :d], x[..., d:]
     gate = torch.nn.functional.silu(gate.clamp(min=None, max=gemm1_limit))
     up = up.clamp(min=-gemm1_limit, max=gemm1_limit)
     return gate * up
