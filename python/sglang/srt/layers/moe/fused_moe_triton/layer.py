@@ -187,7 +187,7 @@ class FusedMoE(torch.nn.Module):
             hidden_size = round_up(hidden_size, 256)
         self.hidden_size = hidden_size
 
-        self.moe_runner_config = c(
+        self.moe_runner_config = MoeRunnerConfig(
             num_experts=num_experts,
             num_local_experts=self.num_local_experts,
             hidden_size=hidden_size,
