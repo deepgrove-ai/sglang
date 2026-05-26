@@ -916,21 +916,6 @@ async def get_weights_by_name(obj: GetWeightsByNameReqInput, request: Request):
         return _create_error_response(e)
 
 
-@app.api_route("/get_weight_hashes", methods=["GET", "POST"])
-async def get_weight_hashes(obj: GetWeightHashesReqInput, request: Request):
-    """SHA256 of every parameter in the running model's state_dict.
-
-    Response: a list (one entry per DP rank) of
-        {"hashes": {state_dict_key: sha256_hex},
-         "metadata": {state_dict_key: [dtype_str, [shape...]]}}
-    """
-    try:
-        results = await _global_state.tokenizer_manager.get_weight_hashes(obj)
-        return ORJSONResponse({"results": results}, status_code=200)
-    except Exception as e:
-        return _create_error_response(e)
-
-
 @app.api_route("/release_memory_occupation", methods=["GET", "POST"])
 async def release_memory_occupation(
     obj: ReleaseMemoryOccupationReqInput, request: Request
@@ -1111,7 +1096,6 @@ async def continue_generation(request: Request):
 @app.post("/v1/completions", dependencies=[Depends(validate_json_request)])
 async def openai_v1_completions(request: CompletionRequest, raw_request: Request):
     """OpenAI-compatible text completion endpoint."""
-    # print(">>> GOT /v1/completions REQUEST", flush=True)
     return await raw_request.app.state.openai_serving_completion.handle_request(
         request, raw_request
     )
