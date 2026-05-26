@@ -119,6 +119,7 @@ class TritonRunnerCore(MoeRunnerCore):
             moe_sum_reduce_torch_compile,
             moe_sum_reduce_triton,
             swiglu_with_alpha_and_limit,
+            swiglu_with_limit,
         )
 
         hidden_states = runner_input.hidden_states
@@ -202,6 +203,11 @@ class TritonRunnerCore(MoeRunnerCore):
                 intermediate_cache2 = swiglu_with_alpha_and_limit(
                     intermediate_cache1.view(-1, N),
                     gemm1_alpha,
+                    gemm1_limit,
+                )
+            elif gemm1_limit is not None:
+                intermediate_cache2 = swiglu_with_limit(
+                    intermediate_cache1.view(-1, N),
                     gemm1_limit,
                 )
             elif _is_cuda:

@@ -352,6 +352,14 @@ def swiglu_with_alpha_and_limit(x, gemm1_alpha, gemm1_limit):
     return gate * torch.sigmoid(gate * gemm1_alpha) * (up + 1)
 
 
+@torch.compile
+def swiglu_with_limit(x, gemm1_limit):
+    gate, up = x[..., ::2], x[..., 1::2]
+    gate = torch.nn.functional.silu(gate.clamp(min=None, max=gemm1_limit))
+    up = up.clamp(min=-gemm1_limit, max=gemm1_limit)
+    return gate * up
+
+
 @functools.lru_cache()
 def _down_moe_use_tma():
     return support_tensor_descriptor()
@@ -540,6 +548,11 @@ def fused_experts_impl(
                 intermediate_cache2 = swiglu_with_alpha_and_limit(
                     intermediate_cache1.view(-1, N),
                     gemm1_alpha,
+                    gemm1_limit,
+                )
+            elif gemm1_limit is not None:
+                intermediate_cache2 = swiglu_with_limit(
+                    intermediate_cache1.view(-1, N),
                     gemm1_limit,
                 )
             elif _is_cuda or _is_hip:

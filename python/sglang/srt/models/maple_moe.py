@@ -59,6 +59,8 @@ USE_FUSED_EXPERTS = True
 # parity at small post-norm input magnitudes. Assumes TP=1 (no expert
 # sharding across ranks) — sonicmoe doesn't implement TP shards here.
 USE_SONIC_MOE = False
+#hard coding clamp limit
+MAPLE_SWIGLU_CLAMP_LIMIT = 7.0
 
 # Dump-hooks no-op unless MAPLE_DUMP_HIDDEN=1 — keeps training runs from
 # producing millions of .pt files. Set MAPLE_DUMP_HIDDEN=1 for diagnostic
@@ -219,7 +221,12 @@ class MapleMLP(nn.Module):
     def forward(self, x):
         gate = F.linear(x, self.gate_proj.weight)
         up = F.linear(x, self.up_proj.weight)
-        hidden = (self.act_fn(gate.float()) * up.float()).to(x.dtype)
+        hidden = (
+            self.act_fn(torch.clamp(gate, max=MAPLE_SWIGLU_CLAMP_LIMIT).float())
+            * torch.clamp(
+                up, min=-MAPLE_SWIGLU_CLAMP_LIMIT, max=MAPLE_SWIGLU_CLAMP_LIMIT
+            ).float()
+        ).to(x.dtype)
         return F.linear(hidden, self.down_proj.weight)
 
 
@@ -347,6 +354,8 @@ class MapleSparseMoeBlock(nn.Module):
             layer_id=layer_id,
             quant_config=None,
             prefix="experts",
+            activation=config.hidden_act,
+            gemm1_clamp_limit=MAPLE_SWIGLU_CLAMP_LIMIT,
             no_combine=True,  # return (T, K, H) so we accumulate in fp32 ourselves
             inplace=False,    # required when no_combine=True
         )
