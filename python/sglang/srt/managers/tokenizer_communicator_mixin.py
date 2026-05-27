@@ -282,10 +282,6 @@ class TokenizerCommunicatorMixin:
                     self.get_internal_state_communicator.handle_recv,
                 ),
                 (
-                    GetWeightHashesReqOutput,
-                    self.get_weight_hashes_communicator.handle_recv,
-                ),
-                (
                     SetInternalStateReqOutput,
                     self.set_internal_state_communicator.handle_recv,
                 ),
@@ -618,17 +614,6 @@ class TokenizerCommunicatorMixin:
         )
         # Many DP ranks
         return [res.internal_state for res in responses]
-
-    async def get_weight_hashes(
-        self: TokenizerManager, obj: GetWeightHashesReqInput
-    ) -> List[Dict[str, Any]]:
-        responses: List[GetWeightHashesReqOutput] = (
-            await self.get_weight_hashes_communicator(obj)
-        )
-        # One entry per DP rank. Each entry has hashes + metadata sub-dicts.
-        return [
-            {"hashes": res.hashes, "metadata": res.metadata} for res in responses
-        ]
 
     async def set_internal_state(
         self: TokenizerManager, obj: SetInternalStateReq
