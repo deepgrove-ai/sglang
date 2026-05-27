@@ -610,6 +610,30 @@ class MapleForCausalLM(nn.Module):
             if "rotary_emb.inv_freq" in name:
                 continue
 
+            if name.endswith(".mlp.gate.expert_bias"):
+                continue
+
+            bailing_v2_mapping = (
+                (".self_attn.qkv_proj", ".attention.query_key_value"),
+                (".self_attn.o_proj", ".attention.dense"),
+                (".self_attn.q_norm", ".attention.query_layernorm"),
+                (".self_attn.k_norm", ".attention.key_layernorm"),
+            )
+            loaded_bailing_v2_weight = False
+            for param_name, weight_name in bailing_v2_mapping:
+                if weight_name not in name:
+                    continue
+                mapped_name = name.replace(weight_name, param_name)
+                if mapped_name not in params_dict:
+                    continue
+                param = params_dict[mapped_name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
+                loaded_bailing_v2_weight = True
+                break
+            if loaded_bailing_v2_weight:
+                continue
+
             # 1) qkv fusion
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
