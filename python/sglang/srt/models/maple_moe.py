@@ -48,6 +48,12 @@ from sglang.srt.utils import add_prefix
 logger = logging.getLogger(__name__)
 
 USE_FUSED_EXPERTS = True
+USE_SWIGLU_CLAMP = True
+MAPLE_SWIGLU_CLAMP_LIMIT = 7.0
+
+
+def _use_swiglu_clamp(config) -> bool:
+    return bool(getattr(config, "use_swiglu_clamp", USE_SWIGLU_CLAMP))
 
 # ── building blocks ──────────────────────────────────────────────────────────
 
@@ -121,7 +127,14 @@ class MapleMLP(nn.Module):
     def forward(self, x):
         gate = F.linear(x, self.gate_proj.weight)
         up = F.linear(x, self.up_proj.weight)
-        hidden = (self.act_fn(gate.float()) * up.float()).to(x.dtype)
+        gate = gate.float()
+        up = up.float()
+        if _use_swiglu_clamp(self.config):
+            gate = torch.clamp(gate, max=MAPLE_SWIGLU_CLAMP_LIMIT)
+            up = torch.clamp(
+                up, min=-MAPLE_SWIGLU_CLAMP_LIMIT, max=MAPLE_SWIGLU_CLAMP_LIMIT
+            )
+        hidden = (self.act_fn(gate) * up).to(x.dtype)
         return F.linear(hidden, self.down_proj.weight)
 
 
@@ -249,6 +262,10 @@ class MapleSparseMoeBlock(nn.Module):
             layer_id=layer_id,
             quant_config=None,
             prefix="experts",
+            activation=config.hidden_act,
+            gemm1_clamp_limit=(
+                MAPLE_SWIGLU_CLAMP_LIMIT if _use_swiglu_clamp(config) else None
+            ),
             no_combine=True,  # return (T, K, H) so we accumulate in fp32 ourselves
             inplace=False,    # required when no_combine=True
         )
