@@ -1249,23 +1249,6 @@ class GetWeightsByNameReqOutput(BaseReq):
 
 
 @dataclass
-class GetWeightHashesReqInput(BaseReq):
-    # If provided, only hash params whose state_dict key contains any of these
-    # substrings. Empty / None means hash everything.
-    name_filter: Optional[List[str]] = None
-
-
-@dataclass
-class GetWeightHashesReqOutput(BaseReq):
-    # state_dict key -> sha256 hex digest of the parameter's raw bytes.
-    hashes: Dict[str, str] = None
-    # state_dict key -> (dtype_str, shape tuple). Useful for confirming layout
-    # parity, since two tensors with the same bytes but different shapes hash
-    # the same.
-    metadata: Dict[str, Any] = None
-
-
-@dataclass
 class ReleaseMemoryOccupationReqInput(BaseReq):
     # Optional tags to identify the memory region, which is primarily used for RL
     # Currently we only support `weights` and `kv_cache`
