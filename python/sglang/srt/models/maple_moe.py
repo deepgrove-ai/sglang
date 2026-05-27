@@ -60,11 +60,7 @@ USE_FUSED_EXPERTS = True
 # sharding across ranks) — sonicmoe doesn't implement TP shards here.
 USE_SONIC_MOE = False
 
-# Dump-hooks no-op unless MAPLE_DUMP_HIDDEN=1 — keeps training runs from
-# producing millions of .pt files. Set MAPLE_DUMP_HIDDEN=1 for diagnostic
-# scripts like compare_full_stack.py.
 import os as _early_os
-_DUMP_HIDDEN_ENABLED = _early_os.environ.get("MAPLE_DUMP_HIDDEN", "0") == "1"
 # NaN detection between decoder substeps. Off by default — each check forces
 # a GPU sync. Enable with MAPLE_NAN_CHECK=1 for diagnostics.
 _NAN_CHECK_ENABLED = _early_os.environ.get("MAPLE_NAN_CHECK", "0") == "1"
@@ -84,68 +80,6 @@ def _nan_check(hidden_states: torch.Tensor, layer_idx: int, tag: str) -> None:
             f"nan={nan_count} inf={inf_count}",
             flush=True,
         )
-
-# Dump pre/post input_layernorm hidden_states for every call to ./dumps/sgl/
-# (overridable via MAPLE_SGL_DUMP_DIR). Filenames are
-# rank{R}_L{layer_idx:02d}_call{N:04d}_{pre,post}.pt — N increments per
-# (layer, label, rank). Rank prefix prevents TP/multi-worker race conditions.
-import os as _os
-import threading as _threading
-_SGL_DUMP_DIR = _os.environ.get(
-    "MAPLE_SGL_DUMP_DIR", _os.path.join(_os.getcwd(), "dumps", "sgl")
-)
-_SGL_DUMP_COUNTERS: dict = {}
-_SGL_WEIGHT_DUMPED: set = set()
-_SGL_DUMP_LOCK = _threading.Lock()
-
-def _sgl_resolve_rank() -> int:
-    try:
-        import torch.distributed as _dist
-        if _dist.is_available() and _dist.is_initialized():
-            return _dist.get_rank()
-    except Exception:
-        pass
-    return _os.getpid()
-
-def _sgl_dump_hidden(hidden_states, layer_idx: int, tag: str) -> None:
-    """Dump a per-call hidden_states tensor. See ve modeling_maple.py for the
-    matching contract — filenames and counter semantics are identical so the
-    analysis scripts can pair ve↔sgl by (layer, tag, shape).
-    No-op unless MAPLE_DUMP_HIDDEN=1."""
-    if not _DUMP_HIDDEN_ENABLED:
-        return
-    _os.makedirs(_SGL_DUMP_DIR, exist_ok=True)
-    rank = _sgl_resolve_rank()
-    with _SGL_DUMP_LOCK:
-        key = (rank, layer_idx, tag)
-        n = _SGL_DUMP_COUNTERS.get(key, 0)
-        fname = _os.path.join(
-            _SGL_DUMP_DIR,
-            f"rank{rank}_L{layer_idx:02d}_call{n:04d}_{tag}.pt",
-        )
-        torch.save(hidden_states.detach().to("cpu"), fname)
-        _SGL_DUMP_COUNTERS[key] = n + 1
-
-def _sgl_dump_weight(weight, layer_idx: int, tag: str) -> None:
-    """Dump a parameter tensor once per (rank, layer, tag).
-    No-op unless MAPLE_DUMP_HIDDEN=1."""
-    if not _DUMP_HIDDEN_ENABLED:
-        return
-    rank = _sgl_resolve_rank()
-    key = (rank, layer_idx, tag)
-    if key in _SGL_WEIGHT_DUMPED:
-        return
-    _os.makedirs(_SGL_DUMP_DIR, exist_ok=True)
-    with _SGL_DUMP_LOCK:
-        if key in _SGL_WEIGHT_DUMPED:
-            return
-        fname = _os.path.join(
-            _SGL_DUMP_DIR,
-            f"rank{rank}_L{layer_idx:02d}_call0000_{tag}.pt",
-        )
-        torch.save(weight.detach().to("cpu"), fname)
-        _SGL_WEIGHT_DUMPED.add(key)
-
 
 # ── building blocks ──────────────────────────────────────────────────────────
 
@@ -642,33 +576,24 @@ class MapleDecoderLayer(nn.Module):
                     f"hidden_states.dtype={hidden_states.dtype}\n"
                 )
             MapleDecoderLayer._dtype_logged = True
-        # Dumps + NaN checks at the same 6 tagged points per layer.
-        _sgl_dump_weight(self.input_layernorm.weight, self.layer_idx, "input_layernorm_weight")
-        _sgl_dump_hidden(hidden_states, self.layer_idx, "before_input_norm")
         _nan_check(hidden_states, self.layer_idx, "before_input_norm")
 
         hidden_states = self.input_layernorm(hidden_states)
-        _sgl_dump_hidden(hidden_states, self.layer_idx, "after_input_norm")
         _nan_check(hidden_states, self.layer_idx, "after_input_norm")
 
         hidden_states = self.self_attn(positions, hidden_states, forward_batch, position_embeddings)
         _nan_check(hidden_states, self.layer_idx, "attn_out_only")
         hidden_states = (residual.to(torch.float32) + hidden_states.to(torch.float32)).to(initial_dtype)
-        _sgl_dump_hidden(hidden_states, self.layer_idx, "after_attn")
         _nan_check(hidden_states, self.layer_idx, "after_attn")
 
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        _sgl_dump_hidden(hidden_states, self.layer_idx, "after_post_attn_norm")
         _nan_check(hidden_states, self.layer_idx, "after_post_attn_norm")
 
         hidden_states = self.mlp(hidden_states)
-        # mlp output BEFORE the residual add — isolates MoE kernel vs add.
-        _sgl_dump_hidden(hidden_states, self.layer_idx, "after_mlp_only")
         _nan_check(hidden_states, self.layer_idx, "after_mlp_only")
 
         hidden_states = (residual.to(torch.float32) + hidden_states.to(torch.float32)).to(initial_dtype)
-        _sgl_dump_hidden(hidden_states, self.layer_idx, "after_moe")
         _nan_check(hidden_states, self.layer_idx, "after_moe")
 
         return hidden_states
