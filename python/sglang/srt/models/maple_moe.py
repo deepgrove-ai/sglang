@@ -18,6 +18,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from transformers.activations import ACT2FN
+from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 
 try:
@@ -54,6 +55,19 @@ MAPLE_SWIGLU_CLAMP_LIMIT = 7.0
 
 def _use_swiglu_clamp(config) -> bool:
     return bool(getattr(config, "use_swiglu_clamp", USE_SWIGLU_CLAMP))
+
+def get_attention_sliding_window_size(config: PretrainedConfig):
+    # Aligned with HF sliding window semantics (inclusive),
+    # while SGLang attention backend expects exclusive window size.
+    layer_types = getattr(config, "layer_types", None)
+    if layer_types is None or "sliding_attention" not in layer_types:
+        return None
+    if not hasattr(config, "sliding_window"):
+        return None
+    sliding_window = config.sliding_window
+    if sliding_window is None:
+        return None
+    return sliding_window - 1
 
 # ── building blocks ──────────────────────────────────────────────────────────
 
@@ -362,7 +376,7 @@ class MapleAttention(nn.Module):
         self.q_norm = MapleRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = MapleRMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
-        sliding_window_size = self.sliding_window if self.sliding_window is not None else -1
+        sliding_window_size = (self.sliding_window - 1) if self.sliding_window is not None else -1
         self.attn = RadixAttention(
             num_heads=self.num_local_heads,
             head_dim=self.head_dim,
@@ -501,9 +515,6 @@ class MapleModel(nn.Module):
         position_embeddings = self.rotary_emb(hidden_states, positions.unsqueeze(0))
 
         for i, layer in enumerate(self.layers):
-            # if i > 5: 
-            #     break 
-            
             hidden_states = layer(positions, hidden_states, forward_batch, position_embeddings)
 
         hidden_states = self.norm(hidden_states)
@@ -578,6 +589,9 @@ class MapleForCausalLM(nn.Module):
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.word_embeddings
+
+    def get_attention_sliding_window_size(self):
+        return get_attention_sliding_window_size(self.config)
 
     @torch.no_grad()
     def forward(
