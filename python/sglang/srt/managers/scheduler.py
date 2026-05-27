@@ -2472,38 +2472,6 @@ class Scheduler(
             num_tokens=num_tokens,
         )
 
-    def get_weight_hashes(
-        self, recv_req: GetWeightHashesReqInput
-    ) -> GetWeightHashesReqOutput:
-        """Compute SHA256 of every parameter in the running model's state_dict.
-
-        Returns a {state_dict_key: sha256_hex} mapping plus a parallel
-        {state_dict_key: (dtype_str, shape_tuple)} metadata dict so the caller
-        can confirm layout equivalence, not just byte equivalence. Hashing
-        happens on the local TP rank's shard — the caller is responsible for
-        merging across ranks if needed (TP=1 returns full tensors).
-        """
-        import hashlib
-
-        model = self.tp_worker.model_runner.model
-        name_filter = recv_req.name_filter or None
-
-        hashes: Dict[str, str] = {}
-        metadata: Dict[str, Any] = {}
-        for name, tensor in model.state_dict().items():
-            if name_filter is not None and not any(s in name for s in name_filter):
-                continue
-            t = tensor.detach()
-            if not t.is_contiguous():
-                t = t.contiguous()
-            # Bring to CPU; keep native dtype so the byte representation is
-            # exactly what the GPU is holding.
-            buf = t.cpu().view(torch.uint8).numpy().tobytes()
-            hashes[name] = hashlib.sha256(buf).hexdigest()
-            metadata[name] = (str(tensor.dtype), tuple(tensor.shape))
-
-        return GetWeightHashesReqOutput(hashes=hashes, metadata=metadata)
-
     def get_internal_state(self, recv_req: GetInternalStateReq):
         ret = vars(get_global_server_args())
         ret["last_gen_throughput"] = self.last_gen_throughput
