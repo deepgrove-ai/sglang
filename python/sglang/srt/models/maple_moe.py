@@ -12,7 +12,6 @@ can dump SGLang's top-k decisions for the trainer to replay.
 
 import logging
 import math
-import re
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -25,12 +24,6 @@ try:
     from slime.router_replay import sglang_capture as _slime_router_replay
 except ImportError:  # pragma: no cover
     _slime_router_replay = None
-
-# sonicmoe MoE kernel — same kernel ve's trainer uses. Required for bit-exact
-# MoE output parity between ve↔sgl; FusedMoE (the default sgl path) diverges
-# from sonicmoe at small post-norm input magnitudes.
-from sonicmoe.functional import moe_TC_softmax_topk_layer
-from sonicmoe.enums import ActivationType
 
 from sglang.srt.layers.linear import (
     QKVParallelLinear,
@@ -55,31 +48,6 @@ from sglang.srt.utils import add_prefix
 logger = logging.getLogger(__name__)
 
 USE_FUSED_EXPERTS = True
-# Use sonicmoe (ve trainer's MoE kernel) instead of FusedMoE for bit-exact
-# parity at small post-norm input magnitudes. Assumes TP=1 (no expert
-# sharding across ranks) — sonicmoe doesn't implement TP shards here.
-USE_SONIC_MOE = False
-
-import os as _early_os
-# NaN detection between decoder substeps. Off by default — each check forces
-# a GPU sync. Enable with MAPLE_NAN_CHECK=1 for diagnostics.
-_NAN_CHECK_ENABLED = _early_os.environ.get("MAPLE_NAN_CHECK", "0") == "1"
-
-
-def _nan_check(hidden_states: torch.Tensor, layer_idx: int, tag: str) -> None:
-    """If hidden_states contains a NaN/Inf, print a one-line summary including
-    layer, tag, shape, and counts. No-op unless MAPLE_NAN_CHECK=1."""
-    if not _NAN_CHECK_ENABLED:
-        return
-    nan_count = int(torch.isnan(hidden_states).sum())
-    inf_count = int(torch.isinf(hidden_states).sum())
-    if nan_count or inf_count:
-        print(
-            f"[NAN-CHECK] sgl L{layer_idx:02d} tag={tag} "
-            f"shape={tuple(hidden_states.shape)} dtype={hidden_states.dtype} "
-            f"nan={nan_count} inf={inf_count}",
-            flush=True,
-        )
 
 # ── building blocks ──────────────────────────────────────────────────────────
 
@@ -327,106 +295,6 @@ class MapleSparseMoeBlock(nn.Module):
         return y
 
 
-# ── MoE: sonicmoe path (matches ve's trainer kernel exactly) ─────────────────
-
-class MapleSonicMoeExperts(nn.Module):
-    """Holds the fused expert weights consumed by moe_TC_softmax_topk_layer.
-
-    Layout matches ve's MapleSonicMoeExperts:
-      gate_up_proj : (E, 2*I, H) with gate row at 2*i and up row at 2*i+1
-      down_proj    : (E, H, I)
-    Permutation to (2I, H, E) / (H, I, E) happens at call time.
-    """
-
-    def __init__(self, config):
-        super().__init__()
-        self.gate_up_proj = nn.Parameter(
-            torch.empty(config.num_experts, 2 * config.moe_intermediate_size, config.hidden_size)
-        )
-        self.down_proj = nn.Parameter(
-            torch.empty(config.num_experts, config.hidden_size, config.moe_intermediate_size)
-        )
-
-
-class MapleSparseMoeBlockSonic(nn.Module):
-    """sgl MoE block that calls the same sonicmoe kernel ve's trainer uses.
-
-    Routing is captured for slime router_replay via a separate gate forward
-    so the recorded topk matches what sonicmoe will internally pick.
-    """
-
-    def __init__(self, config, layer_id: int) -> None:
-        super().__init__()
-        self.config = config
-        self.layer_id = layer_id
-        self.num_experts = config.num_experts
-        self.top_k = config.num_experts_per_tok
-        self.experts = MapleSonicMoeExperts(config)
-        self.gate = MapleGate(config)
-        # NOTE: do NOT capture the stream at __init__. sgl runs forwards on
-        # internal scheduler streams that differ from whatever was current
-        # during engine startup, and sonicmoe launching on the wrong stream
-        # reads stale memory → NaN. Read current_stream() per-forward instead.
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        is_2d = hidden_states.dim() == 2
-        if is_2d:
-            hidden_states = hidden_states.unsqueeze(0)
-        bsz, seq_len, h = hidden_states.shape
-        hidden_states = hidden_states.view(-1, h)
-
-        # Let sonicmoe compute the gate internally in bf16 — the same CUDA
-        # kernel runs on both sgl and ve, so internal-routing is bit-identical
-        # across processes. When slime router_replay is active, run the gate
-        # in Python (so we can record what it picked) and hand sonicmoe the
-        # routing decisions back as tensors. The tensor-handoff path replaces
-        # the older ``mod=callable`` route, which forced a Python callback
-        # inside the kernel and prevented CUDA graph capture.
-        replay_active = (
-            _slime_router_replay is not None
-            and _slime_router_replay.enabled()
-        )
-
-        topk_idx_override = None
-        topk_w_override = None
-        router_logits_override = None
-        if replay_active:
-            topk_idx_override, topk_w_override, router_logits_override = self.gate(
-                hidden_states
-            )
-            _slime_router_replay.record_topk(
-                self.layer_id, topk_idx_override, topk_w_override
-            )
-
-        # Dynamic stream capture — matches whichever stream sgl is using
-        # for this layer's forward.
-        stream_id = torch.cuda.current_stream().cuda_stream
-
-        y, _router_logits, _expert_freq = moe_TC_softmax_topk_layer(
-            hidden_states,
-            self.gate.weight,
-            self.experts.gate_up_proj.permute(1, 2, 0),
-            None,                               # b1
-            self.experts.down_proj.permute(1, 2, 0),
-            None,                               # b2
-            self.top_k,
-            stream_id,
-            ActivationType.SWIGLU,
-            False,                              # is_inference_mode_enabled
-            bias=None,
-            scaling_factor=1.0,
-            norm_topk=True,
-            topk_indices_override=topk_idx_override,
-            topk_scores_override=topk_w_override,
-            router_logits_override=router_logits_override,
-        )
-
-        y = y.view(bsz, seq_len, h)
-        if is_2d:
-            y = y.squeeze(0)
-        return y
-
-
 # ── attention (RadixAttention is the only inference-specific substitution) ────
 
 class MapleAttention(nn.Module):
@@ -547,9 +415,7 @@ class MapleDecoderLayer(nn.Module):
 
         self.self_attn = MapleAttention(config=config, layer_idx=layer_idx)
 
-        if USE_SONIC_MOE:
-            self.mlp = MapleSparseMoeBlockSonic(config, layer_id=layer_idx)
-        elif USE_FUSED_EXPERTS:
+        if USE_FUSED_EXPERTS:
             self.mlp = MapleSparseMoeBlock(config, layer_id=layer_idx)
         else:
             self.mlp = MapleSparseMoeBlockOld(config, layer_id=layer_idx)
@@ -566,35 +432,18 @@ class MapleDecoderLayer(nn.Module):
     ) -> torch.Tensor:
         initial_dtype = hidden_states.dtype
         residual = hidden_states
-        # one-shot dtype probe: mirror image of the ve probe to confirm
-        # whether input_layernorm.weight matches across sides.
-        if not getattr(MapleDecoderLayer, "_dtype_logged", False) and self.layer_idx == 0:
-            with open("/tmp/sgl_dtype_probe.log", "a") as _f:
-                _f.write(
-                    f"[sgl L0] input_layernorm.weight.dtype={self.input_layernorm.weight.dtype} "
-                    f"post_attention_layernorm.weight.dtype={self.post_attention_layernorm.weight.dtype} "
-                    f"hidden_states.dtype={hidden_states.dtype}\n"
-                )
-            MapleDecoderLayer._dtype_logged = True
-        _nan_check(hidden_states, self.layer_idx, "before_input_norm")
 
         hidden_states = self.input_layernorm(hidden_states)
-        _nan_check(hidden_states, self.layer_idx, "after_input_norm")
 
         hidden_states = self.self_attn(positions, hidden_states, forward_batch, position_embeddings)
-        _nan_check(hidden_states, self.layer_idx, "attn_out_only")
         hidden_states = (residual.to(torch.float32) + hidden_states.to(torch.float32)).to(initial_dtype)
-        _nan_check(hidden_states, self.layer_idx, "after_attn")
 
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        _nan_check(hidden_states, self.layer_idx, "after_post_attn_norm")
 
         hidden_states = self.mlp(hidden_states)
-        _nan_check(hidden_states, self.layer_idx, "after_mlp_only")
 
         hidden_states = (residual.to(torch.float32) + hidden_states.to(torch.float32)).to(initial_dtype)
-        _nan_check(hidden_states, self.layer_idx, "after_moe")
 
         return hidden_states
 
@@ -724,37 +573,6 @@ class MapleForCausalLM(nn.Module):
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
         return self.logits_processor(input_ids, hidden_states, self.lm_head, forward_batch)
 
-    # Regex for per-expert HF tensor names that we fuse into the sonic layout.
-    _SONIC_EXPERT_RE = re.compile(
-        r"^model\.layers\.(\d+)\.mlp\.experts\.(\d+)\."
-        r"(gate_proj|up_proj|down_proj)\.weight$"
-    )
-
-    def _load_sonic_expert(self, params_dict, name, loaded_weight) -> bool:
-        """If `name` is a per-expert HF tensor, pack it into the sonic
-        gate_up_proj / down_proj layout and return True. Otherwise return
-        False so the caller can try the next loader path.
-        """
-        m = self._SONIC_EXPERT_RE.match(name)
-        if m is None:
-            return False
-        layer = int(m.group(1))
-        eid = int(m.group(2))
-        proj = m.group(3)
-        if proj == "down_proj":
-            target = f"model.layers.{layer}.mlp.experts.down_proj"
-            param = params_dict[target]
-            # down_proj shape (E, H, I), loaded_weight shape (H, I).
-            param.data[eid].copy_(loaded_weight)
-        else:
-            target = f"model.layers.{layer}.mlp.experts.gate_up_proj"
-            param = params_dict[target]
-            # gate_up_proj shape (E, 2*I, H): gate at 2*i, up at 2*i+1.
-            # loaded_weight shape (I, H).
-            offset = 0 if proj == "gate_proj" else 1
-            param.data[eid, offset::2, :].copy_(loaded_weight)
-        return True
-
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         # Map HF-format separate q/k/v projections onto the fused QKVParallelLinear.
         stacked_params_mapping = [
@@ -763,16 +581,11 @@ class MapleForCausalLM(nn.Module):
             (".qkv_proj", ".v_proj", "v"),
         ]
 
-        # FusedMoE mapping only used when USE_SONIC_MOE is False.
-        expert_params_mapping = (
-            []
-            if USE_SONIC_MOE
-            else FusedMoE.make_expert_params_mapping(
-                ckpt_gate_proj_name="gate_proj",
-                ckpt_down_proj_name="down_proj",
-                ckpt_up_proj_name="up_proj",
-                num_experts=self.config.num_experts,
-            )
+        expert_params_mapping = FusedMoE.make_expert_params_mapping(
+            ckpt_gate_proj_name="gate_proj",
+            ckpt_down_proj_name="down_proj",
+            ckpt_up_proj_name="up_proj",
+            num_experts=self.config.num_experts,
         )
 
         params_dict = dict(self.named_parameters())
@@ -791,13 +604,7 @@ class MapleForCausalLM(nn.Module):
                 param.weight_loader(param, loaded_weight, shard_id)
                 break
             else:
-                # 2) sonic expert fusion (only matches if USE_SONIC_MOE=True
-                # since the target tensor names exist only in that case).
-                if USE_SONIC_MOE and self._load_sonic_expert(
-                    params_dict, name, loaded_weight
-                ):
-                    continue
-                # 3) FusedMoE expert mapping (USE_SONIC_MOE=False path)
+                # 2) FusedMoE expert mapping
                 for param_name, weight_name, expert_id, shard_id in expert_params_mapping:
                     if weight_name not in name:
                         continue
@@ -811,7 +618,7 @@ class MapleForCausalLM(nn.Module):
                     )
                     break
                 else:
-                    # 4) fallthrough — plain copy via weight_loader.
+                    # 3) fallthrough — plain copy via weight_loader.
                     if name not in params_dict:
                         logger.debug(f"Skipping {name} — not in model")
                         continue
