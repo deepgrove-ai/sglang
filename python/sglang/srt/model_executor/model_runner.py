@@ -2098,13 +2098,12 @@ class ModelRunner:
             if self.piecewise_cuda_graph_runner.can_run(forward_batch):
                 return self.piecewise_cuda_graph_runner.replay(forward_batch, **kwargs)
 
-        ret = self.model.forward(
+        return self.model.forward(
             forward_batch.input_ids,
             forward_batch.positions,
             forward_batch,
             **kwargs,
         )
-        return ret
 
     def forward_idle(
         self, forward_batch: ForwardBatch, pp_proxy_tensors=None
