@@ -329,10 +329,10 @@ class MapleSparseMoeBlock(nn.Module):
 # ── attention (RadixAttention is the only inference-specific substitution) ────
 
 class MapleAttention(nn.Module):
-    def __init__(self, config, layer_idx: int, prefix: str = ""):
+    def __init__(self, config, layer_id: int, prefix: str = ""):
         super().__init__()
         self.config = config
-        self.layer_idx = layer_idx
+        self.layer_id = layer_id
 
         self.attention_dropout = config.attention_dropout
         self.hidden_size = config.hidden_size
@@ -347,7 +347,7 @@ class MapleAttention(nn.Module):
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.is_causal = True
 
-        self.layer_type = config.layer_types[layer_idx] if hasattr(config, "layer_types") else None
+        self.layer_type = config.layer_types[layer_id] if hasattr(config, "layer_types") else None
         self.sliding_window = config.sliding_window if self.layer_type == "sliding_attention" else None
 
         attn_tp_rank = get_attention_tp_rank()
@@ -382,7 +382,7 @@ class MapleAttention(nn.Module):
             head_dim=self.head_dim,
             scaling=self.scaling,
             num_kv_heads=self.num_local_kv_heads,
-            layer_id=layer_idx,
+            layer_id=layer_id,
             sliding_window_size=sliding_window_size,
         )
 
@@ -439,17 +439,17 @@ class MapleAttention(nn.Module):
 # ── decoder layer ─────────────────────────────────────────────────────────────
 
 class MapleDecoderLayer(nn.Module):
-    def __init__(self, config, layer_idx: int):
+    def __init__(self, config, layer_id: int):
         super().__init__()
         self.hidden_size = config.hidden_size
-        self.layer_idx = layer_idx
+        self.layer_id = layer_id # this is used by sglang, so make sure that the name stays exactly the same!
 
-        self.self_attn = MapleAttention(config=config, layer_idx=layer_idx)
+        self.self_attn = MapleAttention(config=config, layer_id=layer_id)
 
         if USE_FUSED_EXPERTS:
-            self.mlp = MapleSparseMoeBlock(config, layer_id=layer_idx)
+            self.mlp = MapleSparseMoeBlock(config, layer_id=layer_id)
         else:
-            self.mlp = MapleSparseMoeBlockOld(config, layer_id=layer_idx)
+            self.mlp = MapleSparseMoeBlockOld(config, layer_id=layer_id)
 
         self.input_layernorm = MapleRMSNorm(config.hidden_size, eps=config.rms_norm_eps, _fp64=True)
         self.post_attention_layernorm = MapleRMSNorm(config.hidden_size, eps=config.rms_norm_eps, _fp64=True)
@@ -492,7 +492,7 @@ class MapleModel(nn.Module):
         self.word_embeddings = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
 
         self.layers = nn.ModuleList([
-            MapleDecoderLayer(config, layer_idx=i)
+            MapleDecoderLayer(config, layer_id=i)
             for i in range(config.num_hidden_layers)
         ])
 
