@@ -36,8 +36,6 @@ from sglang.srt.managers.io_struct import (
     GetInternalStateReqOutput,
     GetLoadReqInput,
     GetLoadReqOutput,
-    GetWeightHashesReqInput,
-    GetWeightHashesReqOutput,
     GetWeightsByNameReqInput,
     GetWeightsByNameReqOutput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
@@ -198,9 +196,6 @@ class TokenizerCommunicatorMixin:
             self.send_to_scheduler, server_args.dp_size
         )
         self.get_internal_state_communicator = _Communicator(
-            self.send_to_scheduler, server_args.dp_size
-        )
-        self.get_weight_hashes_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
         self.set_internal_state_communicator = _Communicator(
