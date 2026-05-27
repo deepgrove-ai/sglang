@@ -67,7 +67,7 @@ def get_attention_sliding_window_size(config: PretrainedConfig):
     sliding_window = config.sliding_window
     if sliding_window is None:
         return None
-    return sliding_window
+    return sliding_window - 1
 
 # ── building blocks ──────────────────────────────────────────────────────────
 
@@ -376,7 +376,7 @@ class MapleAttention(nn.Module):
         self.q_norm = MapleRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = MapleRMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
-        sliding_window_size = self.sliding_window if self.sliding_window is not None else -1
+        sliding_window_size = self.sliding_window - 1 if self.sliding_window is not None else -1
         self.attn = RadixAttention(
             num_heads=self.num_local_heads,
             head_dim=self.head_dim,
