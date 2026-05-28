@@ -45,6 +45,11 @@ class FlashAttentionMetadata:
     window_size: tuple = (-1, -1)
     # Page table, the index of KV Cache Tables/Blocks
     page_table: torch.Tensor = None
+    # SWA-translated page table (only set when self.is_hybrid; same shape as
+    # page_table but each entry is the SWA-pool slot for the corresponding
+    # full-pool slot in page_table). Sliding-window layers use this in place
+    # of page_table to read KV from the smaller swa_kv_pool.
+    swa_page_table: torch.Tensor = None
 
     # Encoder metadata
     # Cumulative sequence lengths for encoder key
@@ -636,11 +641,20 @@ class FlashAttentionBackend(AttentionBackend):
                 ),
             ]
 
+        if self.is_hybrid and metadata.page_table is not None:
+            metadata.swa_page_table = self.full_to_swa_index_mapping[
+                metadata.page_table
+            ].to(torch.int32)
+
         # Convert the page table to a strided format which is needed by FA3 API
         if self.page_size > 1:
             self.strided_indices = torch.arange(
                 0, metadata.page_table.shape[1], self.page_size, device=self.device
             )
+            if self.is_hybrid and metadata.swa_page_table is not None:
+                metadata.swa_page_table = (
+                    metadata.swa_page_table[:, self.strided_indices] // self.page_size
+                )
             metadata.page_table = (
                 metadata.page_table[:, self.strided_indices] // self.page_size
             )
@@ -751,6 +765,13 @@ class FlashAttentionBackend(AttentionBackend):
             cu_seqlens_k = swa_spec_metadata.cu_seqlens_k
         else:
             page_table = metadata.page_table
+            if is_swa and self.is_hybrid:
+                if metadata.swa_page_table is not None:
+                    page_table = metadata.swa_page_table
+                else:
+                    page_table = self.full_to_swa_index_mapping[page_table].to(
+                        torch.int32
+                    )
             cu_seqlens_q = metadata.cu_seqlens_q
             cache_seqlens = metadata.cache_seqlens_int32
             max_seqlen_q = metadata.max_seq_len_q
@@ -1023,6 +1044,10 @@ class FlashAttentionBackend(AttentionBackend):
         if layer.is_cross_attention or layer.attn_type == AttentionType.ENCODER_ONLY:
             causal = False
 
+        is_swa = (
+            layer.sliding_window_size is not None and layer.sliding_window_size > -1
+        )
+
         # For fa3 interface version compatibility, we put new fields into conditional keyword args
         kwargs = {}
         if self.fa_impl_ver != 3:
@@ -1097,6 +1122,13 @@ class FlashAttentionBackend(AttentionBackend):
                 )
             else:
                 page_table = metadata.page_table
+                if is_swa and self.is_hybrid:
+                    if metadata.swa_page_table is not None:
+                        page_table = metadata.swa_page_table
+                    else:
+                        page_table = self.full_to_swa_index_mapping[page_table].to(
+                            torch.int32
+                        )
                 cache_seqlens = metadata.cache_seqlens_int32
                 cu_seqlens_k = metadata.cu_seqlens_k
                 max_seqlen_q = metadata.max_seq_len_q
@@ -1263,6 +1295,13 @@ class FlashAttentionBackend(AttentionBackend):
                 0, self.max_context_len, self.page_size, device=self.device
             ),
         }
+        if self.is_hybrid:
+            self.decode_cuda_graph_metadata["swa_page_table"] = torch.zeros(
+                max_bs,
+                max_num_pages,
+                dtype=torch.int32,
+                device=self.device,
+            )
         # Only allocate local attention buffers if local attention is enabled
         # This prevents OOM errors when local attention is not being used
         if self.attention_chunk_size is not None:
@@ -1589,6 +1628,10 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata.page_table = self.decode_cuda_graph_metadata["page_table"][
                     :bs, :
                 ]
+                if self.is_hybrid:
+                    metadata.swa_page_table = self.decode_cuda_graph_metadata[
+                        "swa_page_table"
+                    ][:bs, :]
                 # Precompute cumulative sequence lengths
                 metadata.cu_seqlens_q = torch.arange(
                     0, batch_size + 1, dtype=torch.int32, device=device
@@ -1822,6 +1865,16 @@ class FlashAttentionBackend(AttentionBackend):
                     0,
                     self.page_size,
                 )
+
+                if self.is_hybrid:
+                    # Refresh SWA page_table from the (just-populated) full page_table.
+                    # The gather output lands in the pre-allocated buffer so the
+                    # captured CUDA graph sees a stable pointer across replays.
+                    metadata.swa_page_table[:, :max_seq_pages].copy_(
+                        self.full_to_swa_index_mapping[
+                            metadata.page_table[:, :max_seq_pages]
+                        ]
+                    )
 
                 self._update_local_attn_metadata_for_replay(
                     metadata,
