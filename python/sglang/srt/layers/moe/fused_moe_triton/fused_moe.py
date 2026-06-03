@@ -552,10 +552,20 @@ def fused_experts_impl(
                     gemm1_limit,
                 )
             elif gemm1_limit is not None:
-                intermediate_cache2 = swiglu_with_limit(
-                    intermediate_cache1.view(-1, N),
-                    gemm1_limit,
-                )
+                if _is_cuda or _is_hip:
+                    # Clamp in-place, then use the CUDA-graph-safe silu_and_mul kernel.
+                    # swiglu_with_limit uses @torch.compile which allocates a new output tensor;
+                    # CUDA graphs capture the address from capture time, so replay reads stale
+                    # memory when the allocation lands at a different address.
+                    ic1 = intermediate_cache1.view(-1, N)
+                    ic1[:, : N // 2].clamp_(max=gemm1_limit)
+                    ic1[:, N // 2 :].clamp_(-gemm1_limit, gemm1_limit)
+                    silu_and_mul(ic1, intermediate_cache2)
+                else:
+                    intermediate_cache2 = swiglu_with_limit(
+                        intermediate_cache1.view(-1, N),
+                        gemm1_limit,
+                    )
             elif _is_cuda or _is_hip:
                 silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
             else:
