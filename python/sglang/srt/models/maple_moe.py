@@ -49,7 +49,7 @@ from sglang.srt.utils import add_prefix
 logger = logging.getLogger(__name__)
 
 USE_FUSED_EXPERTS = True
-USE_SWIGLU_CLAMP = True
+USE_SWIGLU_CLAMP = False 
 MAPLE_SWIGLU_CLAMP_LIMIT = 7.0
 
 
@@ -177,21 +177,56 @@ class MapleGate(nn.Module):
         self.config = config
         self.top_k = config.num_experts_per_tok
         self.num_experts = config.num_experts
+
+        self.n_group = config.n_group
+        self.topk_group = config.topk_group
+
+        assert (self.n_group == 0) == (self.topk_group == 0), "n_group and topk_group must be 0 at the same time"
+
         self.gating_dim = config.hidden_size
         self.weight = nn.Parameter(torch.empty((self.num_experts, self.gating_dim)))
+        self.routed_scaling_factor = config.routed_scaling_factor
+        self.register_buffer("expert_bias", torch.zeros(self.num_experts, device=self.weight.device))
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
         import torch.nn.init as init
+
         init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+
+    def group_limited_topk(self, scores: torch.Tensor):
+        num_tokens, _ = scores.size()
+        group_scores = scores.view(num_tokens, self.n_group, -1).topk(2, dim=-1)[0].sum(dim=-1)
+        group_idx = torch.topk(group_scores, k=self.topk_group, dim=-1, sorted=False)[1]
+        group_mask = torch.zeros_like(group_scores)
+        group_mask.scatter_(1, group_idx, 1)
+
+        score_mask = (
+            group_mask.unsqueeze(-1)
+            .expand(num_tokens, self.n_group, self.num_experts // self.n_group)
+            .reshape(num_tokens, -1)
+        )
+
+        masked_scores = scores.masked_fill(~score_mask.bool(), float("-inf"))
+        probs, top_indices = torch.topk(masked_scores, k=self.top_k, dim=-1)
+        return probs, top_indices
 
     def forward(self, hidden_states: torch.Tensor):
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
         logits = F.linear(hidden_states.type(torch.float32), self.weight.type(torch.float32))
-        routing_weights = F.softmax(logits, dim=1, dtype=torch.float)
-        scores, topk_idx = torch.topk(routing_weights, self.top_k, dim=-1)
-        scores = scores.type_as(logits)
-        topk_weight = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20)
+
+        scores = torch.sigmoid(logits.float()).type_as(logits)
+        scores_for_routing = (scores + self.expert_bias) if self.config.moe_router_enable_expert_bias else scores
+
+        if self.n_group > 0:
+            _, topk_idx = self.group_limited_topk(scores_for_routing)
+        else:
+            assert False, "maple doesn't support non-group-limited top-k"
+
+        scores = torch.gather(scores, dim=1, index=topk_idx).type_as(logits)
+        topk_weight = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20) if self.top_k > 1 else scores
+        topk_weight = topk_weight * (self.routed_scaling_factor if self.routed_scaling_factor else 1.0)
+
         return topk_idx, topk_weight, logits
 
 
