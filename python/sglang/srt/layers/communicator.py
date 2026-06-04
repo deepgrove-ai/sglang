@@ -291,9 +291,9 @@ class LayerCommunicator:
                             residual,
                         )
                     else:
-                        hidden_states = hidden_states + residual
-                        residual = hidden_states
-                        hidden_states = self.input_layernorm(hidden_states)
+                        hidden_states, residual = self.input_layernorm(
+                            hidden_states, residual
+                        )
 
         hidden_states = self._communicate_simple_fn(
             hidden_states=hidden_states,
@@ -518,9 +518,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
     ):
         # TODO move these `if shape != 0` into LayerNorm itself
         if hidden_states.shape[0] != 0:
-            hidden_states = hidden_states + residual
-            residual = hidden_states
-            hidden_states = layernorm(hidden_states)
+            hidden_states, residual = layernorm(hidden_states, residual)
         return hidden_states, residual
 
     @staticmethod
@@ -577,13 +575,10 @@ class CommunicateWithAllReduceAndLayerNormFn:
                     hidden_states, residual
                 )
             else:
-                orig_dtype = hidden_states.dtype
-                hidden_states = tensor_model_parallel_all_reduce(hidden_states.float())
+                hidden_states = tensor_model_parallel_all_reduce(hidden_states)
                 if context.cache is not None:
                     _ = prepare_weight_cache(hidden_states, context.cache)
-                hidden_states = (hidden_states.float() + residual.float()).to(orig_dtype)
-                residual = hidden_states
-                hidden_states = layernorm(hidden_states)
+                hidden_states, residual = layernorm(hidden_states, residual)
         return hidden_states, residual
 
     @staticmethod
@@ -604,9 +599,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
         if residual_input_mode == ScatterMode.TP_ATTN_FULL:
             residual = residual.tensor_split(context.attn_tp_size)[context.attn_tp_rank]
         if hidden_states.shape[0] != 0:
-            hidden_states = hidden_states + residual
-            residual = hidden_states
-            hidden_states = layernorm(hidden_states)
+            hidden_states, residual = layernorm(hidden_states, residual)
         return hidden_states, residual
 
 
