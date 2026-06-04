@@ -49,7 +49,7 @@ from sglang.srt.utils import add_prefix
 logger = logging.getLogger(__name__)
 
 USE_FUSED_EXPERTS = True
-USE_SWIGLU_CLAMP = False
+USE_SWIGLU_CLAMP = True
 MAPLE_SWIGLU_CLAMP_LIMIT = 7.0
 
 
