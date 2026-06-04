@@ -37,7 +37,7 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead, VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
+from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size, is_dp_attention_enabled
 from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
@@ -48,10 +48,8 @@ from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
 
-USE_FUSED_EXPERTS = True
 USE_SWIGLU_CLAMP = True
 MAPLE_SWIGLU_CLAMP_LIMIT = 7.0
-
 
 def _use_swiglu_clamp(config) -> bool:
     return bool(getattr(config, "use_swiglu_clamp", USE_SWIGLU_CLAMP))
@@ -126,45 +124,15 @@ def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
     return q_embed, k_embed
 
 
-class MapleMLP(nn.Module):
-    def __init__(self, config, intermediate_size: int):
-        super().__init__()
-        self.config = config
-        self.hidden_size = config.hidden_size
-        self.intermediate_size = intermediate_size
-
-        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
-        self.act_fn = ACT2FN[config.hidden_act]
-
-    def forward(self, x):
-        gate = F.linear(x, self.gate_proj.weight)
-        up = F.linear(x, self.up_proj.weight)
-        gate = gate.float()
-        up = up.float()
-        if _use_swiglu_clamp(self.config):
-            gate = torch.clamp(gate, max=MAPLE_SWIGLU_CLAMP_LIMIT)
-            up = torch.clamp(
-                up, min=-MAPLE_SWIGLU_CLAMP_LIMIT, max=MAPLE_SWIGLU_CLAMP_LIMIT
-            )
-        hidden = (self.act_fn(gate) * up).to(x.dtype)
-        return F.linear(hidden, self.down_proj.weight)
-
-
 class MapleRMSNorm(nn.Module):
-    def __init__(self, hidden_size, eps=1e-6, _fp64=False):
+    def __init__(self, hidden_size, eps=1e-6):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
-        # Diagnostic: compute in fp64 to mask any fp32 reduction-order drift
-        # from CUDA kernel dispatch differences (2D vs 3D inputs, eager vs
-        # inductor). Toggled on for input_layernorm only.
-        self._fp64 = _fp64
 
     def forward(self, hidden_states):
         input_dtype = hidden_states.dtype
-        compute_dtype = torch.float64 if self._fp64 else torch.float32
+        compute_dtype = torch.float32
         hidden_states = hidden_states.to(compute_dtype)
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
@@ -193,71 +161,6 @@ class MapleGate(nn.Module):
         scores = scores.type_as(logits)
         topk_weight = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20)
         return topk_idx, topk_weight, logits
-
-
-# ── MoE: Python-reference path (used when USE_FUSED_EXPERTS=False) ───────────
-
-class MapleSparseMoeBlockOld(nn.Module):
-    """Unfused MoE block — identical math to HF; loops over experts in Python."""
-
-    def __init__(self, config, layer_id: int) -> None:
-        super().__init__()
-        self.config = config
-        self.layer_id = layer_id  # exposed for router_replay capture
-        self.num_experts_per_tok = config.num_experts_per_tok
-        self.experts = nn.ModuleList([
-            MapleMLP(config=config, intermediate_size=config.moe_intermediate_size)
-            for _ in range(config.num_experts)
-        ])
-        self.gate = MapleGate(config)
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        is_2d = hidden_states.dim() == 2
-        if is_2d:
-            hidden_states = hidden_states.unsqueeze(0)
-        bsz, seq_len, h = hidden_states.shape
-
-        topk_idx, topk_weight, _router_logits = self.gate(hidden_states)
-        if _slime_router_replay is not None:
-            _slime_router_replay.record_topk(self.layer_id, topk_idx, topk_weight)
-
-        hidden_states = hidden_states.view(-1, h)
-        y = self.moe_infer(hidden_states, topk_idx, topk_weight).view(bsz, seq_len, h)
-        if is_2d:
-            y = y.squeeze(0)
-        return y
-
-    @torch.no_grad()
-    def moe_infer(self, x, topk_ids, topk_weight):
-        cnts = topk_ids.new_zeros((topk_ids.shape[0], len(self.experts)))
-        cnts.scatter_(1, topk_ids, 1)
-        tokens_per_expert = cnts.sum(dim=0)
-        idxs = topk_ids.view(-1).argsort()
-        sorted_tokens = x[idxs // topk_ids.shape[1]]
-        tokens_per_expert = tokens_per_expert.cpu().numpy()
-        outputs = []
-        start_idx = 0
-        for i, num_tokens in enumerate(tokens_per_expert):
-            end_idx = start_idx + num_tokens
-            if num_tokens == 0:
-                continue
-            expert = self.experts[i]
-            tokens_for_this_expert = sorted_tokens[start_idx:end_idx]
-            expert_out = expert(tokens_for_this_expert)
-            outputs.append(expert_out.to(x.device))
-            start_idx = end_idx
-
-        outs = torch.cat(outputs, dim=0) if len(outputs) else sorted_tokens.new_empty(0)
-        new_x = torch.empty_like(outs)
-        new_x[idxs] = outs
-        weighted = (
-            new_x.view(*topk_ids.shape, -1)
-            .type(topk_weight.dtype)
-            .mul_(topk_weight.unsqueeze(dim=-1))
-        )
-        final_out = weighted.sum(dim=1).type(new_x.dtype)
-        return final_out
-
 
 # ── MoE: FusedMoE (Triton) path — the default ────────────────────────────────
 
@@ -446,13 +349,10 @@ class MapleDecoderLayer(nn.Module):
 
         self.self_attn = MapleAttention(config=config, layer_id=layer_id)
 
-        if USE_FUSED_EXPERTS:
-            self.mlp = MapleSparseMoeBlock(config, layer_id=layer_id)
-        else:
-            self.mlp = MapleSparseMoeBlockOld(config, layer_id=layer_id)
+        self.mlp = MapleSparseMoeBlock(config, layer_id=layer_id)
 
-        self.input_layernorm = MapleRMSNorm(config.hidden_size, eps=config.rms_norm_eps, _fp64=True)
-        self.post_attention_layernorm = MapleRMSNorm(config.hidden_size, eps=config.rms_norm_eps, _fp64=True)
+        self.input_layernorm = MapleRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = MapleRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -521,58 +421,6 @@ class MapleModel(nn.Module):
         return hidden_states
 
 
-# ── fp32 lm_head matmul (mirrors VeOmni's MapleForCausalLM.forward exactly) ──
-
-class _FP32MatmulLogitsProcessor(LogitsProcessor):
-    """Force the lm_head matmul into fp32 unconditionally.
-
-    Bypasses ``enable_fp32_lm_head``, ``rl_on_policy_target``,
-    ``use_intel_amx_backend``, the bf16 fallback, and the logit_scale /
-    final_logit_softcapping / DP-scatter tails. The resulting matmul is:
-
-        local_logits = hidden_states.fp32 @ lm_head.weight.fp32.T
-        logits       = all_gather(local_logits)  # only when TP>1
-
-    which is bit-identical to ``MapleForCausalLM.forward``'s lm_head call
-    in VeOmni's modeling_maple.py. At TP=1 the all-gather is a no-op; at
-    TP>1 ``lm_head.weight`` is column-sharded along the vocab dim by
-    ``ParallelLMHead``, so each rank computes a vocab-slice of the logits
-    and we gather them along ``dim=-1`` to reconstitute the full
-    ``[num_tokens, vocab_size]`` tensor before the buffer copy. NCCL
-    preserves fp32 across the gather, so the fp32-parity property holds at
-    any TP.
-    """
-
-    def _get_logits(
-        self,
-        hidden_states: torch.Tensor,
-        lm_head,
-        logits_metadata: LogitsMetadata,
-        embedding_bias: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        # Per-rank shard matmul. With ParallelLMHead column-sharded along
-        # vocab, ``lm_head.weight`` is ``[vocab_size // TP, hidden]`` on each
-        # rank — except possibly on the last rank if vocab_size doesn't
-        # divide evenly, in which case ParallelLMHead pads internally.
-        local_logits = torch.matmul(
-            hidden_states.to(torch.float32),
-            lm_head.weight.to(torch.float32).T,
-        )
-        if get_tensor_model_parallel_world_size() > 1:
-            # All-gather along the vocab dim. Result shape:
-            # ``[num_tokens, padded_vocab_size]`` where padded_vocab_size
-            # equals ``(vocab_size // TP) * TP`` and is >= self.config.vocab_size.
-            logits = tensor_model_parallel_all_gather(local_logits, dim=-1)
-        else:
-            logits = local_logits
-        if logits_metadata.next_token_logits_buffer is not None:
-            buf = logits_metadata.next_token_logits_buffer
-            assert buf.dtype == torch.float
-            buf.copy_(logits[:, : self.config.vocab_size])
-            return buf
-        return logits[:, : self.config.vocab_size]
-
-
 # ── causal LM head ────────────────────────────────────────────────────────────
 
 class MapleForCausalLM(nn.Module):
@@ -580,12 +428,14 @@ class MapleForCausalLM(nn.Module):
 
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
         super().__init__()
+        assert not is_dp_attention_enabled(), "MapleForCausalLM does not support DP attention"
         self.config = config
         self.model = MapleModel(config)
         self.vocab_size = config.vocab_size
 
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
-        self.logits_processor = _FP32MatmulLogitsProcessor(config)
+        self.logits_processor = LogitsProcessor(config)
+        self.logits_processor.use_fp32_lm_head = True
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.word_embeddings
