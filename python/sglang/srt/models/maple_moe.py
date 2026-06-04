@@ -332,39 +332,28 @@ class MapleAttention(nn.Module):
                 query_states, key_states = apply_rotary_pos_emb(
                     query_states, key_states, cos, sin, unsqueeze_dim=1
                 )
-        else: 
+        else:
             if len(out_qkv.shape) == 2:
-                out_qkv = out_qkv.unsqueeze(0)
+                out_qkv = out_qkv.unsqueeze(0).contiguous()
 
             cos, sin, _freqs = position_embeddings
 
-            print(f"freqs: {_freqs.shape}")
-            # fused linghe kernel
+            q_w = self.q_norm.weight.contiguous()
+            k_w = self.k_norm.weight.contiguous()
             if self.sliding_window is not None:
                 query_states, key_states, value_states = triton_qk_norm_and_half_rope_forward(
-                    out_qkv,
-                    self.q_norm.weight,
-                    self.k_norm.weight,
-                    _freqs.contiguous(),
-                    self.num_local_heads,
-                    self.num_local_kv_heads,
-                    eps=1e-6,
+                    out_qkv, q_w, k_w, _freqs.contiguous(),
+                    self.num_local_heads, self.num_local_kv_heads, eps=1e-6,
                 )
-            
             else:
                 query_states, key_states, value_states = triton_qk_norm_and_split_forward(
-                    out_qkv,
-                    self.q_norm.weight,
-                    self.k_norm.weight,
-                    _freqs.contiguous(),
-                    self.num_local_heads,
-                    self.num_local_kv_heads,
-                    eps=1e-6,
+                    out_qkv, q_w, k_w, _freqs.contiguous(),
+                    self.num_local_heads, self.num_local_kv_heads, eps=1e-6,
                 )
 
-        q = query_states.reshape(num_tokens, self.num_local_heads * self.head_dim)
-        k = key_states.reshape(num_tokens, self.num_local_kv_heads * self.head_dim)
-        v = value_states.reshape(num_tokens, self.num_local_kv_heads * self.head_dim)
+        q = query_states.squeeze(0).reshape(num_tokens, self.num_local_heads * self.head_dim)
+        k = key_states.squeeze(0).reshape(num_tokens, self.num_local_kv_heads * self.head_dim)
+        v = value_states.squeeze(0).reshape(num_tokens, self.num_local_kv_heads * self.head_dim)
 
         attn_output = self.attn(q, k, v, forward_batch)
 
