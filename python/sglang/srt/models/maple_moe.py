@@ -55,6 +55,8 @@ from sglang.srt.distributed import (
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.utils import add_prefix
+from .maple_fa.nope import triton_qk_norm_and_split_forward
+from .maple_fa.rope import triton_qk_norm_and_half_rope_forward
 
 
 logger = logging.getLogger(__name__)
@@ -597,27 +599,65 @@ class MapleAttention(nn.Module):
         num_tokens = hidden_states.shape[0]
 
         out_qkv, _ = self.qkv_proj(hidden_states)
-        qkv = out_qkv.view(num_tokens, self.num_local_heads + 2 * self.num_local_kv_heads, self.head_dim)
+        print(f"qkv: {out_qkv.shape}")
+        # qkv = out_qkv.view(num_tokens, self.num_local_heads + 2 * self.num_local_kv_heads, self.head_dim)
+        if len(out_qkv.shape) == 2:
+            out_qkv = out_qkv.unsqueeze(0)
+        # query_states, key_states, value_states = qkv.split(
+        #     [self.num_local_heads, self.num_local_kv_heads, self.num_local_kv_heads], dim=-2
+        # )
 
-        query_states, key_states, value_states = qkv.split(
-            [self.num_local_heads, self.num_local_kv_heads, self.num_local_kv_heads], dim=-2
-        )
+        # query_states = self.q_norm(query_states)
+        # key_states = self.k_norm(key_states)
+        # if self.sliding_window is not None and position_embeddings is not None:
+        #     cos, sin, _ = position_embeddings
+        #     cos = cos.squeeze(0)
+        #     sin = sin.squeeze(0)
+        #     query_states, key_states = apply_rotary_pos_emb(
+        #         query_states, key_states, cos, sin, unsqueeze_dim=1
+        #     )
 
-        query_states = self.q_norm(query_states)
-        key_states = self.k_norm(key_states)
-
-        if self.sliding_window is not None and position_embeddings is not None:
-            cos, sin, _ = position_embeddings
-            cos = cos.squeeze(0)
-            sin = sin.squeeze(0)
-            query_states, key_states = apply_rotary_pos_emb(
-                query_states, key_states, cos, sin, unsqueeze_dim=1
+        # q = query_states.reshape(num_tokens, self.num_local_heads * self.head_dim)
+        # k = key_states.reshape(num_tokens, self.num_local_kv_heads * self.head_dim)
+        # v = value_states.reshape(num_tokens, self.num_local_kv_heads * self.head_dim)
+        cos, sin, _freqs = position_embeddings
+        print(f"freqs: {_freqs.shape}")
+        # fused linghe kernel
+        if self.sliding_window is not None:
+            query_states, key_states, value_states = triton_qk_norm_and_half_rope_forward(
+                out_qkv,
+                self.q_norm.weight,
+                self.k_norm.weight,
+                _freqs.contiguous(),
+                self.num_local_heads,
+                self.num_local_kv_heads,
+                eps=1e-6,
             )
-
-        q = query_states.reshape(num_tokens, self.num_local_heads * self.head_dim)
-        k = key_states.reshape(num_tokens, self.num_local_kv_heads * self.head_dim)
-        v = value_states.reshape(num_tokens, self.num_local_kv_heads * self.head_dim)
-
+        else:
+            query_states, key_states, value_states = triton_qk_norm_and_split_forward(
+                out_qkv,
+                self.q_norm.weight,
+                self.k_norm.weight,
+                _freqs.contiguous(),
+                self.num_local_heads,
+                self.num_local_kv_heads,
+                eps=1e-6,
+            )
+        # Returns:
+        # - qo: shape [B, S, H, head_dim]
+        # - ko: shape [B, S, h, head_dim]
+        # - vo: shape [B, S, h, head_dim]
+        # need in the non fused path shape
+        n_heads = self.num_local_heads
+        n_kv_heads = self.num_local_kv_heads
+        query_states = query_states.reshape(num_tokens, n_heads, self.head_dim)
+        key_states = key_states.reshape(num_tokens, n_kv_heads, self.head_dim)
+        value_states = value_states.reshape(num_tokens, n_kv_heads, self.head_dim)
+        
+        q = query_states.reshape(num_tokens, n_heads * self.head_dim)
+        k = key_states.reshape(num_tokens, n_kv_heads * self.head_dim)
+        v = value_states.reshape(num_tokens, n_kv_heads * self.head_dim)
+        
         attn_output = self.attn(q, k, v, forward_batch)
 
         attn_output, _ = self.o_proj(attn_output)
