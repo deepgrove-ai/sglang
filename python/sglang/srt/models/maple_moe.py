@@ -421,58 +421,6 @@ class MapleModel(nn.Module):
         return hidden_states
 
 
-# ── fp32 lm_head matmul (mirrors VeOmni's MapleForCausalLM.forward exactly) ──
-
-class _FP32MatmulLogitsProcessor(LogitsProcessor):
-    """Force the lm_head matmul into fp32 unconditionally.
-
-    Bypasses ``enable_fp32_lm_head``, ``rl_on_policy_target``,
-    ``use_intel_amx_backend``, the bf16 fallback, and the logit_scale /
-    final_logit_softcapping / DP-scatter tails. The resulting matmul is:
-
-        local_logits = hidden_states.fp32 @ lm_head.weight.fp32.T
-        logits       = all_gather(local_logits)  # only when TP>1
-
-    which is bit-identical to ``MapleForCausalLM.forward``'s lm_head call
-    in VeOmni's modeling_maple.py. At TP=1 the all-gather is a no-op; at
-    TP>1 ``lm_head.weight`` is column-sharded along the vocab dim by
-    ``ParallelLMHead``, so each rank computes a vocab-slice of the logits
-    and we gather them along ``dim=-1`` to reconstitute the full
-    ``[num_tokens, vocab_size]`` tensor before the buffer copy. NCCL
-    preserves fp32 across the gather, so the fp32-parity property holds at
-    any TP.
-    """
-
-    def _get_logits(
-        self,
-        hidden_states: torch.Tensor,
-        lm_head,
-        logits_metadata: LogitsMetadata,
-        embedding_bias: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        # Per-rank shard matmul. With ParallelLMHead column-sharded along
-        # vocab, ``lm_head.weight`` is ``[vocab_size // TP, hidden]`` on each
-        # rank — except possibly on the last rank if vocab_size doesn't
-        # divide evenly, in which case ParallelLMHead pads internally.
-        local_logits = torch.matmul(
-            hidden_states.to(torch.float32),
-            lm_head.weight.to(torch.float32).T,
-        )
-        if get_tensor_model_parallel_world_size() > 1:
-            # All-gather along the vocab dim. Result shape:
-            # ``[num_tokens, padded_vocab_size]`` where padded_vocab_size
-            # equals ``(vocab_size // TP) * TP`` and is >= self.config.vocab_size.
-            logits = tensor_model_parallel_all_gather(local_logits, dim=-1)
-        else:
-            logits = local_logits
-        if logits_metadata.next_token_logits_buffer is not None:
-            buf = logits_metadata.next_token_logits_buffer
-            assert buf.dtype == torch.float
-            buf.copy_(logits[:, : self.config.vocab_size])
-            return buf
-        return logits[:, : self.config.vocab_size]
-
-
 # ── causal LM head ────────────────────────────────────────────────────────────
 
 class MapleForCausalLM(nn.Module):
@@ -486,7 +434,8 @@ class MapleForCausalLM(nn.Module):
         self.vocab_size = config.vocab_size
 
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
-        self.logits_processor = _FP32MatmulLogitsProcessor(config)
+        self.logits_processor = LogitsProcessor(config)
+        self.logits_processor.use_fp32_lm_head = True
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.word_embeddings
