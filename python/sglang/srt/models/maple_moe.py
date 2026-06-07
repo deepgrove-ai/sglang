@@ -44,12 +44,15 @@ from sglang.srt.distributed import (
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.utils import add_prefix
+from sglang.srt.models.maple_fa.nope import triton_qk_norm_and_split_forward
+from sglang.srt.models.maple_fa.rope import triton_qk_norm_and_half_rope_forward
 
 
 logger = logging.getLogger(__name__)
 
 USE_SWIGLU_CLAMP = True
 MAPLE_SWIGLU_CLAMP_LIMIT = 7.0
+USE_TRITON_QK_NORM_KERNELS = True
 
 def _use_swiglu_clamp(config) -> bool:
     return bool(getattr(config, "use_swiglu_clamp", USE_SWIGLU_CLAMP))
@@ -310,26 +313,47 @@ class MapleAttention(nn.Module):
         num_tokens = hidden_states.shape[0]
 
         out_qkv, _ = self.qkv_proj(hidden_states)
-        qkv = out_qkv.view(num_tokens, self.num_local_heads + 2 * self.num_local_kv_heads, self.head_dim)
 
-        query_states, key_states, value_states = qkv.split(
-            [self.num_local_heads, self.num_local_kv_heads, self.num_local_kv_heads], dim=-2
-        )
+        if not USE_TRITON_QK_NORM_KERNELS: 
+            qkv = out_qkv.view(num_tokens, self.num_local_heads + 2 * self.num_local_kv_heads, self.head_dim)
 
-        query_states = self.q_norm(query_states)
-        key_states = self.k_norm(key_states)
-
-        if self.sliding_window is not None and position_embeddings is not None:
-            cos, sin, _ = position_embeddings
-            cos = cos.squeeze(0)
-            sin = sin.squeeze(0)
-            query_states, key_states = apply_rotary_pos_emb(
-                query_states, key_states, cos, sin, unsqueeze_dim=1
+            query_states, key_states, value_states = qkv.split(
+                [self.num_local_heads, self.num_local_kv_heads, self.num_local_kv_heads], dim=-2
             )
 
-        q = query_states.reshape(num_tokens, self.num_local_heads * self.head_dim)
-        k = key_states.reshape(num_tokens, self.num_local_kv_heads * self.head_dim)
-        v = value_states.reshape(num_tokens, self.num_local_kv_heads * self.head_dim)
+            query_states = self.q_norm(query_states)
+            key_states = self.k_norm(key_states)
+
+            cos, sin, _freqs = position_embeddings
+
+            if self.sliding_window is not None:
+                cos = cos.squeeze(0)
+                sin = sin.squeeze(0)
+                query_states, key_states = apply_rotary_pos_emb(
+                    query_states, key_states, cos, sin, unsqueeze_dim=1
+                )
+        else:
+            if len(out_qkv.shape) == 2:
+                out_qkv = out_qkv.unsqueeze(0).contiguous()
+
+            cos, sin, _freqs = position_embeddings
+
+            q_w = self.q_norm.weight.contiguous()
+            k_w = self.k_norm.weight.contiguous()
+            if self.sliding_window is not None:
+                query_states, key_states, value_states = triton_qk_norm_and_half_rope_forward(
+                    out_qkv, q_w, k_w, _freqs.contiguous(),
+                    self.num_local_heads, self.num_local_kv_heads, eps=1e-6,
+                )
+            else:
+                query_states, key_states, value_states = triton_qk_norm_and_split_forward(
+                    out_qkv, q_w, k_w, _freqs.contiguous(),
+                    self.num_local_heads, self.num_local_kv_heads, eps=1e-6,
+                )
+
+        q = query_states.squeeze(0).reshape(num_tokens, self.num_local_heads * self.head_dim)
+        k = key_states.squeeze(0).reshape(num_tokens, self.num_local_kv_heads * self.head_dim)
+        v = value_states.squeeze(0).reshape(num_tokens, self.num_local_kv_heads * self.head_dim)
 
         attn_output = self.attn(q, k, v, forward_batch)
 
