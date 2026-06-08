@@ -156,9 +156,12 @@ class TritonRunnerCore(MoeRunnerCore):
 
         M = hidden_states.shape[0]
         E, N, _ = w13.shape
-        compute_type = (
-            tl.bfloat16 if hidden_states.dtype == torch.bfloat16 else tl.float16
-        )
+
+        # shift this to fp32
+        # compute_type = (
+        #     tl.bfloat16 if hidden_states.dtype == torch.bfloat16 else tl.float16
+        # )
+        compute_type = tl.float32
 
         intermediate_cache1 = torch.empty(
             (M, topk_ids.shape[1], N),
