@@ -1,722 +1,471 @@
-# Adapted from qwen3_moe.py
+# coding=utf-8
+"""Inference-only Maple model for SGLang.
 
-# Copyright 2023-2024 SGLang Team
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-# ==============================================================================
+SGLang-flavored port of VeOmni's modeling_maple.py:
+  - QKVParallelLinear / RowParallelLinear / VocabParallelEmbedding / ParallelLMHead
+  - FusedMoE (Triton) for the MoE experts
+  - RadixAttention replaces FA3 + DynamicCache
 
-
-"""Inference-only Maple model compatible with HuggingFace weights."""
+Router replay: ``record_topk`` is called inside the MoE forward so slime
+can dump SGLang's top-k decisions for the trainer to replay.
+"""
 
 import logging
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+import math
+from typing import Iterable, Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 from torch import nn
+from transformers.activations import ACT2FN
+from transformers.configuration_utils import PretrainedConfig
+from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 
-from sglang.srt.distributed import (
-    get_moe_expert_parallel_world_size,
-    get_pp_group,
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-    tensor_model_parallel_all_reduce,
-)
-from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
-from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
-from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
-from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
-from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
-from sglang.srt.layers.layernorm import RMSNorm
+try:
+    from slime.router_replay import sglang_capture as _slime_router_replay
+except ImportError:  # pragma: no cover
+    _slime_router_replay = None
+
 from sglang.srt.layers.linear import (
     QKVParallelLinear,
-    ReplicatedLinear,
     RowParallelLinear,
 )
-from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe import (
-    get_moe_a2a_backend,
-    should_use_flashinfer_cutlass_moe_fp4_allgather,
-)
-from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
+from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsMetadata
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-from sglang.srt.layers.moe.topk import TopK
-from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.rotary_embedding import MRotaryEmbedding, get_rope
-from sglang.srt.layers.utils import get_layer_id
-from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
-from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead, VocabParallelEmbedding
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.models.qwen2_moe import Qwen2MoeMLP as MapleMLP
-from sglang.srt.models.qwen2_moe import Qwen2MoeModel
-from sglang.srt.models.utils import (
-    create_fused_set_kv_buffer_arg,
-    enable_fused_set_kv_buffer,
+from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size, is_dp_attention_enabled
+from sglang.srt.distributed import (
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_gather,
+    tensor_model_parallel_all_reduce,
 )
-from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import (
-    add_prefix,
-    is_cuda,
-    is_flashinfer_available,
-    is_non_idle_and_non_empty,
-)
+from sglang.srt.utils import add_prefix
+from sglang.srt.models.maple_fa.nope import triton_qk_norm_and_split_forward
+from sglang.srt.models.maple_fa.rope import triton_qk_norm_and_half_rope_forward
 
-MapleConfig = None
-
-_is_flashinfer_available = is_flashinfer_available()
 
 logger = logging.getLogger(__name__)
-_is_cuda = is_cuda()
 
-# Unchanged from qwen3
-class MapleSparseMoeBlock(nn.Module):
-    def __init__(
-        self,
-        layer_id: int,
-        config: MapleConfig,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
-    ):
+USE_SWIGLU_CLAMP = True
+MAPLE_SWIGLU_CLAMP_LIMIT = 7.0
+USE_TRITON_QK_NORM_KERNELS = True
+
+def _use_swiglu_clamp(config) -> bool:
+    return bool(getattr(config, "use_swiglu_clamp", USE_SWIGLU_CLAMP))
+
+def get_attention_sliding_window_size(config: PretrainedConfig):
+    # Aligned with HF sliding window semantics (inclusive),
+    # while SGLang attention backend expects exclusive window size.
+    layer_types = getattr(config, "layer_types", None)
+    if layer_types is None or "sliding_attention" not in layer_types:
+        return None
+    if not hasattr(config, "sliding_window"):
+        return None
+    sliding_window = config.sliding_window
+    if sliding_window is None:
+        return None
+    return sliding_window - 1
+
+# ── building blocks ──────────────────────────────────────────────────────────
+
+class MapleRotaryEmbedding(nn.Module):
+    def __init__(self, config, device=None):
         super().__init__()
-        self.tp_size = get_tensor_model_parallel_world_size()
-        self.layer_id = layer_id
-        if self.tp_size > config.num_experts:
-            raise ValueError(
-                f"Tensor parallel size {self.tp_size} is greater than "
-                f"the number of experts {config.num_experts}."
-            )
+        if hasattr(config, "rope_scaling") and config.rope_scaling is not None:
+            self.rope_type = config.rope_scaling.get("rope_type", config.rope_scaling.get("type"))
+        else:
+            self.rope_type = "default"
+        self.max_seq_len_cached = config.max_position_embeddings
+        self.original_max_seq_len = config.max_position_embeddings
 
-        self.topk = TopK(
-            top_k=config.num_experts_per_tok,
-            renormalize=True,  #config.norm_topk_prob,
-            use_grouped_topk=False,
-        )
+        self.config = config
+        self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
 
-        self.experts = get_moe_impl_class(quant_config)(
-            num_experts=config.num_experts
-            + get_global_server_args().ep_num_redundant_experts,
+        inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.original_inv_freq = self.inv_freq
+
+    @torch.no_grad()
+    @dynamic_rope_update
+    def forward(self, x, position_ids):
+        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
+        position_ids_expanded = position_ids[:, None, :].float()
+
+        device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"
+        with torch.autocast(device_type=device_type, enabled=False):
+            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            cos = emb.cos() * self.attention_scaling
+            sin = emb.sin() * self.attention_scaling
+        freqs = torch.cat([freqs, freqs], dim=-1)
+        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype), freqs.float()
+
+
+def rotate_half(x):
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+
+    rotary_dim = cos.shape[-1]
+    q_rot, q_pass = q[..., :rotary_dim], q[..., rotary_dim:]
+    k_rot, k_pass = k[..., :rotary_dim], k[..., rotary_dim:]
+
+    q_embed = (q_rot * cos) + (rotate_half(q_rot) * sin)
+    k_embed = (k_rot * cos) + (rotate_half(k_rot) * sin)
+
+    q_embed = torch.cat([q_embed, q_pass], dim=-1)
+    k_embed = torch.cat([k_embed, k_pass], dim=-1)
+    return q_embed, k_embed
+
+
+class MapleRMSNorm(nn.Module):
+    def __init__(self, hidden_size, eps=1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
+
+    def forward(self, hidden_states):
+        input_dtype = hidden_states.dtype
+        compute_dtype = torch.float32
+        hidden_states = hidden_states.to(compute_dtype)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        return (self.weight.to(compute_dtype) * hidden_states).to(input_dtype)
+
+
+class MapleGate(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.top_k = config.num_experts_per_tok
+        self.num_experts = config.num_experts
+        self.gating_dim = config.hidden_size
+        self.weight = nn.Parameter(torch.empty((self.num_experts, self.gating_dim)))
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        import torch.nn.init as init
+        init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+
+    def forward(self, hidden_states: torch.Tensor):
+        hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+        logits = F.linear(hidden_states.type(torch.float32), self.weight.type(torch.float32))
+        routing_weights = F.softmax(logits, dim=1, dtype=torch.float)
+        scores, topk_idx = torch.topk(routing_weights, self.top_k, dim=-1)
+        scores = scores.type_as(logits)
+        topk_weight = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20)
+        return topk_idx, topk_weight, logits
+
+# ── MoE: FusedMoE (Triton) path — the default ────────────────────────────────
+
+class MapleSparseMoeBlock(nn.Module):
+    def __init__(self, config, layer_id: int) -> None:
+        super().__init__()
+        self.config = config
+        self.layer_id = layer_id  # exposed for router_replay capture
+        self.num_experts_per_tok = config.num_experts_per_tok
+
+        self.experts = FusedMoE(
+            num_experts=config.num_experts,
             top_k=config.num_experts_per_tok,
-            layer_id=layer_id,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
-            quant_config=quant_config,
-            prefix=add_prefix("experts", prefix),
-        )
-
-        self.gate = ReplicatedLinear(
-            config.hidden_size,
-            config.num_experts,
-            bias=False,
+            layer_id=layer_id,
             quant_config=None,
-            prefix=add_prefix("gate", prefix),
+            prefix="experts",
+            activation=config.hidden_act,
+            gemm1_clamp_limit=(
+                MAPLE_SWIGLU_CLAMP_LIMIT if _use_swiglu_clamp(config) else None
+            ),
+            no_combine=True,  # return (T, K, H) so we accumulate in fp32 ourselves
+            inplace=False,    # required when no_combine=True
+        )
+        self.gate = MapleGate(config)
+
+    @torch.no_grad()
+    def moe_infer(self, x, topk_ids, topk_weight, router_logits):
+        hidden_states = x
+        # Pass ones so the W2 kernel multiplies by 1.0 (no-op); apply the
+        # actual weights below in fp32 to match the reference moe_infer's
+        # accumulation precision.
+        topk_output = StandardTopKOutput(
+            topk_weights=torch.ones_like(topk_weight),
+            topk_ids=topk_ids.to(torch.int32),
+            router_logits=router_logits,
         )
 
-        if get_moe_a2a_backend().is_deepep():
-            # TODO: we will support tp < ep in the future
-            self.ep_size = get_moe_expert_parallel_world_size()
-            self.num_experts = (
-                config.num_experts + get_global_server_args().ep_num_redundant_experts
-            )
-            self.top_k = config.num_experts_per_tok
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        forward_batch: Optional[ForwardBatch] = None,
-        should_allreduce_fusion: bool = False,
-        use_reduce_scatter: bool = False,
-    ) -> torch.Tensor:
-
-        if not get_moe_a2a_backend().is_deepep():
-            return self.forward_normal(
-                hidden_states, should_allreduce_fusion, use_reduce_scatter
-            )
-        else:
-            return self.forward_deepep(hidden_states, forward_batch)
-
-    def get_moe_weights(self):
-        return [
-            x.data
-            for name, x in self.experts.named_parameters()
-            if name not in ["correction_bias"]
-        ]
-
-    def forward_normal(
-        self,
-        hidden_states: torch.Tensor,
-        should_allreduce_fusion: bool = False,
-        use_reduce_scatter: bool = False,
-    ) -> torch.Tensor:
-        num_tokens, hidden_dim = hidden_states.shape
-        hidden_states = hidden_states.view(-1, hidden_dim)
-
-        # router_logits: (num_tokens, n_experts)
-        router_logits, _ = self.gate(hidden_states)
-        topk_output = self.topk(hidden_states, router_logits)
-        final_hidden_states = self.experts(hidden_states, topk_output)
-        if (
-            self.tp_size > 1
-            and not should_allreduce_fusion
-            and not use_reduce_scatter
-            and not should_use_flashinfer_cutlass_moe_fp4_allgather()
-        ):
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
-
-        return final_hidden_states.view(num_tokens, hidden_dim)
-
-    def forward_deepep(
-        self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
-    ) -> torch.Tensor:
-        if hidden_states.shape[0] > 0:
-            # router_logits: (num_tokens, n_experts)
-            router_logits, _ = self.gate(hidden_states)
-            topk_output = self.topk(
-                hidden_states,
-                router_logits,
-                num_token_non_padded=forward_batch.num_token_non_padded,
-                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                    layer_id=self.layer_id,
-                ),
-            )
-        else:
-            topk_output = self.topk.empty_topk_output(hidden_states.device)
-        final_hidden_states = self.experts(
-            hidden_states=hidden_states,
-            topk_output=topk_output,
+        dispatch_output = self.experts.dispatcher.dispatch(
+            hidden_states=hidden_states, topk_output=topk_output
         )
-        return final_hidden_states
+        combine_input = self.experts.run_moe_core(dispatch_output=dispatch_output)
+        expert_outs = combine_input.hidden_states  # (T, K, H) in model dtype, unweighted
 
-    def op_gate(self, state):
-        if is_non_idle_and_non_empty(
-            state.forward_batch.forward_mode, state.hidden_states_mlp_input
-        ):
-            # router_logits: (num_tokens, n_experts)
-            state.router_logits, _ = self.gate(state.hidden_states_mlp_input)
-        else:
-            state.router_logits = None
+        weighted = expert_outs.to(torch.float32).mul_(topk_weight.unsqueeze(dim=-1))
+        final_out = weighted.sum(dim=1)
+        if get_tensor_model_parallel_world_size() > 1:
+            final_out = tensor_model_parallel_all_reduce(final_out)
+        return final_out.to(hidden_states.dtype)
 
-    def op_select_experts(self, state):
-        router_logits = state.pop("router_logits")
-        hidden_states = state.hidden_states_mlp_input
-        if router_logits is not None:
-            with get_global_expert_distribution_recorder().with_current_layer(
-                self.layer_id
-            ):
-                state.topk_output = self.topk(
-                    hidden_states=hidden_states,
-                    router_logits=router_logits,
-                    num_token_non_padded=state.forward_batch.num_token_non_padded,
-                    expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                        layer_id=self.layer_id,
-                    ),
-                )
-        else:
-            state.topk_output = self.topk.empty_topk_output(hidden_states.device)
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        is_2d = hidden_states.dim() == 2
+        if is_2d:
+            hidden_states = hidden_states.unsqueeze(0)
+        bsz, seq_len, h = hidden_states.shape
 
-    def op_dispatch_a(self, state):
-        if self.ep_size > 1:
-            self.experts.dispatcher.dispatch_a(
-                hidden_states=state.pop("hidden_states_mlp_input"),
-                topk_output=state.pop("topk_output"),
-                tbo_subbatch_index=state.get("tbo_subbatch_index"),
-            )
+        topk_idx, topk_weight, router_logits = self.gate(hidden_states)
+        if _slime_router_replay is not None:
+            _slime_router_replay.record_topk(self.layer_id, topk_idx, topk_weight)
 
-    def op_dispatch_b(self, state):
-        if self.ep_size > 1:
-            with get_global_expert_distribution_recorder().with_current_layer(
-                self.layer_id
-            ):
-                state.dispatch_output = self.experts.dispatcher.dispatch_b(
-                    tbo_subbatch_index=state.get("tbo_subbatch_index"),
-                )
+        hidden_states = hidden_states.view(-1, h)
+        y = self.moe_infer(hidden_states, topk_idx, topk_weight, router_logits).view(bsz, seq_len, h)
+        if is_2d:
+            y = y.squeeze(0)
+        return y
 
-    def op_experts(self, state):
-        state.combine_input = self.experts.run_moe_core(
-            dispatch_output=state.dispatch_output,
-        )
 
-    def op_combine_a(self, state):
-        if self.ep_size > 1:
-            self.experts.dispatcher.combine_a(
-                combine_input=state.pop("combine_input"),
-                tbo_subbatch_index=state.get("tbo_subbatch_index"),
-            )
-            state.pop("dispatch_output")
+# ── attention (RadixAttention is the only inference-specific substitution) ────
 
-    def op_combine_b(self, state):
-        if self.ep_size > 1:
-            state.hidden_states_after_combine = self.experts.dispatcher.combine_b(
-                tbo_subbatch_index=state.get("tbo_subbatch_index"),
-            )
-
-    def op_output(self, state):
-        state.hidden_states_mlp_output = state.pop("hidden_states_after_combine")
-
-# adapted from qwen3: added NoPe global + half RoPe SWA
 class MapleAttention(nn.Module):
-    def __init__(
-        self,
-        hidden_size: int,
-        num_heads: int,
-        num_kv_heads: int,
-        layer_id: int = 0,
-        rope_theta: float = 10000,
-        rope_scaling: Optional[Dict[str, Any]] = None,
-        max_position_embeddings: int = 8192,
-        head_dim: Optional[int] = None,
-        rms_norm_eps: float = 1e-06,
-        attention_bias: bool = False,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
-        dual_chunk_attention_config: Optional[dict[str, Any]] = None,
-        alt_stream: Optional[torch.cuda.Stream] = None,
-        layer_type = "full_attention",
-        sliding_window_size: int = -1,
-    ) -> None:
+    def __init__(self, config, layer_id: int, prefix: str = ""):
         super().__init__()
-        self.hidden_size = hidden_size
-        self.layer_type = layer_type
-        use_sliding_window = layer_type == "sliding_attention"
-        # print(f"layer {layer_id} sliding attention: {use_sliding_window}")
-        self.use_rope = use_sliding_window
-        self.sliding_window_size = sliding_window_size - 1 
+        self.config = config
+        self.layer_id = layer_id
 
+        self.attention_dropout = config.attention_dropout
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        self.head_dim = config.head_dim or self.hidden_size // self.num_heads
+        self.scaling = self.head_dim ** -0.5
+
+        partial_rotary_factor = 0.5
+        self.rope_dim = int(self.head_dim * partial_rotary_factor)
+
+        self.num_key_value_heads = config.num_key_value_heads
+        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
+        self.is_causal = True
+
+        self.layer_type = config.layer_types[layer_id] if hasattr(config, "layer_types") else None
+        self.sliding_window = config.sliding_window if self.layer_type == "sliding_attention" else None
 
         attn_tp_rank = get_attention_tp_rank()
         attn_tp_size = get_attention_tp_size()
 
-        self.total_num_heads = num_heads
-        assert self.total_num_heads % attn_tp_size == 0
-        self.num_heads = self.total_num_heads // attn_tp_size
-        self.total_num_kv_heads = num_kv_heads
-        if self.total_num_kv_heads >= attn_tp_size:
-            # Number of KV heads is greater than TP size, so we partition
-            # the KV heads across multiple tensor parallel GPUs.
-            assert self.total_num_kv_heads % attn_tp_size == 0
-        else:
-            # Number of KV heads is less than TP size, so we replicate
-            # the KV heads across multiple tensor parallel GPUs.
-            assert attn_tp_size % self.total_num_kv_heads == 0
-        self.num_kv_heads = max(1, self.total_num_kv_heads // attn_tp_size)
-        self.head_dim = head_dim or hidden_size // self.total_num_heads
-        self.q_size = self.num_heads * self.head_dim
-        self.kv_size = self.num_kv_heads * self.head_dim
-        self.scaling = self.head_dim**-0.5
-        self.rope_theta = rope_theta
-        self.max_position_embeddings = max_position_embeddings
-        self.tp_rank = get_tensor_model_parallel_rank()
+        assert self.num_heads % attn_tp_size == 0, (
+            f"num_heads={self.num_heads} not divisible by attn_tp_size={attn_tp_size}"
+        )
+        assert self.num_key_value_heads % attn_tp_size == 0, (
+            f"num_key_value_heads={self.num_key_value_heads} not divisible by attn_tp_size={attn_tp_size}"
+        )
+        self.num_local_heads = self.num_heads // attn_tp_size
+        self.num_local_kv_heads = self.num_key_value_heads // attn_tp_size
 
         self.qkv_proj = QKVParallelLinear(
-            hidden_size,
+            self.hidden_size,
             self.head_dim,
-            self.total_num_heads,
-            self.total_num_kv_heads,
+            self.num_heads,
+            self.num_key_value_heads,
             bias=False,
-            quant_config=quant_config,
             tp_rank=attn_tp_rank,
             tp_size=attn_tp_size,
             prefix=add_prefix("qkv_proj", prefix),
         )
 
+        self.q_norm = MapleRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = MapleRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+
+        sliding_window_size = self.sliding_window - 1 if self.sliding_window is not None else -1
+        self.attn = RadixAttention(
+            num_heads=self.num_local_heads,
+            head_dim=self.head_dim,
+            scaling=self.scaling,
+            num_kv_heads=self.num_local_kv_heads,
+            layer_id=layer_id,
+            sliding_window_size=sliding_window_size,
+        )
+
+        # reduce_results=False so we can do the cross-rank all-reduce in fp32 below.
         self.o_proj = RowParallelLinear(
-            self.total_num_heads * self.head_dim,
-            hidden_size,
-            bias=False,
-            quant_config=quant_config,
+            self.num_heads * self.head_dim,
+            self.hidden_size,
+            bias=config.use_bias,
             tp_rank=attn_tp_rank,
             tp_size=attn_tp_size,
             reduce_results=False,
             prefix=add_prefix("o_proj", prefix),
         )
 
-        # main change is using rotary embed half dim
-        if use_sliding_window:
-            self.rotary_emb = get_rope(
-                self.head_dim,
-                rotary_dim=int(self.head_dim*0.5),
-                max_position=max_position_embeddings,
-                base=rope_theta,
-                rope_scaling=rope_scaling,
-                dual_chunk_attention_config=dual_chunk_attention_config,
-            )
-        else:
-            self.rotary_emb = None
-        # self.compatible_with_fused_kv_buffer = (
-        #     False if isinstance(self.rotary_emb, MRotaryEmbedding) else True
-        # )
-        self.compatible_with_fused_kv_buffer = (
-            self.rotary_emb is not None
-            and not isinstance(self.rotary_emb, MRotaryEmbedding)
-        )
-
-        self.attn = RadixAttention(
-            self.num_heads,
-            self.head_dim,
-            self.scaling,
-            num_kv_heads=self.num_kv_heads,
-            layer_id=layer_id,
-            prefix=add_prefix("attn", prefix),
-            sliding_window_size=(self.sliding_window_size if use_sliding_window else -1),
-        )
-
-        self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
-        self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
-        self.alt_stream = alt_stream
-
-    def _apply_qk_norm(
-        self, q: torch.Tensor, k: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # overlap qk norm
-        if self.alt_stream is not None and get_is_capture_mode():
-            current_stream = torch.cuda.current_stream()
-            self.alt_stream.wait_stream(current_stream)
-            q_by_head = q.reshape(-1, self.head_dim)
-            q_by_head = self.q_norm(q_by_head)
-            with torch.cuda.stream(self.alt_stream):
-                k_by_head = k.reshape(-1, self.head_dim)
-                k_by_head = self.k_norm(k_by_head)
-            current_stream.wait_stream(self.alt_stream)
-        else:
-            q_by_head = q.reshape(-1, self.head_dim)
-            q_by_head = self.q_norm(q_by_head)
-            k_by_head = k.reshape(-1, self.head_dim)
-            k_by_head = self.k_norm(k_by_head)
-        q = q_by_head.view(q.shape)
-        k = k_by_head.view(k.shape)
-        return q, k
-
-    def op_prepare(self, state):
-        state.attn_intermediate_state = self.forward_prepare(
-            positions=state.positions,
-            hidden_states=state.pop("hidden_states_after_comm_pre_attn"),
-            forward_batch=state.forward_batch,
-        )
-
-    def op_core(self, state):
-        state.hidden_states_after_attn = self.forward_core(
-            state.pop("attn_intermediate_state")
-        )
-
-    def forward_prepare(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        forward_batch: ForwardBatch,
-    ):
-        if hidden_states.shape[0] == 0:
-            return hidden_states, forward_batch, None
-        qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = self._apply_qk_norm(q, k)
-        if self.rotary_emb is not None:
-            q, k = self.rotary_emb(
-                positions,
-                q,
-                k,
-                fused_set_kv_buffer_arg=(
-                    create_fused_set_kv_buffer_arg(
-                        value=v,
-                        layer=self.attn,
-                        forward_batch=forward_batch,
-                    )
-                    if enable_fused_set_kv_buffer(forward_batch)
-                    and self.compatible_with_fused_kv_buffer
-                    else None
-                ),
-            )
-        # print(f"q: {q[..., :1]}")
-        # print(f"k: {k[..., :1]}")
-        # print(f"v: {v[..., :1]}")
-        inner_state = q, k, v, forward_batch
-        return None, forward_batch, inner_state
-
-    def forward_core(self, intermediate_state):
-        hidden_states, forward_batch, inner_state = intermediate_state
-        if inner_state is None:
-            return hidden_states
-        attn_output = self.attn(
-            *inner_state,
-            save_kv_cache=not (
-                enable_fused_set_kv_buffer(forward_batch)
-                and self.compatible_with_fused_kv_buffer
-            ),
-        )
-        output, _ = self.o_proj(attn_output)
-        return output
-
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
-        s = self.forward_prepare(
-            positions=positions,
-            hidden_states=hidden_states,
-            forward_batch=forward_batch,
-        )
-        return self.forward_core(s)
+        num_tokens = hidden_states.shape[0]
 
+        out_qkv, _ = self.qkv_proj(hidden_states)
+
+        if not USE_TRITON_QK_NORM_KERNELS: 
+            qkv = out_qkv.view(num_tokens, self.num_local_heads + 2 * self.num_local_kv_heads, self.head_dim)
+
+            query_states, key_states, value_states = qkv.split(
+                [self.num_local_heads, self.num_local_kv_heads, self.num_local_kv_heads], dim=-2
+            )
+
+            query_states = self.q_norm(query_states)
+            key_states = self.k_norm(key_states)
+
+            cos, sin, _freqs = position_embeddings
+
+            if self.sliding_window is not None:
+                cos = cos.squeeze(0)
+                sin = sin.squeeze(0)
+                query_states, key_states = apply_rotary_pos_emb(
+                    query_states, key_states, cos, sin, unsqueeze_dim=1
+                )
+        else:
+            if len(out_qkv.shape) == 2:
+                out_qkv = out_qkv.unsqueeze(0).contiguous()
+
+            cos, sin, _freqs = position_embeddings
+
+            q_w = self.q_norm.weight.contiguous()
+            k_w = self.k_norm.weight.contiguous()
+            if self.sliding_window is not None:
+                query_states, key_states, value_states = triton_qk_norm_and_half_rope_forward(
+                    out_qkv, q_w, k_w, _freqs.contiguous(),
+                    self.num_local_heads, self.num_local_kv_heads, eps=1e-6,
+                )
+            else:
+                query_states, key_states, value_states = triton_qk_norm_and_split_forward(
+                    out_qkv, q_w, k_w, _freqs.contiguous(),
+                    self.num_local_heads, self.num_local_kv_heads, eps=1e-6,
+                )
+
+        q = query_states.squeeze(0).reshape(num_tokens, self.num_local_heads * self.head_dim)
+        k = key_states.squeeze(0).reshape(num_tokens, self.num_local_kv_heads * self.head_dim)
+        v = value_states.squeeze(0).reshape(num_tokens, self.num_local_kv_heads * self.head_dim)
+
+        attn_output = self.attn(q, k, v, forward_batch)
+
+        attn_output, _ = self.o_proj(attn_output)
+        if get_tensor_model_parallel_world_size() > 1:
+            attn_output = tensor_model_parallel_all_reduce(attn_output.to(torch.float32)).to(hidden_states.dtype)
+        return attn_output
+
+
+# ── decoder layer ─────────────────────────────────────────────────────────────
 
 class MapleDecoderLayer(nn.Module):
-    def __init__(
-        self,
-        config: MapleConfig,
-        layer_id: int,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
-        alt_stream: Optional[torch.cuda.Stream] = None,
-    ) -> None:
+    def __init__(self, config, layer_id: int):
         super().__init__()
-        self.config = config
         self.hidden_size = config.hidden_size
-        rope_theta = getattr(config, "rope_theta", 10000)
-        rope_scaling = getattr(config, "rope_scaling", None)
-        max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
-        head_dim = getattr(
-            config, "head_dim", config.hidden_size // config.num_attention_heads
-        )
-        rms_norm_eps = config.rms_norm_eps
-        attention_bias = False # config.attention_bias
-        dual_chunk_attention_config = getattr(
-            config, "dual_chunk_attention_config", None
-        )
-        layer_type = config.layer_types[layer_id]
-        sliding_window_size = config.sliding_window
-        # TODO: wire in all of the args
-        self.self_attn = MapleAttention(
-            hidden_size=self.hidden_size,
-            num_heads=config.num_attention_heads,
-            num_kv_heads=config.num_key_value_heads,
-            layer_id=layer_id,
-            rope_theta=rope_theta,
-            rope_scaling=rope_scaling,
-            max_position_embeddings=max_position_embeddings,
-            head_dim=head_dim,
-            rms_norm_eps=rms_norm_eps,
-            attention_bias=attention_bias,
-            quant_config=quant_config,
-            prefix=add_prefix("self_attn", prefix),
-            dual_chunk_attention_config=dual_chunk_attention_config,
-            alt_stream=alt_stream,
-            layer_type=layer_type,
-            sliding_window_size=sliding_window_size,
-        )
+        self.layer_id = layer_id # this is used by sglang, so make sure that the name stays exactly the same!
 
-        self.layer_id = layer_id
+        self.self_attn = MapleAttention(config=config, layer_id=layer_id)
 
-        self.attn_tp_size = get_attention_tp_size()
-        self.attn_tp_rank = get_attention_tp_rank()
+        self.mlp = MapleSparseMoeBlock(config, layer_id=layer_id)
 
-        # Qwen3MoE all layers are sparse and have no nextn now
-        self.is_layer_sparse = True
-        is_previous_layer_sparse = True
-
-        self.layer_scatter_modes = LayerScatterModes.init_new(
-            layer_id=layer_id,
-            num_layers=config.num_hidden_layers,
-            is_layer_sparse=self.is_layer_sparse,
-            is_previous_layer_sparse=is_previous_layer_sparse,
-        )
-
-        if self.is_layer_sparse:
-            self.mlp = MapleSparseMoeBlock(
-                layer_id=self.layer_id,
-                config=config,
-                quant_config=quant_config,
-                prefix=add_prefix("mlp", prefix),
-            )
-        else:
-            self.mlp = MapleMLP(
-                hidden_size=config.hidden_size,
-                intermediate_size=config.intermediate_size,
-                hidden_act=config.hidden_act,
-                quant_config=quant_config,
-                prefix=add_prefix("mlp", prefix),
-            )
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
-
-        self.layer_communicator = LayerCommunicator(
-            layer_scatter_modes=self.layer_scatter_modes,
-            input_layernorm=self.input_layernorm,
-            post_attention_layernorm=self.post_attention_layernorm,
-            allow_reduce_scatter=True,
-            is_last_layer=(self.layer_id == self.config.num_hidden_layers - 1),
-        )
+        self.input_layernorm = MapleRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = MapleRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-        residual: Optional[torch.Tensor],
-        captured_last_layer_outputs: Optional[List[torch.Tensor]] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
+    ) -> torch.Tensor:
+        initial_dtype = hidden_states.dtype
+        residual = hidden_states
 
-        hidden_states, residual = (
-            self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
-                hidden_states,
-                residual,
-                forward_batch,
-                captured_last_layer_outputs=captured_last_layer_outputs,
-            )
-        )
+        hidden_states = self.input_layernorm(hidden_states)
 
-        if hidden_states.shape[0] != 0:
-            hidden_states = self.self_attn(
-                positions=positions,
-                hidden_states=hidden_states,
-                forward_batch=forward_batch,
-            )
-            # print(f"post attention: {hidden_states[..., :5]}")
+        hidden_states = self.self_attn(positions, hidden_states, forward_batch, position_embeddings)
+        hidden_states = (residual.to(torch.float32) + hidden_states.to(torch.float32)).to(initial_dtype)
 
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
-            hidden_states, residual, forward_batch
-        )
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
 
-        should_allreduce_fusion = (
-            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
-                forward_batch
-            )
-        )
+        hidden_states = self.mlp(hidden_states)
 
-        # For DP with padding, reduce scatter can be used instead of all-reduce.
-        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
-            forward_batch
-        )
+        hidden_states = (residual.to(torch.float32) + hidden_states.to(torch.float32)).to(initial_dtype)
 
-        hidden_states = self.mlp(
-            hidden_states, forward_batch, should_allreduce_fusion, use_reduce_scatter
-        )
-        # print(f"post mlp: {hidden_states}")
+        return hidden_states
 
-        if should_allreduce_fusion:
-            hidden_states._sglang_needs_allreduce_fusion = True
-        else:
-            hidden_states, residual = self.layer_communicator.postprocess_layer(
-                hidden_states, residual, forward_batch
-            )
 
-        return hidden_states, residual
+# ── backbone ──────────────────────────────────────────────────────────────────
 
-    def op_comm_prepare_attn(
+class MapleModel(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.padding_idx = config.pad_token_id
+        self.vocab_size = config.vocab_size
+
+        # VocabParallelEmbedding is weight-compatible with nn.Embedding.
+        self.word_embeddings = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
+
+        self.layers = nn.ModuleList([
+            MapleDecoderLayer(config, layer_id=i)
+            for i in range(config.num_hidden_layers)
+        ])
+
+        self.norm = MapleRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.rotary_emb = MapleRotaryEmbedding(config=config)
+
+    def forward(
         self,
-        state,
+        input_ids: torch.Tensor,
         positions: torch.Tensor,
-        hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-        residual: Optional[torch.Tensor],
-        tbo_subbatch_index: Optional[int] = None,
-    ):
-        state.hidden_states_after_comm_pre_attn, state.residual_after_input_ln = (
-            self.layer_communicator.prepare_attn(hidden_states, residual, forward_batch)
-        )
-        state.update(
-            dict(
-                forward_batch=forward_batch,
-                positions=positions,
-                tbo_subbatch_index=tbo_subbatch_index,
-            )
-        )
+        input_embeds: torch.Tensor = None,
+    ) -> torch.Tensor:
+        if input_embeds is None:
+            hidden_states = self.word_embeddings(input_ids)
+        else:
+            hidden_states = input_embeds
 
-    def op_comm_prepare_mlp(self, state):
-        state.hidden_states_mlp_input, state.residual_after_comm_pre_mlp = (
-            self.layer_communicator.prepare_mlp(
-                state.pop("hidden_states_after_attn"),
-                state.pop("residual_after_input_ln"),
-                state.forward_batch,
-            )
-        )
+        # positions: (num_tokens,) → rotary_emb expects (B, T)
+        position_embeddings = self.rotary_emb(hidden_states, positions.unsqueeze(0))
 
-    def op_mlp(self, state):
-        hidden_states = state.pop("hidden_states_mlp_input")
-        state.hidden_states_mlp_output = self.mlp(hidden_states, state.forward_batch)
+        for i, layer in enumerate(self.layers):
+            hidden_states = layer(positions, hidden_states, forward_batch, position_embeddings)
 
-    def op_comm_postprocess_layer(self, state):
-        hidden_states, residual = self.layer_communicator.postprocess_layer(
-            state.pop("hidden_states_mlp_output"),
-            state.pop("residual_after_comm_pre_mlp"),
-            state.forward_batch,
-        )
-
-        output = dict(
-            positions=state.positions,
-            hidden_states=hidden_states,
-            residual=residual,
-            forward_batch=state.forward_batch,
-            tbo_subbatch_index=state.tbo_subbatch_index,
-        )
-
-        state.clear(
-            expect_keys={
-                "positions",
-                "forward_batch",
-                "tbo_subbatch_index",
-            }
-        )
-        return output
+        hidden_states = self.norm(hidden_states)
+        return hidden_states
 
 
-class MapleModel(Qwen2MoeModel):
-    def __init__(
-        self,
-        config: MapleConfig,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
-        decoder_layer_type=MapleDecoderLayer,
-    ) -> None:
-        alt_stream = torch.cuda.Stream() if _is_cuda else None
-        super().__init__(
-            config=config,
-            quant_config=quant_config,
-            prefix=prefix,
-            decoder_layer_type=decoder_layer_type,
-            alt_stream=alt_stream,
-        )
-
+# ── causal LM head ────────────────────────────────────────────────────────────
 
 class MapleForCausalLM(nn.Module):
     fall_back_to_pt_during_load = False
 
-    def __init__(
-        self,
-        config: MapleConfig,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
-    ) -> None:
+    def __init__(self, config, quant_config=None, prefix: str = "") -> None:
         super().__init__()
-        self.pp_group = get_pp_group()
+        assert not is_dp_attention_enabled(), "MapleForCausalLM does not support DP attention"
         self.config = config
-        self.quant_config = quant_config
-        self.model = MapleModel(
-            config, quant_config, prefix=add_prefix("model", prefix)
-        )
-        # print(self.model)
-        self.lm_head = ParallelLMHead(
-            config.vocab_size,
-            config.hidden_size,
-            quant_config=quant_config,
-            prefix=add_prefix("lm_head", prefix),
-            use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
-        )
+        self.model = MapleModel(config)
+        self.vocab_size = config.vocab_size
+
+        self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         self.logits_processor = LogitsProcessor(config)
-        self.capture_aux_hidden_states = False
+        self.logits_processor.use_fp32_lm_head = True
 
     def get_input_embeddings(self) -> nn.Embedding:
-        return self.model.embed_tokens
+        return self.model.word_embeddings
+
+    def get_attention_sliding_window_size(self):
+        return get_attention_sliding_window_size(self.config)
 
     @torch.no_grad()
     def forward(
@@ -725,106 +474,16 @@ class MapleForCausalLM(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
-        pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-        hidden_states = self.model(
-            input_ids,
-            positions,
-            forward_batch,
-            input_embeds,
-            pp_proxy_tensors=pp_proxy_tensors,
-        )
-
-        aux_hidden_states = None
-        if self.capture_aux_hidden_states:
-            hidden_states, aux_hidden_states = hidden_states
-
-        if self.pp_group.is_last_rank:
-            return self.logits_processor(
-                input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
-            )
-        else:
-            return hidden_states
-
-    @torch.no_grad()
-    def forward_split_prefill(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        forward_batch: ForwardBatch,
-        split_interval: Tuple[int, int],  # [start, end) 0-based
-        input_embeds: torch.Tensor = None,
-    ):
-        start, end = split_interval
-        # embed
-        if start == 0:
-            if input_embeds is None:
-                forward_batch.hidden_states = self.model.embed_tokens(input_ids)
-            else:
-                forward_batch.hidden_states = input_embeds
-
-        # decoder layer
-        for i in range(start, end):
-            with get_global_expert_distribution_recorder().with_current_layer(i):
-                layer = self.model.layers[i]
-                forward_batch.hidden_states, forward_batch.residual = layer(
-                    positions,
-                    forward_batch.hidden_states,
-                    forward_batch,
-                    forward_batch.residual,
-                )
-
-        if end == self.model.config.num_hidden_layers:
-            # norm
-            hidden_states, _ = self.model.norm(
-                forward_batch.hidden_states, forward_batch.residual
-            )
-            forward_batch.hidden_states = hidden_states
-            # logits process
-            result = self.logits_processor(
-                input_ids, forward_batch.hidden_states, self.lm_head, forward_batch
-            )
-        else:
-            result = None
-
-        return result
-
-    @property
-    def start_layer(self):
-        return self.model.start_layer
-
-    @property
-    def end_layer(self):
-        return self.model.end_layer
-
-    def get_embed_and_head(self):
-        return self.model.embed_tokens.weight, self.lm_head.weight
-
-    def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
-        if not self.pp_group.is_last_rank:
-            return
-
-        self.capture_aux_hidden_states = True
-        if layer_ids is None:
-            num_layers = self.config.num_hidden_layers
-            self.model.set_eagle3_layers_to_capture(
-                [
-                    2,
-                    num_layers // 2,
-                    num_layers - 3,
-                ]
-            )  # Specific layers for EAGLE3 support
-        else:
-            self.model.set_eagle3_layers_to_capture([val + 1 for val in layer_ids])
+        hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
+        return self.logits_processor(input_ids, hidden_states, self.lm_head, forward_batch)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        # Map HF-format separate q/k/v projections onto the fused QKVParallelLinear.
         stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
+            (".qkv_proj", ".q_proj", "q"),
+            (".qkv_proj", ".k_proj", "k"),
+            (".qkv_proj", ".v_proj", "v"),
         ]
 
         expert_params_mapping = FusedMoE.make_expert_params_mapping(
@@ -834,112 +493,67 @@ class MapleForCausalLM(nn.Module):
             num_experts=self.config.num_experts,
         )
 
-        # Cache params_dict to avoid repeated expensive traversal of model parameters
-        if not hasattr(self, "_cached_params_dict"):
-            self._cached_params_dict = dict(self.named_parameters())
-        params_dict = self._cached_params_dict
+        params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
-            if "word_embeddings" in name:
-                name = name.replace("word_embeddings", "embed_tokens")
-            layer_id = get_layer_id(name)
-            if (
-                layer_id is not None
-                and hasattr(self.model, "start_layer")
-                and (
-                    layer_id < self.model.start_layer
-                    or layer_id >= self.model.end_layer
-                )
-            ):
-                continue
-
             if "rotary_emb.inv_freq" in name:
                 continue
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                # Skip non-stacked layers and experts (experts handled below).
+
+            if name.endswith(".mlp.gate.expert_bias"):
+                continue
+
+            bailing_v2_mapping = (
+                (".self_attn.qkv_proj", ".attention.query_key_value"),
+                (".self_attn.o_proj", ".attention.dense"),
+                (".self_attn.q_norm", ".attention.query_layernorm"),
+                (".self_attn.k_norm", ".attention.key_layernorm"),
+            )
+            loaded_bailing_v2_weight = False
+            for param_name, weight_name in bailing_v2_mapping:
                 if weight_name not in name:
                     continue
-                # We have mlp.experts[0].gate_proj in the checkpoint.
-                # Since we handle the experts below in expert_params_mapping,
-                # we need to skip here BEFORE we update the name, otherwise
-                # name will be updated to mlp.experts[0].gate_up_proj, which
-                # will then be updated below in expert_params_mapping
-                # for mlp.experts[0].gate_gate_up_proj, which breaks load.
-                if "mlp.experts" in name:
+                mapped_name = name.replace(weight_name, param_name)
+                if mapped_name not in params_dict:
                     continue
-                name = name.replace(weight_name, param_name)
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                if name not in params_dict:
-                    continue
+                param = params_dict[mapped_name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
+                loaded_bailing_v2_weight = True
+                break
+            if loaded_bailing_v2_weight:
+                continue
 
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
+            # 1) qkv fusion
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                if weight_name not in name:
+                    continue
+                fused_name = name.replace(weight_name, param_name)
+                if fused_name not in params_dict:
+                    continue
+                param = params_dict[fused_name]
+                param.weight_loader(param, loaded_weight, shard_id)
                 break
             else:
-                # Track if this is an expert weight to enable early skipping
-                is_expert_weight = False
-
-                for mapping in expert_params_mapping:
-                    param_name, weight_name, expert_id, shard_id = mapping
+                # 2) FusedMoE expert mapping
+                for param_name, weight_name, expert_id, shard_id in expert_params_mapping:
                     if weight_name not in name:
                         continue
-
-                    # Mark as expert weight regardless of whether we can process it
-                    is_expert_weight = True
-
-                    name = name.replace(weight_name, param_name)
-                    if name not in params_dict:
-                        # Expert weight not on this rank, will be skipped below
+                    mapped_name = name.replace(weight_name, param_name)
+                    if mapped_name not in params_dict:
                         continue
-
-                    param = params_dict[name]
-                    weight_loader = param.weight_loader
-                    weight_loader(
-                        param,
-                        loaded_weight,
-                        name,
-                        shard_id=shard_id,
-                        expert_id=expert_id,
+                    param = params_dict[mapped_name]
+                    param.weight_loader(
+                        param, loaded_weight, mapped_name,
+                        shard_id=shard_id, expert_id=expert_id,
                     )
                     break
                 else:
-                    if is_expert_weight:
-                        # This is an expert weight but not mapped to this rank, skip all remaining processing
-                        continue
-
-                    # Skip loading extra bias for GPTQ models.
-                    if name.endswith(".bias") and name not in params_dict:
-                        continue
+                    # 3) fallthrough — plain copy via weight_loader.
                     if name not in params_dict:
+                        logger.debug(f"Skipping {name} — not in model")
                         continue
-
-                    if name in params_dict.keys():
-                        param = params_dict[name]
-                        weight_loader = getattr(
-                            param, "weight_loader", default_weight_loader
-                        )
-                        weight_loader(param, loaded_weight)
-                    else:
-                        logger.warning(f"Parameter {name} not found in params_dict")
-
-        # TODO mimic deepseek
-        # Lazy initialization of expert weights cache to avoid slowing down load_weights
-        if not hasattr(self, "routed_experts_weights_of_layer"):
-            self.routed_experts_weights_of_layer = {
-                layer_id: self.model.layers[layer_id].mlp.get_moe_weights()
-                for layer_id in range(self.start_layer, self.end_layer)
-                if isinstance(self.model.layers[layer_id].mlp, MapleSparseMoeBlock)
-            }
-
-    @classmethod
-    def get_model_config_for_expert_location(cls, config):
-        return ModelConfigForExpertLocation(
-            num_layers=config.num_hidden_layers,
-            num_logical_experts=config.num_experts,
-            num_groups=None,
-        )
+                    param = params_dict[name]
+                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                    weight_loader(param, loaded_weight)
 
 
 EntryClass = MapleForCausalLM

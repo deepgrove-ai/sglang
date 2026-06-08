@@ -686,6 +686,16 @@ class CudaGraphRunner:
 
         self.deepep_adapter.capture(is_extend_in_batch=False)
 
+        # Router replay (slime): bootstrap _CTX so record_topk's scatter is
+        # captured into the graph. Without this, the captured graph has zero
+        # scatter ops and the replay buffer stays zero, breaking trainer KL.
+        try:
+            from slime.router_replay import sglang_capture as _slime_router_replay
+        except ImportError:
+            _slime_router_replay = None
+        if _slime_router_replay is not None:
+            _slime_router_replay.begin_capture(self.model_runner, bs)
+
         for _ in range(2):
             self.device_module.synchronize()
             self.model_runner.tp_group.barrier()

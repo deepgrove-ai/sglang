@@ -119,6 +119,7 @@ class TritonRunnerCore(MoeRunnerCore):
             moe_sum_reduce_torch_compile,
             moe_sum_reduce_triton,
             swiglu_with_alpha_and_limit,
+            swiglu_with_limit,
         )
 
         hidden_states = runner_input.hidden_states
@@ -155,9 +156,12 @@ class TritonRunnerCore(MoeRunnerCore):
 
         M = hidden_states.shape[0]
         E, N, _ = w13.shape
-        compute_type = (
-            tl.bfloat16 if hidden_states.dtype == torch.bfloat16 else tl.float16
-        )
+
+        # shift this to fp32
+        # compute_type = (
+        #     tl.bfloat16 if hidden_states.dtype == torch.bfloat16 else tl.float16
+        # )
+        compute_type = tl.float32
 
         intermediate_cache1 = torch.empty(
             (M, topk_ids.shape[1], N),
@@ -204,6 +208,21 @@ class TritonRunnerCore(MoeRunnerCore):
                     gemm1_alpha,
                     gemm1_limit,
                 )
+            elif gemm1_limit is not None:
+                if _is_cuda:
+                    # Clamp in-place, then use the CUDA-graph-safe silu_and_mul kernel.
+                    # swiglu_with_limit uses @torch.compile which allocates a new output tensor;
+                    # CUDA graphs capture the address from capture time, so replay reads stale
+                    # memory when the allocation lands at a different address.
+                    ic1 = intermediate_cache1.view(-1, N)
+                    ic1[:, : N // 2].clamp_(max=gemm1_limit)
+                    ic1[:, N // 2 :].clamp_(-gemm1_limit, gemm1_limit)
+                    silu_and_mul(ic1, intermediate_cache2)
+                else:
+                    intermediate_cache2 = swiglu_with_limit(
+                        intermediate_cache1.view(-1, N),
+                        gemm1_limit,
+                    )
             elif _is_cuda:
                 silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
             else:
@@ -238,7 +257,11 @@ class TritonRunnerCore(MoeRunnerCore):
         elif inplace:
             out_hidden_states = hidden_states
         else:
-            out_hidden_states = torch.empty_like(hidden_states)
+            out_hidden_states = torch.empty(
+                (M, w2.shape[1]),
+                device=hidden_states.device,
+                dtype=torch.float32,
+            )
 
         invoke_fused_moe_kernel(
             intermediate_cache2,
@@ -313,6 +336,9 @@ class TritonRunnerCore(MoeRunnerCore):
                 intermediate_cache3.view(*intermediate_cache3.shape),
                 out_hidden_states,
             )
+
+        if not no_combine and not inplace and out_hidden_states.dtype != hidden_states.dtype:
+            out_hidden_states = out_hidden_states.to(hidden_states.dtype)
 
         return TritonRunnerOutput(
             hidden_states=out_hidden_states,

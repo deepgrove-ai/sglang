@@ -346,10 +346,20 @@ def moe_sum_reduce_torch_compile(x, out, routed_scaling_factor):
 
 @torch.compile
 def swiglu_with_alpha_and_limit(x, gemm1_alpha, gemm1_limit):
-    gate, up = x[..., ::2], x[..., 1::2]
+    d = x.shape[-1] // 2
+    gate, up = x[..., :d], x[..., d:]
     gate = gate.clamp(min=None, max=gemm1_limit)
     up = up.clamp(min=-gemm1_limit, max=gemm1_limit)
     return gate * torch.sigmoid(gate * gemm1_alpha) * (up + 1)
+
+
+@torch.compile
+def swiglu_with_limit(x, gemm1_limit):
+    d = x.shape[-1] // 2
+    gate, up = x[..., :d], x[..., d:]
+    gate = torch.nn.functional.silu(gate.clamp(min=None, max=gemm1_limit))
+    up = up.clamp(min=-gemm1_limit, max=gemm1_limit)
+    return gate * up
 
 
 @functools.lru_cache()
@@ -541,6 +551,21 @@ def fused_experts_impl(
                     gemm1_alpha,
                     gemm1_limit,
                 )
+            elif gemm1_limit is not None:
+                if _is_cuda or _is_hip:
+                    # Clamp in-place, then use the CUDA-graph-safe silu_and_mul kernel.
+                    # swiglu_with_limit uses @torch.compile which allocates a new output tensor;
+                    # CUDA graphs capture the address from capture time, so replay reads stale
+                    # memory when the allocation lands at a different address.
+                    ic1 = intermediate_cache1.view(-1, N)
+                    ic1[:, : N // 2].clamp_(max=gemm1_limit)
+                    ic1[:, N // 2 :].clamp_(-gemm1_limit, gemm1_limit)
+                    silu_and_mul(ic1, intermediate_cache2)
+                else:
+                    intermediate_cache2 = swiglu_with_limit(
+                        intermediate_cache1.view(-1, N),
+                        gemm1_limit,
+                    )
             elif _is_cuda or _is_hip:
                 silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
             else:
@@ -559,15 +584,12 @@ def fused_experts_impl(
         else:
             raise ValueError(f"Unsupported activation: {activation=}")
 
+        _w2_out = (intermediate_cache3 if not no_combine and topk_ids.shape[1] != 1 else out_hidden_states[begin_chunk_idx:end_chunk_idx].unsqueeze(0))
         invoke_fused_moe_kernel(
             intermediate_cache2,
             w2,
             b2,
-            (
-                intermediate_cache3
-                if not no_combine and topk_ids.shape[1] != 1
-                else out_hidden_states[begin_chunk_idx:end_chunk_idx].unsqueeze(0)
-            ),
+            _w2_out,
             a2_scale,
             w2_scale,
             w2_zp,
