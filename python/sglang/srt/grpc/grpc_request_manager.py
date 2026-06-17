@@ -589,6 +589,15 @@ class GrpcRequestManager:
             if state.obj.return_logprob:
                 self._convert_logprob_style(state, batch_out, i)
 
+            if (
+                state.obj.return_hidden_states
+                and batch_out.output_hidden_states
+                and i < len(batch_out.output_hidden_states)
+            ):
+                output_data["meta_info"]["hidden_states"] = (
+                    batch_out.output_hidden_states[i]
+                )
+
             # Send input logprobs based if available
             if (
                 state.obj.return_logprob

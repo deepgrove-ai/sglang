@@ -15,6 +15,7 @@ from concurrent import futures
 from typing import AsyncIterator, Dict, Optional
 
 import grpc
+import numpy as np
 from google.protobuf.json_format import MessageToDict
 from google.protobuf.struct_pb2 import Struct
 from google.protobuf.timestamp_pb2 import Timestamp
@@ -433,6 +434,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             ),
             top_logprobs_num=grpc_req.top_logprobs_num or 0,
             stream=grpc_req.stream or False,
+            return_hidden_states=grpc_req.return_hidden_states,
             lora_id=grpc_req.lora_id if grpc_req.lora_id else None,
             token_ids_logprob=(
                 list(grpc_req.token_ids_logprob) if grpc_req.token_ids_logprob else None
@@ -596,6 +598,48 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             top_logprobs=top_logprobs_proto,
         )
 
+    def _convert_hidden_states_to_proto(
+        self, hidden_states
+    ) -> list[sglang_scheduler_pb2.HiddenStates]:
+        """Convert returned hidden-state chunks to bytes-backed proto tensors."""
+        if hidden_states is None:
+            return []
+
+        try:
+            arr = np.asarray(hidden_states, dtype=np.float32)
+        except (TypeError, ValueError):
+            chunks = hidden_states
+        else:
+            if arr.ndim <= 2:
+                chunks = [hidden_states]
+            elif arr.ndim == 3:
+                chunks = list(hidden_states)
+            else:
+                chunks = [arr.reshape(-1, arr.shape[-1])]
+
+        hidden_state_protos = []
+        for position, chunk in enumerate(chunks):
+            chunk_arr = np.asarray(chunk, dtype=np.float32)
+            if chunk_arr.size == 0:
+                continue
+            if chunk_arr.ndim == 1:
+                chunk_arr = chunk_arr.reshape(1, -1)
+            elif chunk_arr.ndim > 2:
+                chunk_arr = chunk_arr.reshape(-1, chunk_arr.shape[-1])
+            chunk_arr = np.ascontiguousarray(chunk_arr)
+            hidden_state_protos.append(
+                sglang_scheduler_pb2.HiddenStates(
+                    position=position,
+                    tensor_data=sglang_scheduler_pb2.TensorData(
+                        data=chunk_arr.tobytes(),
+                        shape=list(chunk_arr.shape),
+                        dtype=str(chunk_arr.dtype),
+                    ),
+                )
+            )
+
+        return hidden_state_protos
+
     def _create_chunk_response(
         self, request_id: str, output: Dict
     ) -> sglang_scheduler_pb2.GenerateResponse:
@@ -666,6 +710,9 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         input_logprobs_proto = self._convert_input_logprobs_to_proto(
             output.get("input_logprobs")
         )
+        hidden_states_proto = self._convert_hidden_states_to_proto(
+            meta_info.get("hidden_states")
+        )
 
         return sglang_scheduler_pb2.GenerateResponse(
             request_id=request_id,
@@ -678,6 +725,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 ),
                 cached_tokens=meta_info.get("cached_tokens", 0),
                 output_logprobs=output_logprobs_proto,
+                all_hidden_states=hidden_states_proto,
                 input_logprobs=input_logprobs_proto,
                 index=output.get("index", 0),
                 **matched_stop_kwargs,

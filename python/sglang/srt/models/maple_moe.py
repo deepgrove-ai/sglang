@@ -54,12 +54,34 @@ USE_SWIGLU_CLAMP = True
 MAPLE_SWIGLU_CLAMP_LIMIT = 7.0
 USE_TRITON_QK_NORM_KERNELS = True
 
+MAPLE_QUANTIZED_WEIGHT_SUFFIXES = (
+    "dense.weight",
+    "query_key_value.weight",
+    "_proj.weight",
+    "_proj",
+)
+
+
+def _should_quantize_maple_weight(name: str, tensor: torch.Tensor) -> bool:
+    return tensor.ndim >= 2 and name.endswith(MAPLE_QUANTIZED_WEIGHT_SUFFIXES)
+
+
+def _quantize_maple_weight(tensor: torch.Tensor) -> torch.Tensor:
+    w_fp = tensor.float()
+    abs_w = w_fp.abs()
+    threshold = abs_w.mean(dim=-1, keepdim=True) * 0.7
+    mask = abs_w > threshold
+    mask_f = mask.float()
+    alpha = (abs_w * mask_f).sum(dim=-1, keepdim=True) / mask_f.sum(
+        dim=-1, keepdim=True
+    ).clamp(min=1.0)
+    return (w_fp.sign() * mask_f * alpha).to(tensor.dtype)
+
+
 def _use_swiglu_clamp(config) -> bool:
     return bool(getattr(config, "use_swiglu_clamp", USE_SWIGLU_CLAMP))
 
 def get_attention_sliding_window_size(config: PretrainedConfig):
-    # Aligned with HF sliding window semantics (inclusive),
-    # while SGLang attention backend expects exclusive window size.
     layer_types = getattr(config, "layer_types", None)
     if layer_types is None or "sliding_attention" not in layer_types:
         return None
@@ -68,7 +90,7 @@ def get_attention_sliding_window_size(config: PretrainedConfig):
     sliding_window = config.sliding_window
     if sliding_window is None:
         return None
-    return sliding_window - 1
+    return sliding_window
 
 # ── building blocks ──────────────────────────────────────────────────────────
 
@@ -282,7 +304,7 @@ class MapleAttention(nn.Module):
         self.q_norm = MapleRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = MapleRMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
-        sliding_window_size = self.sliding_window - 1 if self.sliding_window is not None else -1
+        sliding_window_size = self.sliding_window if self.sliding_window is not None else -1
         self.attn = RadixAttention(
             num_heads=self.num_local_heads,
             head_dim=self.head_dim,
@@ -494,12 +516,16 @@ class MapleForCausalLM(nn.Module):
         )
 
         params_dict = dict(self.named_parameters())
+        quantize_weights = bool(getattr(self.config, "quantize", False))
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
 
             if name.endswith(".mlp.gate.expert_bias"):
                 continue
+
+            if quantize_weights and _should_quantize_maple_weight(name, loaded_weight):
+                loaded_weight = _quantize_maple_weight(loaded_weight)
 
             bailing_v2_mapping = (
                 (".self_attn.qkv_proj", ".attention.query_key_value"),
