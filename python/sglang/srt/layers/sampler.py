@@ -90,7 +90,7 @@ class Sampler(nn.Module):
             # Use torch.argmax if all requests use greedy sampling
             batch_next_token_ids = torch.argmax(logits, -1)
             if return_logprob:
-                logprobs = torch.nn.functional.log_softmax(logits, dim=-1)
+                logprobs = torch.nn.functional.log_softmax(logits.float(), dim=-1)
         else:
             can_sample_directly_from_probs = (
                 not sampling_info.need_top_p_sampling
@@ -102,12 +102,10 @@ class Sampler(nn.Module):
             if return_logprob and SGLANG_RETURN_ORIGINAL_LOGPROB:
                 probs_without_temp_scaling = torch.softmax(logits, dim=-1)
 
-            if get_global_server_args().rl_on_policy_target == "fsdp":
-                logits_div_temperature = (
-                    logits.bfloat16().div(sampling_info.temperatures).bfloat16()
-                )
+            # fp32 logprobs from pre-softmax logits
+            if return_logprob and not SGLANG_RETURN_ORIGINAL_LOGPROB:
                 logprobs_via_logsoftmax_kernel = torch.log_softmax(
-                    logits_div_temperature, dim=-1
+                    logits.float().div(sampling_info.temperatures), dim=-1
                 )
 
             # Post process logits
@@ -156,17 +154,15 @@ class Sampler(nn.Module):
                     )
 
             if return_logprob:
-                if get_global_server_args().rl_on_policy_target == "fsdp":
-                    logprobs = logprobs_via_logsoftmax_kernel
-                    del logprobs_via_logsoftmax_kernel
-                # clamp to avoid -inf
-                elif SGLANG_RETURN_ORIGINAL_LOGPROB:
+                if SGLANG_RETURN_ORIGINAL_LOGPROB:
+                    # clamp to avoid -inf
                     logprobs = torch.log(probs_without_temp_scaling).clamp(
                         min=torch.finfo(probs_without_temp_scaling.dtype).min
                     )
                     del probs_without_temp_scaling
                 else:
-                    logprobs = torch.log(probs).clamp(min=torch.finfo(probs.dtype).min)
+                    logprobs = logprobs_via_logsoftmax_kernel
+                    del logprobs_via_logsoftmax_kernel
 
         # Attach logprobs to logits_output (in-place modification)
         if return_logprob:

@@ -39,6 +39,8 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size, is_dp_attention_enabled
 from sglang.srt.distributed import (
+    get_moe_tensor_parallel_rank,
+    get_moe_tensor_parallel_world_size,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
@@ -53,6 +55,16 @@ logger = logging.getLogger(__name__)
 USE_SWIGLU_CLAMP = True
 MAPLE_SWIGLU_CLAMP_LIMIT = 7.0
 USE_TRITON_QK_NORM_KERNELS = True
+try:
+    from sonicmoe.enums import ActivationType
+    from sonicmoe.functional import moe_TC_softmax_topk_layer
+except ImportError:
+    ActivationType = None
+    moe_TC_softmax_topk_layer = None
+
+
+def _use_sonic_moe(config) -> bool:
+    return bool(getattr(config, "use_sonic_moe", True))
 
 MAPLE_QUANTIZED_WEIGHT_SUFFIXES = (
     "dense.weight",
@@ -254,6 +266,141 @@ class MapleSparseMoeBlock(nn.Module):
         return y
 
 
+class MapleSonicMoeBlock(nn.Module):
+    """SonicMoE variant for alignment experiments.
+
+    This keeps SGLang's tensor-parallel expert sharding: gate/up rows and
+    down input columns are partitioned across MoE TP ranks, then the hidden
+    output is all-reduced. Weights are expected to be quantized by
+    MapleForCausalLM.load_weights, matching the existing FusedMoE path.
+    """
+
+    def __init__(self, config, layer_id: int) -> None:
+        super().__init__()
+        if moe_TC_softmax_topk_layer is None:
+            raise RuntimeError("MapleSonicMoeBlock requires the sonicmoe package")
+
+        self.config = config
+        self.layer_id = layer_id
+        self.num_experts = config.num_experts
+        self.top_k = config.num_experts_per_tok
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.moe_intermediate_size
+        self.moe_tp_size = get_moe_tensor_parallel_world_size()
+        self.moe_tp_rank = get_moe_tensor_parallel_rank()
+        assert self.intermediate_size % self.moe_tp_size == 0, (
+            f"moe_intermediate_size={self.intermediate_size} must be divisible "
+            f"by moe_tp_size={self.moe_tp_size}"
+        )
+        self.intermediate_size_per_partition = self.intermediate_size // self.moe_tp_size
+
+        self.gate = MapleGate(config)
+        self.gate_up_proj = nn.Parameter(
+            torch.empty(
+                self.num_experts,
+                2 * self.intermediate_size_per_partition,
+                self.hidden_size,
+            ),
+            requires_grad=False,
+        )
+        self.down_proj = nn.Parameter(
+            torch.empty(
+                self.num_experts,
+                self.hidden_size,
+                self.intermediate_size_per_partition,
+            ),
+            requires_grad=False,
+        )
+
+    def load_expert_weight(
+        self,
+        projection_name: str,
+        expert_id: int,
+        loaded_weight: torch.Tensor,
+    ) -> None:
+        if not 0 <= expert_id < self.num_experts:
+            raise ValueError(f"Expert id out of range for layer {self.layer_id}: {expert_id}")
+
+        shard = self.intermediate_size_per_partition
+        start = self.moe_tp_rank * shard
+        with torch.no_grad():
+            if projection_name == "gate_proj":
+                weight = loaded_weight.narrow(0, start, shard)
+                target = self.gate_up_proj[expert_id, 0::2, :]
+            elif projection_name == "up_proj":
+                weight = loaded_weight.narrow(0, start, shard)
+                target = self.gate_up_proj[expert_id, 1::2, :]
+            elif projection_name == "down_proj":
+                weight = loaded_weight.narrow(1, start, shard)
+                target = self.down_proj[expert_id]
+            else:
+                raise ValueError(f"Unknown Maple expert projection: {projection_name}")
+
+            assert target.shape == weight.shape, (
+                f"target shape {tuple(target.shape)} != loaded weight shape {tuple(weight.shape)} "
+                f"for expert {expert_id} {projection_name}"
+            )
+            target.copy_(weight.to(device=target.device, dtype=target.dtype))
+
+    def load_stacked_expert_weight(
+        self,
+        projection_name: str,
+        loaded_weight: torch.Tensor,
+    ) -> None:
+        shard = self.intermediate_size_per_partition
+        start = self.moe_tp_rank * shard
+        with torch.no_grad():
+            if projection_name == "gate_up_proj":
+                weight = loaded_weight.narrow(1, 2 * start, 2 * shard)
+                target = self.gate_up_proj
+            elif projection_name == "down_proj":
+                weight = loaded_weight.narrow(2, start, shard)
+                target = self.down_proj
+            else:
+                raise ValueError(f"Unknown Maple stacked expert projection: {projection_name}")
+
+            assert target.shape == weight.shape, (
+                f"target shape {tuple(target.shape)} != loaded weight shape {tuple(weight.shape)} "
+                f"for stacked {projection_name}"
+            )
+            target.copy_(weight.to(device=target.device, dtype=target.dtype))
+
+    @torch.no_grad()
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        is_2d = hidden_states.dim() == 2
+        if is_2d:
+            hidden_states = hidden_states.unsqueeze(0)
+        original_shape = hidden_states.shape
+        flat_hidden_states = hidden_states.reshape(-1, self.hidden_size)
+
+        if _slime_router_replay is not None:
+            topk_idx, topk_weight, _ = self.gate(hidden_states)
+            _slime_router_replay.record_topk(self.layer_id, topk_idx, topk_weight)
+
+        output, _, _ = moe_TC_softmax_topk_layer(
+            flat_hidden_states,
+            self.gate.weight,
+            self.gate_up_proj.permute(1, 2, 0),
+            None,
+            self.down_proj.permute(1, 2, 0),
+            None,
+            self.top_k,
+            torch.cuda.current_stream().cuda_stream,
+            ActivationType.SWIGLU,
+            False,
+            norm_topk=True,
+            swiglu_limit=MAPLE_SWIGLU_CLAMP_LIMIT if _use_swiglu_clamp(self.config) else 0.0,
+        )
+
+        if self.moe_tp_size > 1:
+            output = tensor_model_parallel_all_reduce(output)
+
+        output = output.view(original_shape)
+        if is_2d:
+            output = output.squeeze(0)
+        return output
+
+
 # ── attention (RadixAttention is the only inference-specific substitution) ────
 
 class MapleAttention(nn.Module):
@@ -395,7 +542,11 @@ class MapleDecoderLayer(nn.Module):
 
         self.self_attn = MapleAttention(config=config, layer_id=layer_id)
 
-        self.mlp = MapleSparseMoeBlock(config, layer_id=layer_id)
+        self.mlp = (
+            MapleSonicMoeBlock(config, layer_id=layer_id)
+            if _use_sonic_moe(config)
+            else MapleSparseMoeBlock(config, layer_id=layer_id)
+        )
 
         self.input_layernorm = MapleRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = MapleRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -481,7 +632,6 @@ class MapleForCausalLM(nn.Module):
 
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         self.logits_processor = LogitsProcessor(config)
-        self.logits_processor.use_fp32_lm_head = True
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.word_embeddings
@@ -516,6 +666,7 @@ class MapleForCausalLM(nn.Module):
         )
 
         params_dict = dict(self.named_parameters())
+        modules_dict = dict(self.named_modules())
         quantize_weights = bool(getattr(self.config, "quantize", False))
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
@@ -559,27 +710,52 @@ class MapleForCausalLM(nn.Module):
                 param.weight_loader(param, loaded_weight, shard_id)
                 break
             else:
-                # 2) FusedMoE expert mapping
-                for param_name, weight_name, expert_id, shard_id in expert_params_mapping:
-                    if weight_name not in name:
-                        continue
-                    mapped_name = name.replace(weight_name, param_name)
-                    if mapped_name not in params_dict:
-                        continue
-                    param = params_dict[mapped_name]
-                    param.weight_loader(
-                        param, loaded_weight, mapped_name,
-                        shard_id=shard_id, expert_id=expert_id,
-                    )
-                    break
+                # 2) MoE expert mapping
+                loaded_moe_weight = False
+                if _use_sonic_moe(self.config) and ".mlp.experts." in name:
+                    module_name, projection_name = name.split(".mlp.experts.", 1)
+                    module = modules_dict.get(f"{module_name}.mlp")
+                    if (
+                        isinstance(module, MapleSonicMoeBlock)
+                        and projection_name in ("gate_up_proj", "down_proj")
+                    ):
+                        module.load_stacked_expert_weight(projection_name, loaded_weight)
+                        loaded_moe_weight = True
+
+                if _use_sonic_moe(self.config) and ".mlp.experts." in name and name.endswith(".weight"):
+                    module_name, local_name = name.split(".mlp.experts.", 1)
+                    local_parts = local_name.split(".")
+                    if len(local_parts) == 3 and local_parts[0].isdigit():
+                        expert_id = int(local_parts[0])
+                        projection_name = local_parts[1]
+                        module = modules_dict.get(f"{module_name}.mlp")
+                        if isinstance(module, MapleSonicMoeBlock):
+                            module.load_expert_weight(projection_name, expert_id, loaded_weight)
+                            loaded_moe_weight = True
+
+                if loaded_moe_weight:
+                    pass
                 else:
-                    # 3) fallthrough — plain copy via weight_loader.
-                    if name not in params_dict:
-                        logger.debug(f"Skipping {name} — not in model")
-                        continue
-                    param = params_dict[name]
-                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                    weight_loader(param, loaded_weight)
+                    for param_name, weight_name, expert_id, shard_id in expert_params_mapping:
+                        if weight_name not in name:
+                            continue
+                        mapped_name = name.replace(weight_name, param_name)
+                        if mapped_name not in params_dict:
+                            continue
+                        param = params_dict[mapped_name]
+                        param.weight_loader(
+                            param, loaded_weight, mapped_name,
+                            shard_id=shard_id, expert_id=expert_id,
+                        )
+                        break
+                    else:
+                        # 3) fallthrough — plain copy via weight_loader.
+                        if name not in params_dict:
+                            logger.debug(f"Skipping {name} — not in model")
+                            continue
+                        param = params_dict[name]
+                        weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                        weight_loader(param, loaded_weight)
 
 
 EntryClass = MapleForCausalLM
