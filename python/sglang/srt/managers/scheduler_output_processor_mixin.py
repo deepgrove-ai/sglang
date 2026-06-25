@@ -9,6 +9,7 @@ import torch
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.moe.routed_experts_capturer import get_global_experts_capturer
 from sglang.srt.managers.io_struct import (
     AbortReq,
     BatchEmbeddingOutput,
@@ -41,6 +42,19 @@ class SchedulerOutputProcessorMixin:
     This class implements the output processing logic for Scheduler.
     We put them into a separate file to make the `scheduler.py` shorter.
     """
+
+    def maybe_collect_routed_experts(self: Scheduler, req: Req):
+        if not (
+            self.server_args.enable_return_routed_experts
+            and req.return_routed_experts
+            and req.routed_experts is None
+        ):
+            return
+        req.routed_experts = get_global_experts_capturer().get_routed_experts(
+            req_pool_idx=req.req_pool_idx,
+            seqlen=req.seqlen,
+            req_to_token_pool=self.req_to_token_pool,
+        )
 
     def process_batch_result_prefill(
         self: Scheduler,
@@ -111,6 +125,7 @@ class SchedulerOutputProcessorMixin:
                     req.check_finished()
 
                     if req.finished():
+                        self.maybe_collect_routed_experts(req)
                         self.tree_cache.cache_finished_req(req)
                         req.time_stats.completion_time = time.perf_counter()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
@@ -265,6 +280,7 @@ class SchedulerOutputProcessorMixin:
                     req.check_finished()
 
                     if req.finished():
+                        self.maybe_collect_routed_experts(req)
                         self.tree_cache.cache_finished_req(req)
                     else:
                         self.tree_cache.cache_unfinished_req(req)
@@ -382,6 +398,7 @@ class SchedulerOutputProcessorMixin:
             req.check_finished(new_accepted_len)
 
             if req.finished():
+                self.maybe_collect_routed_experts(req)
                 if batch.is_v2_eagle and self.cur_batch.forward_mode.is_extend():
                     # FIXME(lsyin): fix the messy logic here
                     # 1) when not overlap (v2 impl), we free the extra tokens in the req
@@ -785,6 +802,7 @@ class SchedulerOutputProcessorMixin:
         spec_accepted_tokens = []
         retraction_counts = []
         output_hidden_states = None
+        output_routed_experts = []
 
         queue_times = []
         forward_entry_times = []
@@ -990,6 +1008,10 @@ class SchedulerOutputProcessorMixin:
                         output_hidden_states = []
                     output_hidden_states.append(req.hidden_states)
 
+                output_routed_experts.append(
+                    req.routed_experts if req.return_routed_experts else None
+                )
+
             if (
                 req.finished()
                 and self.tp_rank == 0
@@ -1035,6 +1057,7 @@ class SchedulerOutputProcessorMixin:
                     output_token_ids_logprobs_idx=output_token_ids_logprobs_idx,
                     output_token_entropy_val=None,
                     output_hidden_states=output_hidden_states,
+                    output_routed_experts=output_routed_experts,
                     rids=rids,
                     http_worker_ipcs=http_worker_ipcs,
                     placeholder_tokens_idx=None,

@@ -86,6 +86,10 @@ from sglang.srt.layers.dp_attention import (
     initialize_dp_attention,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.moe.routed_experts_capturer import (
+    RoutedExpertsCapturer,
+    set_global_experts_capturer,
+)
 from sglang.srt.layers.sampler import Sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.lora.lora_manager import LoRAManager
@@ -474,6 +478,7 @@ class ModelRunner:
             server_args.max_running_requests,
             server_args.max_total_tokens,
         )
+        self.init_routed_experts_capturer()
         if self.device == "cuda":
             self.init_cublas()
             self.init_attention_backend()
@@ -1485,6 +1490,29 @@ class ModelRunner:
             logger.info(
                 f"Use Sliding window memory pool. full_layer_tokens={self.full_max_total_num_tokens}, swa_layer_tokens={self.swa_max_total_num_tokens}"
             )
+
+    def init_routed_experts_capturer(self):
+        max_running_requests = min(
+            (
+                self.max_total_num_tokens // 2
+                if self.server_args.max_running_requests is None
+                else self.server_args.max_running_requests
+            ),
+            self.req_to_token_pool.size,
+        )
+        num_fused_shared_experts = getattr(
+            self.model, "num_fused_shared_experts", 0
+        )
+        set_global_experts_capturer(
+            RoutedExpertsCapturer.create(
+                enable=get_global_server_args().enable_return_routed_experts,
+                model_config=self.model_config,
+                num_fused_shared_experts=num_fused_shared_experts,
+                num_tokens=self.max_total_num_tokens + self.page_size,
+                max_running_requests=max_running_requests,
+                device=self.device,
+            )
+        )
 
     def can_run_piecewise_cuda_graph(self):
         if self.server_args.disable_cuda_graph:

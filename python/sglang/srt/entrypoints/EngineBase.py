@@ -24,6 +24,7 @@ class EngineBase(ABC):
         lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None,
         custom_logit_processor: Optional[Union[List[str], str]] = None,
         return_hidden_states: Optional[bool] = None,
+        return_routed_experts: Optional[bool] = None,
         stream: Optional[bool] = None,
         bootstrap_host: Optional[Union[List[str], str]] = None,
         bootstrap_port: Optional[Union[List[int], int]] = None,

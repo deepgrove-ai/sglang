@@ -710,6 +710,16 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                     "The server is not configured to return the hidden states. "
                     "Please set `--enable-return-hidden-states` to enable this feature."
                 )
+            return_routed_experts = (
+                any(obj.return_routed_experts)
+                if isinstance(obj.return_routed_experts, list)
+                else obj.return_routed_experts
+            )
+            if return_routed_experts and not self.server_args.enable_return_routed_experts:
+                raise ValueError(
+                    "The server is not configured to return routed experts. "
+                    "Please set `--enable-return-routed-experts` to enable this feature."
+                )
             if (
                 obj.custom_logit_processor
                 and not self.server_args.enable_custom_logit_processor
@@ -802,6 +812,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 session_params=session_params,
                 custom_logit_processor=obj.custom_logit_processor,
                 return_hidden_states=obj.return_hidden_states,
+                return_routed_experts=obj.return_routed_experts,
                 data_parallel_rank=obj.data_parallel_rank,
                 priority=obj.priority,
                 extra_key=obj.extra_key,
@@ -1481,6 +1492,12 @@ class TokenizerManager(TokenizerCommunicatorMixin):
 
             if getattr(recv_obj, "output_hidden_states", None):
                 meta_info["hidden_states"] = recv_obj.output_hidden_states[i]
+
+            if (
+                getattr(recv_obj, "output_routed_experts", None)
+                and recv_obj.output_routed_experts[i] is not None
+            ):
+                meta_info["routed_experts"] = recv_obj.output_routed_experts[i]
 
             if isinstance(recv_obj, BatchStrOutput):
                 state.text += recv_obj.output_strs[i]

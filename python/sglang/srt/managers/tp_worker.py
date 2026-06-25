@@ -37,6 +37,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
+from sglang.srt.layers.moe.routed_experts_capturer import get_global_experts_capturer
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
@@ -340,6 +341,15 @@ class TpModelWorker(BaseTpWorker):
             self.model_runner.token_to_kv_pool.size,
         )
 
+    def _sync_routed_experts(
+        self, forward_batch: ForwardBatch, can_run_cuda_graph: bool
+    ):
+        get_global_experts_capturer().on_forward_end(
+            forward_batch=forward_batch,
+            can_run_graph=can_run_cuda_graph,
+            cuda_graph_batch=getattr(self.model_runner.graph_runner, "bs", None),
+        )
+
     def forward_batch_generation(
         self,
         model_worker_batch: ModelWorkerBatch,
@@ -373,6 +383,7 @@ class TpModelWorker(BaseTpWorker):
                 pp_proxy_tensors=pp_proxy_tensors,
                 skip_attn_backend_init=skip_attn_backend_init,
             )
+            self._sync_routed_experts(forward_batch, can_run_cuda_graph)
             batch_result = GenerationBatchResult(
                 logits_output=logits_output,
                 can_run_cuda_graph=can_run_cuda_graph,
@@ -425,6 +436,7 @@ class TpModelWorker(BaseTpWorker):
                 pp_proxy_tensors=pp_proxy_tensors,
                 skip_attn_backend_init=skip_attn_backend_init,
             )
+            self._sync_routed_experts(forward_batch, can_run_cuda_graph)
             return GenerationBatchResult(
                 pp_hidden_states_proxy_tensors=pp_proxy_tensors,
                 can_run_cuda_graph=can_run_cuda_graph,
@@ -442,6 +454,7 @@ class TpModelWorker(BaseTpWorker):
         logits_output, can_run_cuda_graph = self.model_runner.forward(
             batch.split_forward_batch, split_forward_count=batch.split_forward_count
         )
+        self._sync_routed_experts(batch.split_forward_batch, can_run_cuda_graph)
         if logits_output:
             next_token_ids = self.model_runner.sample(logits_output, model_worker_batch)
         else:

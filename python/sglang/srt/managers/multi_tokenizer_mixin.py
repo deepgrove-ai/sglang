@@ -222,6 +222,11 @@ def _handle_output_by_index(output, i):
                 if output.output_hidden_states
                 else None
             ),
+            output_routed_experts=(
+                [output.output_routed_experts[i]]
+                if output.output_routed_experts
+                else None
+            ),
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
             token_steps=([output.token_steps[i]] if output.token_steps else None),
@@ -359,6 +364,11 @@ def _handle_output_by_index(output, i):
             output_hidden_states=(
                 [output.output_hidden_states[i]]
                 if output.output_hidden_states
+                else None
+            ),
+            output_routed_experts=(
+                [output.output_routed_experts[i]]
+                if output.output_routed_experts
                 else None
             ),
             placeholder_tokens_idx=None,

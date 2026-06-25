@@ -47,6 +47,7 @@ fn default_generate_request() -> GenerateRequest {
         stream: false,
         log_metrics: true,
         return_hidden_states: false,
+        return_routed_experts: None,
         modalities: None,
         session_params: None,
         lora_path: None,

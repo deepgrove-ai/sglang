@@ -31,6 +31,7 @@ from sglang.srt.layers.moe.token_dispatcher.standard import (
     StandardDispatcher,
     StandardDispatchOutput,
 )
+from sglang.srt.layers.moe.routed_experts_capturer import get_global_experts_capturer
 from sglang.srt.layers.moe.topk import TopKOutput, TopKOutputChecker
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
@@ -832,6 +833,11 @@ class FusedMoE(torch.nn.Module):
     def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput, **kwargs):
         origin_hidden_states_dim = hidden_states.shape[-1]
         assert self.quant_method is not None
+        if TopKOutputChecker.format_is_standard(topk_output):
+            get_global_experts_capturer().capture(
+                layer_id=self.layer_id,
+                topk_ids=topk_output.topk_ids,
+            )
 
         dispatch_output = self.dispatcher.dispatch(
             hidden_states=hidden_states, topk_output=topk_output

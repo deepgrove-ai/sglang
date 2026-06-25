@@ -5,9 +5,6 @@ SGLang-flavored port of VeOmni's modeling_maple.py:
   - QKVParallelLinear / RowParallelLinear / VocabParallelEmbedding / ParallelLMHead
   - FusedMoE (Triton) for the MoE experts
   - RadixAttention replaces FA3 + DynamicCache
-
-Router replay: ``record_topk`` is called inside the MoE forward so slime
-can dump SGLang's top-k decisions for the trainer to replay.
 """
 
 import logging
@@ -21,18 +18,15 @@ from transformers.activations import ACT2FN
 from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 
-try:
-    from slime.router_replay import sglang_capture as _slime_router_replay
-except ImportError:  # pragma: no cover
-    _slime_router_replay = None
-
 from sglang.srt.layers.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsMetadata
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+from sglang.srt.layers.moe.routed_experts_capturer import get_global_experts_capturer
 from sglang.srt.layers.moe.topk import StandardTopKOutput
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead, VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -64,7 +58,7 @@ except ImportError:
 
 
 def _use_sonic_moe(config) -> bool:
-    return bool(getattr(config, "use_sonic_moe", True))
+    return bool(getattr(config, "use_sonic_moe", False))
 
 MAPLE_QUANTIZED_WEIGHT_SUFFIXES = (
     "dense.weight",
@@ -256,8 +250,7 @@ class MapleSparseMoeBlock(nn.Module):
         bsz, seq_len, h = hidden_states.shape
 
         topk_idx, topk_weight, router_logits = self.gate(hidden_states)
-        if _slime_router_replay is not None:
-            _slime_router_replay.record_topk(self.layer_id, topk_idx, topk_weight)
+        get_global_experts_capturer().capture(self.layer_id, topk_idx)
 
         hidden_states = hidden_states.view(-1, h)
         y = self.moe_infer(hidden_states, topk_idx, topk_weight, router_logits).view(bsz, seq_len, h)
@@ -373,9 +366,9 @@ class MapleSonicMoeBlock(nn.Module):
         original_shape = hidden_states.shape
         flat_hidden_states = hidden_states.reshape(-1, self.hidden_size)
 
-        if _slime_router_replay is not None:
-            topk_idx, topk_weight, _ = self.gate(hidden_states)
-            _slime_router_replay.record_topk(self.layer_id, topk_idx, topk_weight)
+        if get_global_server_args().enable_return_routed_experts:
+            topk_idx, _, _ = self.gate(hidden_states)
+            get_global_experts_capturer().capture(self.layer_id, topk_idx)
 
         output, _, _ = moe_TC_softmax_topk_layer(
             flat_hidden_states,
@@ -667,7 +660,9 @@ class MapleForCausalLM(nn.Module):
 
         params_dict = dict(self.named_parameters())
         modules_dict = dict(self.named_modules())
-        quantize_weights = bool(getattr(self.config, "quantize", False))
+        quantize_weights = bool(getattr(self.config, "quantize", False)) and not bool(
+            getattr(self.config, "prequantized_weights", False)
+        )
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
